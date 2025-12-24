@@ -238,6 +238,7 @@ impl GlueCatalog {
         let db_name = validate_namespace(table.namespace())?;
         let table_name = table.name();
 
+        let glue_start = std::time::Instant::now();
         let builder = self
             .client
             .0
@@ -247,6 +248,7 @@ impl GlueCatalog {
         let builder = with_catalog_id!(builder, self.config);
 
         let glue_table_output = builder.send().await.map_err(from_aws_sdk_error)?;
+        let glue_time = glue_start.elapsed();
 
         let glue_table = glue_table_output.table().ok_or_else(|| {
             Error::new(
@@ -260,7 +262,16 @@ impl GlueCatalog {
         let version_id = glue_table.version_id.clone();
         let metadata_location = get_metadata_location(&glue_table.parameters)?;
 
+        let s3_start = std::time::Instant::now();
         let metadata = TableMetadata::read_from(&self.file_io, &metadata_location).await?;
+        let s3_time = s3_start.elapsed();
+
+        tracing::info!(
+            table = table_name,
+            glue_api_ms = glue_time.as_millis(),
+            s3_metadata_ms = s3_time.as_millis(),
+            "load_table timing"
+        );
 
         let table = Table::builder()
             .file_io(self.file_io())
