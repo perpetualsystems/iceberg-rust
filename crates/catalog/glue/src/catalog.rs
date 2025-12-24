@@ -24,7 +24,8 @@ use aws_sdk_glue::operation::create_table::CreateTableError;
 use aws_sdk_glue::operation::update_table::UpdateTableError;
 use aws_sdk_glue::types::TableInput;
 use iceberg::io::{
-    FileIO, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN,
+    Extensions, FileIO, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY,
+    S3_SESSION_TOKEN,
 };
 use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
@@ -50,18 +51,20 @@ pub const GLUE_CATALOG_PROP_CATALOG_ID: &str = "catalog_id";
 pub const GLUE_CATALOG_PROP_WAREHOUSE: &str = "warehouse";
 
 /// Builder for [`GlueCatalog`].
-#[derive(Debug)]
-pub struct GlueCatalogBuilder(GlueCatalogConfig);
+#[derive(Debug, Default)]
+pub struct GlueCatalogBuilder {
+    config: GlueCatalogConfig,
+    extensions: Extensions,
+}
 
-impl Default for GlueCatalogBuilder {
-    fn default() -> Self {
-        Self(GlueCatalogConfig {
-            name: None,
-            uri: None,
-            catalog_id: None,
-            warehouse: "".to_string(),
-            props: HashMap::new(),
-        })
+impl GlueCatalogBuilder {
+    /// Add FileIO extensions to the builder.
+    ///
+    /// Extensions are passed through to the FileIO builder, allowing custom
+    /// credential loaders to be used for S3 access.
+    pub fn with_extensions(mut self, extensions: Extensions) -> Self {
+        self.extensions = extensions;
+        self
     }
 }
 
@@ -73,25 +76,25 @@ impl CatalogBuilder for GlueCatalogBuilder {
         name: impl Into<String>,
         props: HashMap<String, String>,
     ) -> impl Future<Output = Result<Self::C>> + Send {
-        self.0.name = Some(name.into());
+        self.config.name = Some(name.into());
 
         if props.contains_key(GLUE_CATALOG_PROP_URI) {
-            self.0.uri = props.get(GLUE_CATALOG_PROP_URI).cloned()
+            self.config.uri = props.get(GLUE_CATALOG_PROP_URI).cloned()
         }
 
         if props.contains_key(GLUE_CATALOG_PROP_CATALOG_ID) {
-            self.0.catalog_id = props.get(GLUE_CATALOG_PROP_CATALOG_ID).cloned()
+            self.config.catalog_id = props.get(GLUE_CATALOG_PROP_CATALOG_ID).cloned()
         }
 
         if props.contains_key(GLUE_CATALOG_PROP_WAREHOUSE) {
-            self.0.warehouse = props
+            self.config.warehouse = props
                 .get(GLUE_CATALOG_PROP_WAREHOUSE)
                 .cloned()
                 .unwrap_or_default();
         }
 
         // Collect other remaining properties
-        self.0.props = props
+        self.config.props = props
             .into_iter()
             .filter(|(k, _)| {
                 k != GLUE_CATALOG_PROP_URI
@@ -101,25 +104,25 @@ impl CatalogBuilder for GlueCatalogBuilder {
             .collect();
 
         async move {
-            if self.0.name.is_none() {
+            if self.config.name.is_none() {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     "Catalog name is required",
                 ));
             }
-            if self.0.warehouse.is_empty() {
+            if self.config.warehouse.is_empty() {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     "Catalog warehouse is required",
                 ));
             }
 
-            GlueCatalog::new(self.0).await
+            GlueCatalog::new(self.config, self.extensions).await
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 /// Glue Catalog configuration
 pub(crate) struct GlueCatalogConfig {
     name: Option<String>,
@@ -148,7 +151,7 @@ impl Debug for GlueCatalog {
 
 impl GlueCatalog {
     /// Create a new glue catalog
-    async fn new(config: GlueCatalogConfig) -> Result<Self> {
+    async fn new(config: GlueCatalogConfig, extensions: Extensions) -> Result<Self> {
         let sdk_config = create_sdk_config(&config.props, config.uri.as_ref()).await;
         let mut file_io_props = config.props.clone();
         if !file_io_props.contains_key(S3_ACCESS_KEY_ID)
@@ -184,6 +187,7 @@ impl GlueCatalog {
 
         let file_io = FileIO::from_path(&config.warehouse)?
             .with_props(file_io_props)
+            .with_extensions(extensions)
             .build()?;
 
         Ok(GlueCatalog {
