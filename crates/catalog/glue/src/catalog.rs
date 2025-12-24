@@ -55,6 +55,7 @@ pub const GLUE_CATALOG_PROP_WAREHOUSE: &str = "warehouse";
 pub struct GlueCatalogBuilder {
     config: GlueCatalogConfig,
     extensions: Extensions,
+    sdk_config: Option<aws_config::SdkConfig>,
 }
 
 impl GlueCatalogBuilder {
@@ -64,6 +65,15 @@ impl GlueCatalogBuilder {
     /// credential loaders to be used for S3 access.
     pub fn with_extensions(mut self, extensions: Extensions) -> Self {
         self.extensions = extensions;
+        self
+    }
+
+    /// Use a pre-loaded AWS SDK config instead of loading one from properties.
+    ///
+    /// This avoids redundant credential resolution when the caller already has
+    /// an SDK config with cached credentials.
+    pub fn with_sdk_config(mut self, sdk_config: aws_config::SdkConfig) -> Self {
+        self.sdk_config = Some(sdk_config);
         self
     }
 }
@@ -117,7 +127,7 @@ impl CatalogBuilder for GlueCatalogBuilder {
                 ));
             }
 
-            GlueCatalog::new(self.config, self.extensions).await
+            GlueCatalog::new(self.config, self.extensions, self.sdk_config).await
         }
     }
 }
@@ -151,8 +161,16 @@ impl Debug for GlueCatalog {
 
 impl GlueCatalog {
     /// Create a new glue catalog
-    async fn new(config: GlueCatalogConfig, extensions: Extensions) -> Result<Self> {
-        let sdk_config = create_sdk_config(&config.props, config.uri.as_ref()).await;
+    async fn new(
+        config: GlueCatalogConfig,
+        extensions: Extensions,
+        provided_sdk_config: Option<aws_config::SdkConfig>,
+    ) -> Result<Self> {
+        // Use provided SDK config if available, otherwise load from properties
+        let sdk_config = match provided_sdk_config {
+            Some(cfg) => cfg,
+            None => create_sdk_config(&config.props, config.uri.as_ref()).await,
+        };
         let mut file_io_props = config.props.clone();
         if !file_io_props.contains_key(S3_ACCESS_KEY_ID)
             && let Some(access_key_id) = file_io_props.get(AWS_ACCESS_KEY_ID)
