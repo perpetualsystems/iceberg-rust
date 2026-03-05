@@ -2109,6 +2109,8 @@ message schema {
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
+                column_sizes: None,
+                split_offsets: None,
                 case_sensitive: false,
             })]
             .into_iter(),
@@ -2431,6 +2433,8 @@ message schema {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            column_sizes: None,
+            split_offsets: None,
             case_sensitive: false,
         };
 
@@ -2448,6 +2452,8 @@ message schema {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            column_sizes: None,
+            split_offsets: None,
             case_sensitive: false,
         };
 
@@ -2576,6 +2582,8 @@ message schema {
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
+                column_sizes: None,
+                split_offsets: None,
                 case_sensitive: false,
             })]
             .into_iter(),
@@ -2748,6 +2756,8 @@ message schema {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            column_sizes: None,
+            split_offsets: None,
             case_sensitive: false,
         };
 
@@ -2966,6 +2976,8 @@ message schema {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            column_sizes: None,
+            split_offsets: None,
             case_sensitive: false,
         };
 
@@ -3177,6 +3189,8 @@ message schema {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            column_sizes: None,
+            split_offsets: None,
             case_sensitive: false,
         };
 
@@ -3281,6 +3295,8 @@ message schema {
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
+                column_sizes: None,
+                split_offsets: None,
                 case_sensitive: false,
             })]
             .into_iter(),
@@ -3379,6 +3395,8 @@ message schema {
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
+                column_sizes: None,
+                split_offsets: None,
                 case_sensitive: false,
             })]
             .into_iter(),
@@ -3466,6 +3484,8 @@ message schema {
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
+                column_sizes: None,
+                split_offsets: None,
                 case_sensitive: false,
             })]
             .into_iter(),
@@ -3567,6 +3587,8 @@ message schema {
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
+                column_sizes: None,
+                split_offsets: None,
                 case_sensitive: false,
             })]
             .into_iter(),
@@ -3697,6 +3719,8 @@ message schema {
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
+                column_sizes: None,
+                split_offsets: None,
                 case_sensitive: false,
             })]
             .into_iter(),
@@ -3794,6 +3818,8 @@ message schema {
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
+                column_sizes: None,
+                split_offsets: None,
                 case_sensitive: false,
             })]
             .into_iter(),
@@ -3904,6 +3930,8 @@ message schema {
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
+                column_sizes: None,
+                split_offsets: None,
                 case_sensitive: false,
             })]
             .into_iter(),
@@ -3995,6 +4023,8 @@ message schema {
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
+                column_sizes: None,
+                split_offsets: None,
                 case_sensitive: false,
             }),
             Ok(FileScanTask {
@@ -4010,6 +4040,8 @@ message schema {
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
+                column_sizes: None,
+                split_offsets: None,
                 case_sensitive: false,
             }),
             Ok(FileScanTask {
@@ -4025,6 +4057,8 @@ message schema {
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
+                column_sizes: None,
+                split_offsets: None,
                 case_sensitive: false,
             }),
         ];
@@ -4204,6 +4238,8 @@ message schema {
                 partition: Some(partition_data),
                 partition_spec: Some(partition_spec),
                 name_mapping: None,
+                column_sizes: None,
+                split_offsets: None,
                 case_sensitive: false,
             })]
             .into_iter(),
