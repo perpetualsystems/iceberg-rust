@@ -23,7 +23,7 @@ use crate::io::{FileIO, OutputFile};
 use crate::spec::{DataFileBuilder, PartitionKey, TableProperties};
 use crate::writer::CurrentFileStatus;
 use crate::writer::file_writer::location_generator::{FileNameGenerator, LocationGenerator};
-use crate::writer::file_writer::{FileWriter, FileWriterBuilder, RowGroupFlushable};
+use crate::writer::file_writer::{FileWriter, FileWriterBuilder, RowGroupFlushable, RowGroupSizeEstimate};
 use crate::{Error, ErrorKind, Result};
 
 /// Builder for [`RollingFileWriter`].
@@ -262,11 +262,11 @@ where
     L: LocationGenerator,
     F: FileNameGenerator,
 {
-    fn in_progress_row_group_bytes(&self) -> usize {
+    fn in_progress_row_group_bytes(&self) -> RowGroupSizeEstimate {
         self.inner
             .as_ref()
             .map(|w| w.in_progress_row_group_bytes())
-            .unwrap_or(0)
+            .unwrap_or_default()
     }
 
     async fn flush_row_group(&mut self) -> Result<()> {

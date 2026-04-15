@@ -31,7 +31,7 @@ use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::WriterProperties;
 use parquet::file::statistics::Statistics;
 
-use super::{FileWriter, FileWriterBuilder, RowGroupFlushable};
+use super::{FileWriter, FileWriterBuilder, RowGroupFlushable, RowGroupSizeEstimate};
 use crate::arrow::{
     ArrowFileReader, DEFAULT_MAP_FIELD_NAME, FieldMatchMode, NanValueCountVisitor,
     get_parquet_stat_max_as_datum, get_parquet_stat_min_as_datum,
@@ -86,6 +86,7 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             current_row_num: 0,
             output_file,
             nan_value_count_visitor: NanValueCountVisitor::new_with_match_mode(self.match_mode),
+            arrow_memory_row_group_bytes: 0,
         })
     }
 }
@@ -216,6 +217,7 @@ pub struct ParquetWriter {
     writer_properties: WriterProperties,
     current_row_num: usize,
     nan_value_count_visitor: NanValueCountVisitor,
+    arrow_memory_row_group_bytes: usize,
 }
 
 /// Used to aggregate min and max value of each column.
@@ -480,6 +482,7 @@ impl FileWriter for ParquetWriter {
         }
 
         self.current_row_num += batch.num_rows();
+        self.arrow_memory_row_group_bytes += batch.get_array_memory_size();
 
         let batch_c = batch.clone();
         self.nan_value_count_visitor
@@ -574,11 +577,15 @@ impl CurrentFileStatus for ParquetWriter {
 }
 
 impl RowGroupFlushable for ParquetWriter {
-    fn in_progress_row_group_bytes(&self) -> usize {
-        self.inner_writer
-            .as_ref()
-            .map(|w| w.in_progress_size())
-            .unwrap_or(0)
+    fn in_progress_row_group_bytes(&self) -> RowGroupSizeEstimate {
+        RowGroupSizeEstimate {
+            compressed: self
+                .inner_writer
+                .as_ref()
+                .map(|w| w.in_progress_size())
+                .unwrap_or(0),
+            arrow_memory: self.arrow_memory_row_group_bytes,
+        }
     }
 
     async fn flush_row_group(&mut self) -> Result<()> {
@@ -587,6 +594,9 @@ impl RowGroupFlushable for ParquetWriter {
                 Error::new(ErrorKind::Unexpected, "Failed to flush row group.").with_source(e)
             })?;
         }
+        // Reset after successful flush only — a failed flush retains the count for retry.
+        // Implicit row-count-limit flushes inside AsyncArrowWriter do not reset this.
+        self.arrow_memory_row_group_bytes = 0;
         Ok(())
     }
 }
@@ -2297,5 +2307,144 @@ mod tests {
 
         assert_eq!(lower_bounds, HashMap::from([(0, Datum::int(i32::MIN))]));
         assert_eq!(upper_bounds, HashMap::from([(0, Datum::int(i32::MAX))]));
+    }
+
+    #[tokio::test]
+    async fn test_flush_row_group() -> Result<()> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("test_flush".to_string(), None, DataFileFormat::Parquet);
+
+        let iceberg_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()?,
+        );
+
+        let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+
+        let mut writer =
+            ParquetWriterBuilder::new(WriterProperties::builder().build(), iceberg_schema)
+                .build(output_file)
+                .await?;
+
+        // Before any write, both fields should be 0
+        let est = writer.in_progress_row_group_bytes();
+        assert_eq!(est.compressed, 0);
+        assert_eq!(est.arrow_memory, 0);
+
+        // Write first batch
+        let batch1 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )?;
+        writer.write(&batch1).await?;
+
+        // arrow_memory should now be non-zero
+        let est = writer.in_progress_row_group_bytes();
+        assert!(
+            est.arrow_memory > 0,
+            "arrow_memory should be non-zero after write"
+        );
+
+        // Flush row group — resets arrow_memory to 0
+        writer.flush_row_group().await?;
+        let est = writer.in_progress_row_group_bytes();
+        assert_eq!(
+            est.arrow_memory, 0,
+            "arrow_memory should reset to 0 after flush_row_group"
+        );
+
+        // Write second batch
+        let batch2 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
+        )?;
+        writer.write(&batch2).await?;
+
+        let res = writer.close().await?;
+        assert_eq!(res.len(), 1);
+
+        let data_file = res
+            .into_iter()
+            .next()
+            .unwrap()
+            .content(DataContentType::Data)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .build()?;
+
+        assert_eq!(data_file.record_count(), 6);
+
+        // Verify two row groups were written
+        let input_file = file_io.new_input(data_file.file_path.clone())?;
+        let content = input_file.read().await.unwrap();
+        let reader_builder = ParquetRecordBatchReaderBuilder::try_new(content).unwrap();
+        assert_eq!(
+            reader_builder.metadata().num_row_groups(),
+            2,
+            "Expected 2 row groups after one explicit flush"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_flush_row_group_never_written() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen = DefaultFileNameGenerator::new(
+            "test_flush_empty".to_string(),
+            None,
+            DataFileFormat::Parquet,
+        );
+
+        let iceberg_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(2)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()?,
+        );
+
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+
+        let mut writer =
+            ParquetWriterBuilder::new(WriterProperties::builder().build(), iceberg_schema)
+                .build(output_file)
+                .await?;
+
+        // flush_row_group on a never-written writer must not panic and return Ok
+        writer.flush_row_group().await?;
+
+        let est = writer.in_progress_row_group_bytes();
+        assert_eq!(est.compressed, 0);
+        assert_eq!(est.arrow_memory, 0);
+
+        Ok(())
     }
 }
