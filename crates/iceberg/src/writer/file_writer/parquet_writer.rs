@@ -481,8 +481,8 @@ impl FileWriter for ParquetWriter {
             return Ok(());
         }
 
-        self.current_row_num += batch.num_rows();
-        self.arrow_memory_row_group_bytes += batch.get_array_memory_size();
+        self.current_row_num = self.current_row_num.saturating_add(batch.num_rows());
+        self.arrow_memory_row_group_bytes = self.arrow_memory_row_group_bytes.saturating_add(batch.get_array_memory_size());
 
         let batch_c = batch.clone();
         self.nan_value_count_visitor
@@ -583,7 +583,7 @@ impl RowGroupFlushable for ParquetWriter {
                 .inner_writer
                 .as_ref()
                 .map(|w| w.in_progress_size())
-                .unwrap_or(0),
+                .unwrap_or_default(),
             arrow_memory: self.arrow_memory_row_group_bytes,
         }
     }
@@ -2395,8 +2395,8 @@ mod tests {
 
         // Verify two row groups were written
         let input_file = file_io.new_input(data_file.file_path.clone())?;
-        let content = input_file.read().await.unwrap();
-        let reader_builder = ParquetRecordBatchReaderBuilder::try_new(content).unwrap();
+        let content = input_file.read().await?;
+        let reader_builder = ParquetRecordBatchReaderBuilder::try_new(content)?;
         assert_eq!(
             reader_builder.metadata().num_row_groups(),
             2,

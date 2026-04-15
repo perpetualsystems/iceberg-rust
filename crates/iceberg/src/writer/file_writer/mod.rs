@@ -55,7 +55,7 @@ pub trait FileWriter<O = DefaultOutput>: Send + CurrentFileStatus + 'static {
 ///
 /// `#[non_exhaustive]` — fields may be added without breaking callers.
 #[non_exhaustive]
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RowGroupSizeEstimate {
     /// Post-compression byte count from `AsyncArrowWriter::in_progress_size()`.
     /// Already included in `CurrentFileStatus::current_written_size()` — do not double-count.
