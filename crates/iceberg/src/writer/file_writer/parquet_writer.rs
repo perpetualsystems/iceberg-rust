@@ -594,8 +594,7 @@ impl RowGroupFlushable for ParquetWriter {
                 Error::new(ErrorKind::Unexpected, "Failed to flush row group.").with_source(e)
             })?;
         }
-        // Reset after successful flush only — a failed flush retains the count for retry.
-        // Implicit row-count-limit flushes inside AsyncArrowWriter do not reset this.
+        // Reset after flush succeeds — a failed flush retains the count for retry.
         self.arrow_memory_row_group_bytes = 0;
         Ok(())
     }

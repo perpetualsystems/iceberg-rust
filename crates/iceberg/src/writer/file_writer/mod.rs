@@ -51,46 +51,28 @@ pub trait FileWriter<O = DefaultOutput>: Send + CurrentFileStatus + 'static {
     fn close(self) -> impl Future<Output = Result<O>> + Send;
 }
 
-/// Size estimate for the current in-progress row group, returned by
-/// [`RowGroupFlushable::in_progress_row_group_bytes`].
+/// Size estimates for the current in-progress row group.
 ///
-/// Both fields are estimates. The struct is `#[non_exhaustive]` — fields may be
-/// added without breaking callers.
+/// `#[non_exhaustive]` — fields may be added without breaking callers.
 #[non_exhaustive]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RowGroupSizeEstimate {
-    /// Post-block-compression byte count from `AsyncArrowWriter::in_progress_size()`.
-    /// Approximately equal to on-disk row group size.
-    ///
-    /// **Already included in `CurrentFileStatus::current_written_size()`** — do not
-    /// add both to avoid double-counting.
+    /// Post-compression byte count from `AsyncArrowWriter::in_progress_size()`.
+    /// Already included in `CurrentFileStatus::current_written_size()` — do not double-count.
     pub compressed: usize,
-    /// Arrow heap buffer capacity accumulated via `RecordBatch::get_array_memory_size()`
-    /// across all batches in the current row group.
-    ///
-    /// Resets to 0 on `flush_row_group()` and on rolling-writer file transitions.
-    /// Implicit row-count-limit flushes inside `AsyncArrowWriter` do **not** reset this.
-    ///
-    /// May overcount for sliced batches — `get_array_memory_size()` reports buffer
-    /// `.capacity()`, not logical slice length.
+    /// Arrow buffer capacity from `RecordBatch::get_array_memory_size()`, accumulated per batch.
+    /// Resets on explicit `flush_row_group()` only; implicit row-count-limit flushes do not reset it.
+    /// May overcount sliced batches (`.capacity()`, not logical size).
     pub arrow_memory: usize,
 }
 
 /// Row-group-level flush control for file writers that support it.
 ///
-/// # Object safety
+/// Not object-safe due to RPITIT in `flush_row_group` — use generic bounds (`W: RowGroupFlushable`).
 ///
-/// This trait is **not object-safe** due to RPITIT in `flush_row_group`. Use
-/// generic bounds (`W: RowGroupFlushable`) rather than `dyn RowGroupFlushable`.
-///
-/// # Performance
-///
-/// `in_progress_row_group_bytes()` calls `AsyncArrowWriter::in_progress_size()` which
-/// iterates all column writers — O(physical column count). Call at per-batch granularity;
-/// avoid calling in sub-batch inner loops.
+/// `in_progress_row_group_bytes()` is O(physical column count); avoid calling inside inner loops.
 pub trait RowGroupFlushable: Send {
-    /// Returns size estimates for the current in-progress row group.
-    /// Returns `RowGroupSizeEstimate::default()` (all fields 0) when no row group is open.
+    /// Returns size estimates for the current in-progress row group, or all-zeros if none is open.
     fn in_progress_row_group_bytes(&self) -> RowGroupSizeEstimate;
     /// Flushes the current in-progress row group.
     fn flush_row_group(&mut self) -> impl Future<Output = Result<()>> + Send;
