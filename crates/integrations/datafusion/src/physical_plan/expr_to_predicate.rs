@@ -49,6 +49,62 @@ pub fn convert_filters_to_predicate(filters: &[Expr]) -> Option<Predicate> {
         .reduce(Predicate::and)
 }
 
+/// Strict variant of [`convert_filters_to_predicate`]: returns an error if any
+/// filter (or any sub-expression inside it) cannot be represented as an Iceberg
+/// predicate.
+///
+/// The permissive variant is safe for scan pushdown (unconverted clauses stay in
+/// the DataFusion filter). For row-level DML it is not: silently dropping a
+/// clause from the predicate would delete/update rows the user didn't ask to
+/// touch.
+pub fn convert_filters_to_predicate_strict(
+    filters: &[Expr],
+) -> std::result::Result<Option<Predicate>, String> {
+    let mut combined: Option<Predicate> = None;
+    for expr in filters {
+        let predicate = convert_filter_to_predicate_strict(expr)?;
+        combined = Some(match combined {
+            Some(existing) => existing.and(predicate),
+            None => predicate,
+        });
+    }
+    Ok(combined)
+}
+
+fn convert_filter_to_predicate_strict(expr: &Expr) -> std::result::Result<Predicate, String> {
+    // Logical connectives are walked recursively so that silent drops in
+    // `to_iceberg_and_predicate` / `to_iceberg_or_predicate` can't hide a
+    // non-convertible sub-expression.
+    if let Expr::BinaryExpr(b) = expr {
+        match b.op {
+            Operator::And => {
+                return Ok(convert_filter_to_predicate_strict(&b.left)?
+                    .and(convert_filter_to_predicate_strict(&b.right)?));
+            }
+            Operator::Or => {
+                return Ok(convert_filter_to_predicate_strict(&b.left)?
+                    .or(convert_filter_to_predicate_strict(&b.right)?));
+            }
+            _ => {}
+        }
+    }
+    if let Expr::Not(inner) = expr {
+        return Ok(!convert_filter_to_predicate_strict(inner)?);
+    }
+
+    match to_iceberg_predicate(expr) {
+        TransformedResult::Predicate(p) => Ok(p),
+        TransformedResult::Column(column) => Ok(Predicate::Binary(BinaryExpression::new(
+            PredicateOperator::Eq,
+            column,
+            Datum::bool(true),
+        ))),
+        TransformedResult::Literal(_) | TransformedResult::NotTransformed => Err(format!(
+            "Expression `{expr}` cannot be represented as an Iceberg predicate"
+        )),
+    }
+}
+
 fn convert_filter_to_predicate(expr: &Expr) -> Option<Predicate> {
     match to_iceberg_predicate(expr) {
         TransformedResult::Predicate(predicate) => Some(predicate),
@@ -309,23 +365,31 @@ fn scalar_value_to_datum(value: &ScalarValue) -> Option<Datum> {
         ScalarValue::LargeBinary(Some(v)) => Some(Datum::binary(v.clone())),
         ScalarValue::Date32(Some(v)) => Some(Datum::date(*v)),
         ScalarValue::Date64(Some(v)) => Some(Datum::date((*v / MILLIS_PER_DAY) as i32)),
-        // Timestamps without timezone
+        // Timestamp conversions.
+        //
+        // The timezone variant matters: Datum::timestamp_* and Datum::timestamptz_* are
+        // distinct Iceberg types. Mismatched types compare as incomparable (PartialOrd
+        // returns None), silently producing `false` for every row — which for DELETE
+        // means a silent zero-row no-op. Route tz-bearing values to the tz Datum.
+        //
+        // Iceberg's Datum has no Second/Millisecond variants, so we scale those into
+        // microseconds. `checked_mul` returns None on overflow (near the i64 ends) so
+        // callers fall back to no pushdown rather than constructing a bogus predicate.
         ScalarValue::TimestampSecond(Some(v), None) => {
-            Some(Datum::timestamp_micros(*v * 1_000_000))
+            v.checked_mul(1_000_000).map(Datum::timestamp_micros)
+        }
+        ScalarValue::TimestampSecond(Some(v), Some(_)) => {
+            v.checked_mul(1_000_000).map(Datum::timestamptz_micros)
         }
         ScalarValue::TimestampMillisecond(Some(v), None) => {
-            Some(Datum::timestamp_micros(*v * 1_000))
-        }
-        ScalarValue::TimestampMicrosecond(Some(v), None) => Some(Datum::timestamp_micros(*v)),
-        ScalarValue::TimestampNanosecond(Some(v), None) => Some(Datum::timestamp_nanos(*v)),
-        // Timestamps with timezone
-        ScalarValue::TimestampSecond(Some(v), Some(_)) => {
-            Some(Datum::timestamptz_micros(*v * 1_000_000))
+            v.checked_mul(1_000).map(Datum::timestamp_micros)
         }
         ScalarValue::TimestampMillisecond(Some(v), Some(_)) => {
-            Some(Datum::timestamptz_micros(*v * 1_000))
+            v.checked_mul(1_000).map(Datum::timestamptz_micros)
         }
+        ScalarValue::TimestampMicrosecond(Some(v), None) => Some(Datum::timestamp_micros(*v)),
         ScalarValue::TimestampMicrosecond(Some(v), Some(_)) => Some(Datum::timestamptz_micros(*v)),
+        ScalarValue::TimestampNanosecond(Some(v), None) => Some(Datum::timestamp_nanos(*v)),
         ScalarValue::TimestampNanosecond(Some(v), Some(_)) => Some(Datum::timestamptz_nanos(*v)),
         _ => None,
     }
@@ -567,31 +631,54 @@ mod tests {
         let datum = super::scalar_value_to_datum(&ScalarValue::TimestampMicrosecond(None, None));
         assert_eq!(datum, None);
 
-        // Test TimestampSecond - converted to microseconds
-        let ts_seconds = 1672876800i64; // 2023-01-05 00:00:00 UTC in seconds
-        let datum =
-            super::scalar_value_to_datum(&ScalarValue::TimestampSecond(Some(ts_seconds), None));
-        assert_eq!(datum, Some(Datum::timestamp_micros(ts_seconds * 1_000_000)));
-
-        // Test TimestampMillisecond - converted to microseconds
-        let ts_millis = 1672876800000i64; // 2023-01-05 00:00:00 UTC in milliseconds
-        let datum =
-            super::scalar_value_to_datum(&ScalarValue::TimestampMillisecond(Some(ts_millis), None));
-        assert_eq!(datum, Some(Datum::timestamp_micros(ts_millis * 1_000)));
-
-        // Test timestamps with timezone
-        let tz = Some("UTC".into());
+        // Timezone-aware timestamps must map to the timestamptz Datum variant.
+        // Datum compares across types as incomparable (PartialOrd returns None), so
+        // using the non-tz variant against a timestamptz column silently produces
+        // false everywhere — a soundness hazard for DML.
         let datum = super::scalar_value_to_datum(&ScalarValue::TimestampMicrosecond(
             Some(ts_micros),
-            tz.clone(),
+            Some("UTC".into()),
         ));
         assert_eq!(datum, Some(Datum::timestamptz_micros(ts_micros)));
 
         let datum = super::scalar_value_to_datum(&ScalarValue::TimestampNanosecond(
             Some(ts_nanos),
-            tz.clone(),
+            Some("UTC".into()),
         ));
         assert_eq!(datum, Some(Datum::timestamptz_nanos(ts_nanos)));
+
+        // TimestampSecond / TimestampMillisecond: scaled into microseconds because Iceberg's
+        // Datum has no second/millisecond variants. Matters for non-DataFusion callers of
+        // the public convert_filters_to_predicate functions (DataFusion's own type coercion
+        // usually upgrades these before we see them).
+        let ts_seconds = 1672876800i64; // 2023-01-05 00:00:00 UTC in seconds
+        let datum =
+            super::scalar_value_to_datum(&ScalarValue::TimestampSecond(Some(ts_seconds), None));
+        assert_eq!(datum, Some(Datum::timestamp_micros(ts_seconds * 1_000_000)));
+        let datum = super::scalar_value_to_datum(&ScalarValue::TimestampSecond(
+            Some(ts_seconds),
+            Some("UTC".into()),
+        ));
+        assert_eq!(
+            datum,
+            Some(Datum::timestamptz_micros(ts_seconds * 1_000_000))
+        );
+
+        let ts_millis = 1672876800000i64; // 2023-01-05 00:00:00 UTC in milliseconds
+        let datum =
+            super::scalar_value_to_datum(&ScalarValue::TimestampMillisecond(Some(ts_millis), None));
+        assert_eq!(datum, Some(Datum::timestamp_micros(ts_millis * 1_000)));
+        let datum = super::scalar_value_to_datum(&ScalarValue::TimestampMillisecond(
+            Some(ts_millis),
+            Some("UTC".into()),
+        ));
+        assert_eq!(datum, Some(Datum::timestamptz_micros(ts_millis * 1_000)));
+
+        // Overflow returns None so the caller falls back to no pushdown instead of
+        // constructing a predicate with a wrapped value.
+        let datum =
+            super::scalar_value_to_datum(&ScalarValue::TimestampSecond(Some(i64::MAX), None));
+        assert_eq!(datum, None);
     }
 
     #[test]

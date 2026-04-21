@@ -335,6 +335,7 @@ impl ArrowReader {
         Ok(stream)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn process_file_scan_task(
         task: FileScanTask,
         batch_size: Option<usize>,
@@ -387,58 +388,57 @@ impl ArrowReader {
         // - Branch 1: hasIds(fileSchema) → trust embedded field IDs, use pruneColumns()
         // - Branch 2: nameMapping present → applyNameMapping(), then pruneColumns()
         // - Branch 3: fallback → addFallbackIds(), then pruneColumnsFallback()
-        let arrow_metadata = if missing_field_ids {
-            // Parquet file lacks field IDs - must assign them before reading
-            let arrow_schema = if let Some(name_mapping) = &task.name_mapping {
-                // Branch 2: Apply name mapping to assign correct Iceberg field IDs
-                // Per spec rule #2: "Use schema.name-mapping.default metadata to map field id
-                // to columns without field id"
-                // Corresponds to Java's ParquetSchemaUtil.applyNameMapping()
-                apply_name_mapping_to_arrow_schema(
-                    Arc::clone(arrow_metadata.schema()),
-                    name_mapping,
-                )?
-            } else {
-                // Branch 3: No name mapping - use position-based fallback IDs
-                // Corresponds to Java's ParquetSchemaUtil.addFallbackIds()
-                add_fallback_field_ids_to_arrow_schema(arrow_metadata.schema())
-            };
+        let arrow_metadata =
+            if missing_field_ids {
+                // Parquet file lacks field IDs - must assign them before reading
+                let arrow_schema = if let Some(name_mapping) = &task.name_mapping {
+                    // Branch 2: Apply name mapping to assign correct Iceberg field IDs
+                    // Per spec rule #2: "Use schema.name-mapping.default metadata to map field id
+                    // to columns without field id"
+                    // Corresponds to Java's ParquetSchemaUtil.applyNameMapping()
+                    apply_name_mapping_to_arrow_schema(
+                        Arc::clone(arrow_metadata.schema()),
+                        name_mapping,
+                    )?
+                } else {
+                    // Branch 3: No name mapping - use position-based fallback IDs
+                    // Corresponds to Java's ParquetSchemaUtil.addFallbackIds()
+                    add_fallback_field_ids_to_arrow_schema(arrow_metadata.schema())
+                };
 
-            // If the caller supplied an Arrow schema override, apply it to the
-            // assigned-ID schema so the Parquet decoder produces the caller's types.
-            let arrow_schema =
-                apply_arrow_schema_override(&arrow_schema, arrow_schema_override.as_deref());
-            let options = ArrowReaderOptions::new().with_schema(arrow_schema);
-            ArrowReaderMetadata::try_new(Arc::clone(arrow_metadata.metadata()), options).map_err(
-                |e| {
-                    Error::new(
-                        ErrorKind::Unexpected,
-                        "Failed to create ArrowReaderMetadata with field ID schema",
-                    )
-                    .with_source(e)
-                },
-            )?
-        } else if let Some(override_schema) = arrow_schema_override.as_deref() {
-            // Branch 1+override: file has embedded field IDs and caller supplied an Arrow
-            // schema override. Remap the file's arrow schema field-by-field to the
-            // caller's types so the Parquet decoder produces them directly (zero-copy
-            // for types that share the same physical encoding, e.g. Utf8View ↔ Utf8).
-            let remapped =
-                apply_arrow_schema_override(arrow_metadata.schema(), Some(override_schema));
-            let options = ArrowReaderOptions::new().with_schema(remapped);
-            ArrowReaderMetadata::try_new(Arc::clone(arrow_metadata.metadata()), options).map_err(
-                |e| {
-                    Error::new(
-                        ErrorKind::Unexpected,
-                        "Failed to create ArrowReaderMetadata with overridden schema",
-                    )
-                    .with_source(e)
-                },
-            )?
-        } else {
-            // Branch 1: File has embedded field IDs - trust them
-            arrow_metadata
-        };
+                // If the caller supplied an Arrow schema override, apply it to the
+                // assigned-ID schema so the Parquet decoder produces the caller's types.
+                let arrow_schema =
+                    apply_arrow_schema_override(&arrow_schema, arrow_schema_override.as_deref());
+                let options = ArrowReaderOptions::new().with_schema(arrow_schema);
+                ArrowReaderMetadata::try_new(Arc::clone(arrow_metadata.metadata()), options)
+                    .map_err(|e| {
+                        Error::new(
+                            ErrorKind::Unexpected,
+                            "Failed to create ArrowReaderMetadata with field ID schema",
+                        )
+                        .with_source(e)
+                    })?
+            } else if let Some(override_schema) = arrow_schema_override.as_deref() {
+                // Branch 1+override: file has embedded field IDs and caller supplied an Arrow
+                // schema override. Remap the file's arrow schema field-by-field to the
+                // caller's types so the Parquet decoder produces them directly (zero-copy
+                // for types that share the same physical encoding, e.g. Utf8View ↔ Utf8).
+                let remapped =
+                    apply_arrow_schema_override(arrow_metadata.schema(), Some(override_schema));
+                let options = ArrowReaderOptions::new().with_schema(remapped);
+                ArrowReaderMetadata::try_new(Arc::clone(arrow_metadata.metadata()), options)
+                    .map_err(|e| {
+                        Error::new(
+                            ErrorKind::Unexpected,
+                            "Failed to create ArrowReaderMetadata with overridden schema",
+                        )
+                        .with_source(e)
+                    })?
+            } else {
+                // Branch 1: File has embedded field IDs - trust them
+                arrow_metadata
+            };
 
         // Build the stream reader, reusing the already-opened file reader
         let mut record_batch_stream_builder =
@@ -2711,7 +2711,7 @@ message schema {
 
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
-            .set_max_row_group_size(100)
+            .set_max_row_group_row_count(Some(100))
             .build();
 
         let file = File::create(&file_path).unwrap();
@@ -3032,7 +3032,7 @@ message schema {
         // Force each batch into its own row group
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
-            .set_max_row_group_size(100)
+            .set_max_row_group_row_count(Some(100))
             .build();
 
         let file = File::create(&data_file_path).unwrap();
@@ -3230,7 +3230,7 @@ message schema {
         // Force each batch into its own row group
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
-            .set_max_row_group_size(100)
+            .set_max_row_group_row_count(Some(100))
             .build();
 
         let file = File::create(&data_file_path).unwrap();
@@ -3456,7 +3456,7 @@ message schema {
         // Force each batch into its own row group
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
-            .set_max_row_group_size(100)
+            .set_max_row_group_row_count(Some(100))
             .build();
 
         let file = File::create(&data_file_path).unwrap();
@@ -3912,7 +3912,7 @@ message schema {
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
             .set_write_batch_size(2)
-            .set_max_row_group_size(2)
+            .set_max_row_group_row_count(Some(2))
             .build();
 
         let file = File::create(format!("{table_location}/1.parquet")).unwrap();
@@ -4868,10 +4868,12 @@ message schema {
     }
 
     fn field_with_id(name: &str, dt: DataType, nullable: bool, id: i32) -> FieldRef {
-        Arc::new(Field::new(name, dt, nullable).with_metadata(HashMap::from([(
-            PARQUET_FIELD_ID_META_KEY.to_string(),
-            id.to_string(),
-        )])))
+        Arc::new(
+            Field::new(name, dt, nullable).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                id.to_string(),
+            )])),
+        )
     }
 
     fn make_scan_task(
@@ -4963,8 +4965,7 @@ message schema {
             false,
             1,
         )]));
-        let override_schema =
-            ArrowSchema::new(vec![field_with_id("a", DataType::Int64, false, 1)]);
+        let override_schema = ArrowSchema::new(vec![field_with_id("a", DataType::Int64, false, 1)]);
 
         let result = super::apply_arrow_schema_override(&file, Some(&override_schema));
         assert_eq!(result.field(0).data_type(), &DataType::Int32);
@@ -5048,12 +5049,7 @@ message schema {
             .build();
         let task = make_scan_task(data_path, table_schema.clone(), vec![1]);
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
-        let batches: Vec<RecordBatch> = reader
-            .read(tasks)
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
+        let batches: Vec<RecordBatch> = reader.read(tasks).unwrap().try_collect().await.unwrap();
 
         assert_eq!(batches.len(), 1);
         let out = &batches[0];
@@ -5126,12 +5122,7 @@ message schema {
             .build();
         let task = make_scan_task(data_path, table_schema.clone(), vec![1]);
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
-        let batches: Vec<RecordBatch> = reader
-            .read(tasks)
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
+        let batches: Vec<RecordBatch> = reader.read(tasks).unwrap().try_collect().await.unwrap();
 
         assert_eq!(batches.len(), 1);
         let out = &batches[0];

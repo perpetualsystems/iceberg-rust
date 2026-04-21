@@ -133,10 +133,10 @@ impl ReplaceDataFilesAction {
 #[async_trait]
 impl TransactionAction for ReplaceDataFilesAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
-        if self.files_to_add.is_empty() {
+        if self.files_to_add.is_empty() && self.files_to_delete.is_empty() {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
-                "Replace operation requires files to add",
+                "Replace operation requires at least one of files_to_add or files_to_delete",
             ));
         }
 
@@ -175,7 +175,16 @@ impl TransactionAction for ReplaceDataFilesAction {
         snapshot_producer.validate_added_data_files()?;
         snapshot_producer.validate_duplicate_files().await?;
 
+        // Iceberg distinguishes pure delete (`Operation::Delete`) from replace/compaction
+        // (`Operation::Replace`). A commit with only deletes and no additions is a delete.
+        let operation = if self.files_to_add.is_empty() {
+            Operation::Delete
+        } else {
+            Operation::Replace
+        };
+
         let replace_op = ReplaceOperation {
+            operation,
             files_to_delete: self
                 .files_to_delete
                 .iter()
@@ -193,6 +202,7 @@ impl TransactionAction for ReplaceDataFilesAction {
 }
 
 struct ReplaceOperation {
+    operation: Operation,
     files_to_delete: HashSet<String>,
     validate_from_snapshot_id: Option<i64>,
     commit_uuid: Uuid,
@@ -201,7 +211,7 @@ struct ReplaceOperation {
 
 impl SnapshotProduceOperation for ReplaceOperation {
     fn operation(&self) -> Operation {
-        Operation::Replace
+        self.operation.clone()
     }
 
     async fn delete_entries(
