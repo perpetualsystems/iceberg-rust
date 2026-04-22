@@ -89,7 +89,8 @@ impl IcebergTableProvider {
 
         // Load table once to get initial schema
         let table = catalog.load_table(&table_ident).await?;
-        let schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
+        let schema =
+            upgrade_to_view_types(&schema_to_arrow_schema(table.metadata().current_schema())?);
 
         Ok(IcebergTableProvider {
             catalog,
@@ -105,6 +106,44 @@ impl IcebergTableProvider {
         // Load fresh table metadata for metadata table access
         let table = self.catalog.load_table(&self.table_ident).await?;
         Ok(IcebergMetadataTableProvider { table, r#type })
+    }
+}
+
+use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
+
+pub fn upgrade_to_view_types(schema: &Schema) -> SchemaRef {
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| upgrade_top_level_field(f))
+        .collect();
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+fn upgrade_top_level_field(field: &Field) -> Field {
+    let new_type = upgrade_data_type(field.data_type());
+    Field::new(field.name(), new_type, field.is_nullable()).with_metadata(field.metadata().clone())
+}
+
+fn upgrade_nested_field(field: &Field) -> Field {
+    let new_type = upgrade_data_type(field.data_type());
+    Field::new(field.name(), new_type, field.is_nullable())
+}
+
+fn upgrade_data_type(dt: &DataType) -> DataType {
+    match dt {
+        DataType::Utf8 | DataType::LargeUtf8 => DataType::Utf8View,
+        DataType::Binary | DataType::LargeBinary => DataType::BinaryView,
+        DataType::Struct(fields) => {
+            let new_fields: Vec<Field> = fields.iter().map(|f| upgrade_nested_field(f)).collect();
+            DataType::Struct(Fields::from(new_fields))
+        }
+        DataType::List(inner) => DataType::List(Arc::new(upgrade_nested_field(inner))),
+        DataType::LargeList(inner) => DataType::LargeList(Arc::new(upgrade_nested_field(inner))),
+        DataType::Map(entry_field, sorted) => {
+            DataType::Map(Arc::new(upgrade_nested_field(entry_field)), *sorted)
+        }
+        other => other.clone(),
     }
 }
 
