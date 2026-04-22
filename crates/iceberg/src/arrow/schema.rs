@@ -673,7 +673,7 @@ impl SchemaVisitor for ToArrowSchemaConverter {
                 DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC_TIME_ZONE.into())),
             )),
             crate::spec::PrimitiveType::String => {
-                Ok(ArrowSchemaOrFieldOrType::Type(DataType::Utf8))
+                Ok(ArrowSchemaOrFieldOrType::Type(DataType::Utf8View))
             }
             crate::spec::PrimitiveType::Uuid => Ok(ArrowSchemaOrFieldOrType::Type(
                 DataType::FixedSizeBinary(16),
