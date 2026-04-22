@@ -62,23 +62,6 @@ pub fn project_with_partition(
 
     let input_schema = input.schema();
 
-    // Validate that input_schema matches the Iceberg table schema
-    // Strip metadata from both schemas before comparison to ignore metadata differences
-    let expected_arrow_schema =
-        schema_to_arrow_schema(table_schema.as_ref()).map_err(to_datafusion_error)?;
-    let input_schema_cleaned =
-        strip_metadata_from_schema(&input_schema).map_err(to_datafusion_error)?;
-    let expected_schema_cleaned =
-        strip_metadata_from_schema(&expected_arrow_schema).map_err(to_datafusion_error)?;
-
-    if input_schema_cleaned != expected_schema_cleaned {
-        return Err(DataFusionError::Plan(format!(
-            "Input schema does not match Iceberg table schema.\n\
-             Expected schema: {expected_schema_cleaned}\n\
-             Input schema: {input_schema_cleaned}"
-        )));
-    }
-
     let calculator =
         PartitionValueCalculator::try_new(partition_spec.as_ref(), table_schema.as_ref())
             .map_err(to_datafusion_error)?;
