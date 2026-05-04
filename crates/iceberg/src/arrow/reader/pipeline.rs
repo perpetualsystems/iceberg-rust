@@ -170,10 +170,8 @@ impl FileScanTaskReader {
 
             // If the caller supplied an Arrow schema override, apply it to the
             // assigned-ID schema so the Parquet decoder produces the caller's types.
-            let arrow_schema = apply_arrow_schema_override(
-                &arrow_schema,
-                self.arrow_schema_override.as_deref(),
-            );
+            let arrow_schema =
+                apply_arrow_schema_override(&arrow_schema, self.arrow_schema_override.as_deref());
             let options = ArrowReaderOptions::new().with_schema(arrow_schema);
             ArrowReaderMetadata::try_new(Arc::clone(arrow_metadata.metadata()), options).map_err(
                 |e| {

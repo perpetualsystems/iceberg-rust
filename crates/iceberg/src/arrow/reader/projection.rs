@@ -1852,10 +1852,12 @@ message schema {
     }
 
     fn field_with_id(name: &str, dt: DataType, nullable: bool, id: i32) -> FieldRef {
-        Arc::new(Field::new(name, dt, nullable).with_metadata(HashMap::from([(
-            PARQUET_FIELD_ID_META_KEY.to_string(),
-            id.to_string(),
-        )])))
+        Arc::new(
+            Field::new(name, dt, nullable).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                id.to_string(),
+            )])),
+        )
     }
 
     fn make_scan_task(
@@ -1947,8 +1949,7 @@ message schema {
             false,
             1,
         )]));
-        let override_schema =
-            ArrowSchema::new(vec![field_with_id("a", DataType::Int64, false, 1)]);
+        let override_schema = ArrowSchema::new(vec![field_with_id("a", DataType::Int64, false, 1)]);
 
         let result = super::apply_arrow_schema_override(&file, Some(&override_schema));
         assert_eq!(result.field(0).data_type(), &DataType::Int32);
