@@ -123,6 +123,23 @@ pub struct FileScanTask {
     #[serde(skip_deserializing)]
     pub split_offsets: Option<Vec<i64>>,
 
+    /// Per-column value counts from the manifest entry (column_id -> cell_count).
+    /// For nested types (map, list), the value is the inner-leaf cell count, which
+    /// can exceed `record_count`. Used for row/cell-aware scan size estimation
+    /// without re-reading manifests.
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
+    pub value_counts: Option<HashMap<i32, u64>>,
+
+    /// Per-column null value counts from the manifest entry (column_id -> null_count).
+    /// Subtracted from `value_counts` to get live cell counts for decode-cost
+    /// estimation.
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
+    pub null_value_counts: Option<HashMap<i32, u64>>,
+
     /// Whether this scan task should treat column names as case-sensitive when binding predicates.
     pub case_sensitive: bool,
 }

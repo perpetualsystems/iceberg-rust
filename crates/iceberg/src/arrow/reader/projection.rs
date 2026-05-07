@@ -701,6 +701,8 @@ message schema {
                 name_mapping: None,
                 column_sizes: None,
                 split_offsets: None,
+                value_counts: None,
+                null_value_counts: None,
                 case_sensitive: false,
             })]
             .into_iter(),
@@ -806,6 +808,8 @@ message schema {
                 name_mapping: None,
                 column_sizes: None,
                 split_offsets: None,
+                value_counts: None,
+                null_value_counts: None,
                 case_sensitive: false,
             })]
             .into_iter(),
@@ -910,6 +914,8 @@ message schema {
                 name_mapping: None,
                 column_sizes: None,
                 split_offsets: None,
+                value_counts: None,
+                null_value_counts: None,
                 case_sensitive: false,
             })]
             .into_iter(),
@@ -1003,6 +1009,8 @@ message schema {
                 name_mapping: None,
                 column_sizes: None,
                 split_offsets: None,
+                value_counts: None,
+                null_value_counts: None,
                 case_sensitive: false,
             })]
             .into_iter(),
@@ -1110,6 +1118,8 @@ message schema {
                 name_mapping: None,
                 column_sizes: None,
                 split_offsets: None,
+                value_counts: None,
+                null_value_counts: None,
                 case_sensitive: false,
             })]
             .into_iter(),
@@ -1246,6 +1256,8 @@ message schema {
                 name_mapping: None,
                 column_sizes: None,
                 split_offsets: None,
+                value_counts: None,
+                null_value_counts: None,
                 case_sensitive: false,
             })]
             .into_iter(),
@@ -1349,6 +1361,8 @@ message schema {
                 name_mapping: None,
                 column_sizes: None,
                 split_offsets: None,
+                value_counts: None,
+                null_value_counts: None,
                 case_sensitive: false,
             })]
             .into_iter(),
@@ -1465,6 +1479,8 @@ message schema {
                 name_mapping: None,
                 column_sizes: None,
                 split_offsets: None,
+                value_counts: None,
+                null_value_counts: None,
                 case_sensitive: false,
             })]
             .into_iter(),
@@ -1611,6 +1627,8 @@ message schema {
                 name_mapping: None,
                 column_sizes: None,
                 split_offsets: None,
+                value_counts: None,
+                null_value_counts: None,
                 case_sensitive: false,
             })]
             .into_iter(),
@@ -1825,6 +1843,8 @@ message schema {
                 name_mapping: None,
                 column_sizes: None,
                 split_offsets: None,
+                value_counts: None,
+                null_value_counts: None,
                 case_sensitive: false,
             })]
             .into_iter(),
@@ -1881,6 +1901,8 @@ message schema {
             name_mapping: None,
             column_sizes: None,
             split_offsets: None,
+            value_counts: None,
+            null_value_counts: None,
             case_sensitive: false,
         }
     }
