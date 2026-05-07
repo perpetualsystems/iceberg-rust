@@ -145,12 +145,7 @@ impl ManifestEntryContext {
                 .split_offsets()
                 .map(|s| s.to_vec()),
             value_counts: Some(self.manifest_entry.data_file().value_counts().clone()),
-            null_value_counts: Some(
-                self.manifest_entry
-                    .data_file()
-                    .null_value_counts()
-                    .clone(),
-            ),
+            null_value_counts: Some(self.manifest_entry.data_file().null_value_counts().clone()),
             case_sensitive: self.case_sensitive,
         })
     }
