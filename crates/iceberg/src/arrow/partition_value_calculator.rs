@@ -23,10 +23,10 @@
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, StructArray};
-use arrow_schema::{DataType, Schema as ArrowSchema};
+use arrow_schema::{DataType, Schema as ArrowSchema, SchemaRef};
 
 use super::record_batch_projector::{RecordBatchProjector, parquet_field_id};
-use super::schema::{schema_to_arrow_schema, strip_metadata_from_schema};
+use super::schema::schema_to_arrow_schema;
 use super::type_to_arrow_type;
 use crate::spec::{PartitionSpec, Schema, StructType, Type};
 use crate::transform::{BoxedTransformFunction, create_transform_function};
@@ -43,7 +43,7 @@ use crate::{Error, ErrorKind, Result};
 pub struct PartitionValueCalculator {
     source_field_ids: Vec<i32>,
     cached_projector: RecordBatchProjector,
-    expected_arrow_schema_stripped: ArrowSchema,
+    expected_arrow_schema: SchemaRef,
     transform_functions: Vec<BoxedTransformFunction>,
     partition_type: StructType,
     partition_arrow_type: DataType,
@@ -89,9 +89,8 @@ impl PartitionValueCalculator {
             .collect();
 
         let expected_arrow_schema = Arc::new(schema_to_arrow_schema(table_schema)?);
-        let expected_arrow_schema_stripped = strip_metadata_from_schema(&expected_arrow_schema)?;
         let cached_projector = RecordBatchProjector::new(
-            expected_arrow_schema,
+            expected_arrow_schema.clone(),
             &source_field_ids,
             parquet_field_id,
             |_| true,
@@ -103,7 +102,7 @@ impl PartitionValueCalculator {
         Ok(Self {
             source_field_ids,
             cached_projector,
-            expected_arrow_schema_stripped,
+            expected_arrow_schema,
             transform_functions,
             partition_type,
             partition_arrow_type,
@@ -142,8 +141,7 @@ impl PartitionValueCalculator {
     /// - Transform application fails
     /// - StructArray construction fails
     pub fn calculate(&self, batch: &RecordBatch) -> Result<ArrayRef> {
-        let stripped_actual = strip_metadata_from_schema(batch.schema_ref())?;
-        let source_columns = if stripped_actual == self.expected_arrow_schema_stripped {
+        let source_columns = if shapes_match(&self.expected_arrow_schema, batch.schema_ref()) {
             self.cached_projector.project_column(batch.columns())?
         } else {
             RecordBatchProjector::project_columns_by_field_id(batch, &self.source_field_ids)?
@@ -178,6 +176,25 @@ impl PartitionValueCalculator {
 
         Ok(Arc::new(struct_array))
     }
+}
+
+/// Structural equivalence between two arrow schemas, ignoring field names
+/// and metadata. Compares column count, per-field nullability, and data
+/// types via [`DataType::equals_datatype`] (which recursively compares
+/// nested types in `List`, `Map`, `Struct`, etc. without considering
+/// names or metadata).
+///
+/// Names are ignored on purpose: DataFusion's INSERT path delivers batches
+/// whose top-level columns may carry generated names like `column1`,
+/// `column2`, ... while still being positionally aligned with the iceberg
+/// schema. Cached positional projection is correct in that case.
+fn shapes_match(expected: &ArrowSchema, actual: &ArrowSchema) -> bool {
+    let ef = expected.fields();
+    let af = actual.fields();
+    ef.len() == af.len()
+        && ef.iter().zip(af).all(|(e, a)| {
+            e.is_nullable() == a.is_nullable() && e.data_type().equals_datatype(a.data_type())
+        })
 }
 
 #[cfg(test)]
