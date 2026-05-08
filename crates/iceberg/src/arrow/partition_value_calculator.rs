@@ -23,10 +23,10 @@
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, StructArray};
-use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef};
+use arrow_schema::{DataType, Schema as ArrowSchema};
 
 use super::record_batch_projector::{RecordBatchProjector, parquet_field_id};
-use super::schema::schema_to_arrow_schema;
+use super::schema::{schema_to_arrow_schema, strip_metadata_from_schema};
 use super::type_to_arrow_type;
 use crate::spec::{PartitionSpec, Schema, StructType, Type};
 use crate::transform::{BoxedTransformFunction, create_transform_function};
@@ -43,7 +43,7 @@ use crate::{Error, ErrorKind, Result};
 pub struct PartitionValueCalculator {
     source_field_ids: Vec<i32>,
     cached_projector: RecordBatchProjector,
-    expected_arrow_schema: SchemaRef,
+    expected_arrow_schema_stripped: ArrowSchema,
     transform_functions: Vec<BoxedTransformFunction>,
     partition_type: StructType,
     partition_arrow_type: DataType,
@@ -89,8 +89,9 @@ impl PartitionValueCalculator {
             .collect();
 
         let expected_arrow_schema = Arc::new(schema_to_arrow_schema(table_schema)?);
+        let expected_arrow_schema_stripped = strip_metadata_from_schema(&expected_arrow_schema)?;
         let cached_projector = RecordBatchProjector::new(
-            expected_arrow_schema.clone(),
+            expected_arrow_schema,
             &source_field_ids,
             parquet_field_id,
             |_| true,
@@ -102,7 +103,7 @@ impl PartitionValueCalculator {
         Ok(Self {
             source_field_ids,
             cached_projector,
-            expected_arrow_schema,
+            expected_arrow_schema_stripped,
             transform_functions,
             partition_type,
             partition_arrow_type,
@@ -141,7 +142,8 @@ impl PartitionValueCalculator {
     /// - Transform application fails
     /// - StructArray construction fails
     pub fn calculate(&self, batch: &RecordBatch) -> Result<ArrayRef> {
-        let source_columns = if shapes_match(&self.expected_arrow_schema, batch.schema_ref()) {
+        let stripped_actual = strip_metadata_from_schema(batch.schema_ref())?;
+        let source_columns = if stripped_actual == self.expected_arrow_schema_stripped {
             self.cached_projector.project_column(batch.columns())?
         } else {
             RecordBatchProjector::project_columns_by_field_id(batch, &self.source_field_ids)?
@@ -176,25 +178,6 @@ impl PartitionValueCalculator {
 
         Ok(Arc::new(struct_array))
     }
-}
-
-/// Compare two arrow schemas while ignoring `Field` metadata (recursively
-/// for struct types). `DataType` itself carries no metadata, so primitive
-/// data types fall through to derived equality.
-fn shapes_match(expected: &ArrowSchema, actual: &ArrowSchema) -> bool {
-    fn fields_match(a: &Field, b: &Field) -> bool {
-        a.name() == b.name()
-            && a.is_nullable() == b.is_nullable()
-            && match (a.data_type(), b.data_type()) {
-                (DataType::Struct(af), DataType::Struct(bf)) => {
-                    af.len() == bf.len() && af.iter().zip(bf).all(|(x, y)| fields_match(x, y))
-                }
-                (x, y) => x == y,
-            }
-    }
-    let af = expected.fields();
-    let bf = actual.fields();
-    af.len() == bf.len() && af.iter().zip(bf).all(|(x, y)| fields_match(x, y))
 }
 
 #[cfg(test)]
@@ -316,6 +299,83 @@ mod tests {
         assert_eq!(value_partition.value(0), 100);
         assert_eq!(value_partition.value(1), 200);
         assert_eq!(value_partition.value(2), 300);
+    }
+
+    /// Hand-built batches without `PARQUET:field_id` metadata should still
+    /// take the cached-position fast path even when the iceberg schema
+    /// contains compound types whose inner fields carry metadata (List, Map,
+    /// FixedSizeList, etc.). The fast-path check must compare schemas with
+    /// metadata stripped recursively.
+    #[test]
+    fn test_partition_calculator_fast_path_with_list_field() {
+        use arrow_array::builder::{Int32Builder, ListBuilder};
+
+        let table_schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(
+                    2,
+                    "items",
+                    Type::List(crate::spec::ListType {
+                        element_field: Arc::new(NestedField::required(
+                            3,
+                            "element",
+                            Type::Primitive(PrimitiveType::Int),
+                        )),
+                    }),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap();
+
+        let partition_spec = PartitionSpecBuilder::new(Arc::new(table_schema.clone()))
+            .add_partition_field("id", "id_partition", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let calculator = PartitionValueCalculator::try_new(&partition_spec, &table_schema).unwrap();
+
+        // Hand-built batch: same shape as the iceberg schema, but no
+        // PARQUET:field_id metadata anywhere — including on the List's inner
+        // element field.
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "items",
+                DataType::List(Arc::new(Field::new("element", DataType::Int32, false))),
+                false,
+            ),
+        ]));
+
+        let mut list_builder = ListBuilder::new(Int32Builder::new())
+            .with_field(Arc::new(Field::new("element", DataType::Int32, false)));
+        list_builder.values().append_value(7);
+        list_builder.append(true);
+        list_builder.values().append_value(8);
+        list_builder.append(true);
+
+        let batch = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(list_builder.finish()),
+        ])
+        .unwrap();
+
+        // Without metadata-stripping applied to the List's inner Field, the
+        // fast-path check would fail and the runtime fallback would error
+        // because the batch has no PARQUET:field_id metadata.
+        let result = calculator.calculate(&batch).unwrap();
+        let struct_array = result.as_any().downcast_ref::<StructArray>().unwrap();
+        let id_partition = struct_array
+            .column_by_name("id_partition")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(id_partition.value(0), 1);
+        assert_eq!(id_partition.value(1), 2);
     }
 
     #[test]
