@@ -27,7 +27,7 @@ use itertools::Itertools;
 use parquet::arrow::AsyncArrowWriter;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::async_writer::AsyncFileWriter as ArrowAsyncFileWriter;
-use parquet::file::metadata::ParquetMetaData;
+use parquet::file::metadata::{ParquetMetaData, SortingColumn};
 use parquet::file::properties::WriterProperties;
 use parquet::file::statistics::Statistics;
 
@@ -39,8 +39,8 @@ use crate::arrow::{
 use crate::io::{FileIO, FileWrite, OutputFile};
 use crate::spec::{
     DataContentType, DataFileBuilder, DataFileFormat, Datum, ListType, Literal, MapType,
-    NestedFieldRef, PartitionSpec, PrimitiveType, Schema, SchemaRef, SchemaVisitor, Struct,
-    StructType, TableMetadata, Type, visit_schema,
+    NestedFieldRef, NullOrder, PartitionSpec, PrimitiveType, Schema, SchemaRef, SchemaVisitor,
+    SortDirection, SortOrder, Struct, StructType, TableMetadata, Type, visit_schema,
 };
 use crate::transform::create_transform_function;
 use crate::writer::{CurrentFileStatus, DataFile};
@@ -231,6 +231,138 @@ impl SchemaVisitor for IndexByParquetPathName {
 
         Ok(())
     }
+}
+
+/// Walks an Iceberg schema and records the Parquet leaf-column index for each
+/// primitive (leaf) field id. Used by [`sorting_columns_from_sort_order`] to
+/// translate `SortField.source_id` into a Parquet `column_idx`.
+struct LeafIndexByFieldId {
+    field_id_to_leaf: HashMap<i32, usize>,
+    leaf_counter: usize,
+    current_field_id: i32,
+}
+
+impl LeafIndexByFieldId {
+    fn new() -> Self {
+        Self {
+            field_id_to_leaf: HashMap::new(),
+            leaf_counter: 0,
+            current_field_id: 0,
+        }
+    }
+
+    fn get(&self, field_id: i32) -> Option<&usize> {
+        self.field_id_to_leaf.get(&field_id)
+    }
+}
+
+impl SchemaVisitor for LeafIndexByFieldId {
+    type T = ();
+
+    fn before_struct_field(&mut self, field: &NestedFieldRef) -> Result<()> {
+        self.current_field_id = field.id;
+        Ok(())
+    }
+
+    fn before_list_element(&mut self, field: &NestedFieldRef) -> Result<()> {
+        self.current_field_id = field.id;
+        Ok(())
+    }
+
+    fn before_map_key(&mut self, field: &NestedFieldRef) -> Result<()> {
+        self.current_field_id = field.id;
+        Ok(())
+    }
+
+    fn before_map_value(&mut self, field: &NestedFieldRef) -> Result<()> {
+        self.current_field_id = field.id;
+        Ok(())
+    }
+
+    fn schema(&mut self, _schema: &Schema, _value: Self::T) -> Result<Self::T> {
+        Ok(())
+    }
+
+    fn field(&mut self, _field: &NestedFieldRef, _value: Self::T) -> Result<Self::T> {
+        Ok(())
+    }
+
+    fn r#struct(&mut self, _struct: &StructType, _results: Vec<Self::T>) -> Result<Self::T> {
+        Ok(())
+    }
+
+    fn list(&mut self, _list: &ListType, _value: Self::T) -> Result<Self::T> {
+        Ok(())
+    }
+
+    fn map(&mut self, _map: &MapType, _key_value: Self::T, _value: Self::T) -> Result<Self::T> {
+        Ok(())
+    }
+
+    fn primitive(&mut self, _p: &PrimitiveType) -> Result<Self::T> {
+        self.field_id_to_leaf
+            .insert(self.current_field_id, self.leaf_counter);
+        self.leaf_counter += 1;
+        Ok(())
+    }
+}
+
+/// Map an Iceberg [`SortOrder`] onto Parquet [`SortingColumn`] entries by walking
+/// the schema for leaf-column indices.
+///
+/// Each `SortField.source_id` is resolved to its Parquet leaf-column position
+/// (NOT its Iceberg field id). The `SortField.transform` is intentionally
+/// ignored — this helper returns the *physical* column ordering claim, which is
+/// what callers like sorted-compaction writers actually achieve when their
+/// SortExec sorts by the raw source columns. The Iceberg-manifest-level
+/// `sort_order_id` field continues to carry the logical (transform-aware) sort
+/// claim; the two layers are complementary.
+///
+/// # Reader semantics
+///
+/// Per the [Parquet spec], the entries in `Vec<SortingColumn>` are interpreted
+/// as **lex order** (primary, secondary, …) — not as independently-sorted
+/// columns. Some readers (notably Polars as of [issue #23151]) misinterpret
+/// multi-column stamps as independently-sorted; that is a reader bug and does
+/// not affect the correctness of the stamp itself.
+///
+/// [Parquet spec]: https://github.com/apache/parquet-format/blob/master/src/main/thrift/parquet.thrift
+/// [issue #23151]: https://github.com/pola-rs/polars/issues/23151
+///
+/// # Returns
+///
+/// `None` if any of the following hold:
+/// - The sort order has zero fields (unsorted).
+/// - Any `source_id` is not present in `schema`'s leaf set (schema evolution
+///   dropped the column, or the source is a non-primitive).
+/// - Any computed leaf index exceeds `i32::MAX` (pathological schema).
+///
+/// `Some(cols)` otherwise. Order matches `sort_order.fields`.
+pub fn sorting_columns_from_sort_order(
+    schema: SchemaRef,
+    sort_order: &SortOrder,
+) -> Option<Vec<SortingColumn>> {
+    if sort_order.is_unsorted() {
+        return None;
+    }
+
+    let leaf_index = {
+        let mut visitor = LeafIndexByFieldId::new();
+        visit_schema(&schema, &mut visitor).ok()?;
+        visitor
+    };
+
+    let mut cols = Vec::with_capacity(sort_order.fields.len());
+    for field in &sort_order.fields {
+        let &leaf = leaf_index.get(field.source_id)?;
+        let column_idx = i32::try_from(leaf).ok()?;
+        cols.push(SortingColumn {
+            column_idx,
+            descending: matches!(field.direction, SortDirection::Descending),
+            nulls_first: matches!(field.null_order, NullOrder::First),
+        });
+    }
+    Some(cols)
 }
 
 /// `ParquetWriter`` is used to write arrow data into parquet file on storage.
@@ -2321,5 +2453,284 @@ mod tests {
 
         assert_eq!(lower_bounds, HashMap::from([(0, Datum::int(i32::MIN))]));
         assert_eq!(upper_bounds, HashMap::from([(0, Datum::int(i32::MAX))]));
+    }
+
+    fn two_int_schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(0, "a", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::required(1, "b", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn timestamp_schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(0, "ts", Type::Primitive(PrimitiveType::Timestamp))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn int_schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(0, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn sort_field(
+        source_id: i32,
+        transform: Transform,
+        direction: SortDirection,
+        null_order: NullOrder,
+    ) -> SortField {
+        SortField {
+            source_id,
+            transform,
+            direction,
+            null_order,
+        }
+    }
+
+    #[test]
+    fn sorting_columns_identity_single_asc_nulls_last() {
+        let order = SortOrder {
+            order_id: 1,
+            fields: vec![sort_field(
+                0,
+                Transform::Identity,
+                SortDirection::Ascending,
+                NullOrder::Last,
+            )],
+        };
+        let cols = sorting_columns_from_sort_order(two_int_schema(), &order);
+        assert_eq!(
+            cols,
+            Some(vec![SortingColumn {
+                column_idx: 0,
+                descending: false,
+                nulls_first: false,
+            }])
+        );
+    }
+
+    #[test]
+    fn sorting_columns_identity_single_asc_nulls_first() {
+        let order = SortOrder {
+            order_id: 1,
+            fields: vec![sort_field(
+                0,
+                Transform::Identity,
+                SortDirection::Ascending,
+                NullOrder::First,
+            )],
+        };
+        let cols = sorting_columns_from_sort_order(two_int_schema(), &order);
+        assert_eq!(
+            cols,
+            Some(vec![SortingColumn {
+                column_idx: 0,
+                descending: false,
+                nulls_first: true,
+            }])
+        );
+    }
+
+    #[test]
+    fn sorting_columns_identity_single_desc_nulls_last() {
+        let order = SortOrder {
+            order_id: 1,
+            fields: vec![sort_field(
+                0,
+                Transform::Identity,
+                SortDirection::Descending,
+                NullOrder::Last,
+            )],
+        };
+        let cols = sorting_columns_from_sort_order(two_int_schema(), &order);
+        assert_eq!(
+            cols,
+            Some(vec![SortingColumn {
+                column_idx: 0,
+                descending: true,
+                nulls_first: false,
+            }])
+        );
+    }
+
+    #[test]
+    fn sorting_columns_identity_multi_lex() {
+        let order = SortOrder {
+            order_id: 1,
+            fields: vec![
+                sort_field(
+                    0,
+                    Transform::Identity,
+                    SortDirection::Ascending,
+                    NullOrder::First,
+                ),
+                sort_field(
+                    1,
+                    Transform::Identity,
+                    SortDirection::Descending,
+                    NullOrder::Last,
+                ),
+            ],
+        };
+        let cols = sorting_columns_from_sort_order(two_int_schema(), &order);
+        assert_eq!(
+            cols,
+            Some(vec![
+                SortingColumn {
+                    column_idx: 0,
+                    descending: false,
+                    nulls_first: true,
+                },
+                SortingColumn {
+                    column_idx: 1,
+                    descending: true,
+                    nulls_first: false,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn sorting_columns_non_identity_transform_stamps_source_column() {
+        let order = SortOrder {
+            order_id: 1,
+            fields: vec![sort_field(
+                0,
+                Transform::Day,
+                SortDirection::Ascending,
+                NullOrder::Last,
+            )],
+        };
+        let cols = sorting_columns_from_sort_order(timestamp_schema(), &order);
+        assert_eq!(
+            cols,
+            Some(vec![SortingColumn {
+                column_idx: 0,
+                descending: false,
+                nulls_first: false,
+            }])
+        );
+    }
+
+    #[test]
+    fn sorting_columns_bucket_transform_stamps_source_column() {
+        let order = SortOrder {
+            order_id: 1,
+            fields: vec![sort_field(
+                0,
+                Transform::Bucket(16),
+                SortDirection::Ascending,
+                NullOrder::Last,
+            )],
+        };
+        let cols = sorting_columns_from_sort_order(int_schema(), &order);
+        assert_eq!(
+            cols,
+            Some(vec![SortingColumn {
+                column_idx: 0,
+                descending: false,
+                nulls_first: false,
+            }])
+        );
+    }
+
+    #[test]
+    fn sorting_columns_nested_struct_leaf() {
+        let schema = Arc::new(nested_schema_for_test());
+        let order = SortOrder {
+            order_id: 1,
+            fields: vec![sort_field(
+                5,
+                Transform::Identity,
+                SortDirection::Ascending,
+                NullOrder::Last,
+            )],
+        };
+        let cols = sorting_columns_from_sort_order(schema, &order);
+        assert_eq!(
+            cols,
+            Some(vec![SortingColumn {
+                column_idx: 1,
+                descending: false,
+                nulls_first: false,
+            }])
+        );
+    }
+
+    #[test]
+    fn sorting_columns_top_level_after_nested_struct() {
+        let schema = Arc::new(nested_schema_for_test());
+        let order = SortOrder {
+            order_id: 1,
+            fields: vec![sort_field(
+                2,
+                Transform::Identity,
+                SortDirection::Ascending,
+                NullOrder::Last,
+            )],
+        };
+        let cols = sorting_columns_from_sort_order(schema, &order);
+        assert_eq!(
+            cols,
+            Some(vec![SortingColumn {
+                column_idx: 3,
+                descending: false,
+                nulls_first: false,
+            }])
+        );
+    }
+
+    #[test]
+    fn sorting_columns_missing_field_id_returns_none() {
+        let order = SortOrder {
+            order_id: 1,
+            fields: vec![sort_field(
+                999,
+                Transform::Identity,
+                SortDirection::Ascending,
+                NullOrder::Last,
+            )],
+        };
+        let cols = sorting_columns_from_sort_order(two_int_schema(), &order);
+        assert_eq!(cols, None);
+    }
+
+    #[test]
+    fn sorting_columns_unsorted_order_returns_none() {
+        let order = SortOrder::unsorted_order();
+        let cols = sorting_columns_from_sort_order(two_int_schema(), &order);
+        assert_eq!(cols, None);
+    }
+
+    #[test]
+    fn sorting_column_struct_fields_compile_time_canary() {
+        let col = SortingColumn {
+            column_idx: 0,
+            descending: false,
+            nulls_first: true,
+        };
+        assert_eq!(col.column_idx, 0);
+        assert!(!col.descending);
+        assert!(col.nulls_first);
     }
 }

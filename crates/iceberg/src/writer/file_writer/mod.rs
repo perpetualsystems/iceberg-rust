@@ -25,7 +25,7 @@ use crate::Result;
 use crate::spec::DataFileBuilder;
 
 mod parquet_writer;
-pub use parquet_writer::{ParquetWriter, ParquetWriterBuilder};
+pub use parquet_writer::{ParquetWriter, ParquetWriterBuilder, sorting_columns_from_sort_order};
 
 use crate::io::OutputFile;
 
