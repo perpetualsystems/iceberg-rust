@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use crate::Result;
 use crate::expr::BoundPredicate;
 use crate::spec::{
-    DataContentType, DataFileFormat, ManifestEntryRef, NameMapping, PartitionSpec, Schema,
+    DataContentType, DataFileFormat, Datum, ManifestEntryRef, NameMapping, PartitionSpec, Schema,
     SchemaRef, Struct,
 };
 
@@ -122,6 +122,22 @@ pub struct FileScanTask {
     #[serde(skip_serializing)]
     #[serde(skip_deserializing)]
     pub split_offsets: Option<Vec<i64>>,
+
+    /// Per-column lower bounds (field_id -> value) from the manifest
+    /// entry. Lets a planner reason about a file's value ranges (e.g.
+    /// newest-first ordering on a sort column) without re-reading
+    /// manifests. Planning-only, like `column_sizes`.
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
+    pub lower_bounds: Option<HashMap<i32, Datum>>,
+
+    /// Per-column upper bounds (field_id -> value) from the manifest
+    /// entry. See [`Self::lower_bounds`].
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
+    pub upper_bounds: Option<HashMap<i32, Datum>>,
 
     /// Whether this scan task should treat column names as case-sensitive when binding predicates.
     pub case_sensitive: bool,

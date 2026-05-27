@@ -144,6 +144,8 @@ impl ManifestEntryContext {
                 .data_file()
                 .split_offsets()
                 .map(|s| s.to_vec()),
+            lower_bounds: Some(self.manifest_entry.data_file().lower_bounds().clone()),
+            upper_bounds: Some(self.manifest_entry.data_file().upper_bounds().clone()),
             case_sensitive: self.case_sensitive,
         })
     }
