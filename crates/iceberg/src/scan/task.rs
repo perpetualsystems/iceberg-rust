@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use crate::Result;
 use crate::expr::BoundPredicate;
 use crate::spec::{
-    DataContentType, DataFileFormat, ManifestEntryRef, NameMapping, PartitionSpec, Schema,
+    DataContentType, DataFileFormat, Datum, ManifestEntryRef, NameMapping, PartitionSpec, Schema,
     SchemaRef, Struct,
 };
 
@@ -122,6 +122,37 @@ pub struct FileScanTask {
     #[serde(skip_serializing)]
     #[serde(skip_deserializing)]
     pub split_offsets: Option<Vec<i64>>,
+
+    /// Per-column lower bounds (field_id -> value) from the manifest
+    /// entry. `None` when the manifest records no bounds (never
+    /// `Some` of an empty map). Lets a planner reason about a file's
+    /// value ranges (e.g. newest-first ordering on a sort column)
+    /// without re-reading manifests. Planning-only, like `column_sizes`.
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
+    pub lower_bounds: Option<HashMap<i32, Datum>>,
+
+    /// Per-column upper bounds (field_id -> value) from the manifest
+    /// entry. See [`Self::lower_bounds`].
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
+    pub upper_bounds: Option<HashMap<i32, Datum>>,
+
+    /// The id of the sort order this file was written with, from the
+    /// manifest entry. Sort order id `0` is reserved for the unsorted
+    /// order, so a file's rows are physically sorted in the table's
+    /// current order only when this is `Some(id)` with
+    /// `id == default_sort_order_id` *and* `id != 0`; `Some(0)` or
+    /// `None` means unsorted (do not treat `default_sort_order_id == 0`
+    /// as a sorted match). Lets a planner advertise a scan's output
+    /// ordering (skipping a redundant sort) only for files actually
+    /// written sorted. Planning-only, like `column_sizes`.
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
+    pub sort_order_id: Option<i32>,
 
     /// Whether this scan task should treat column names as case-sensitive when binding predicates.
     pub case_sensitive: bool,

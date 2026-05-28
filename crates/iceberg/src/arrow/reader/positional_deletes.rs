@@ -456,6 +456,9 @@ mod tests {
             name_mapping: None,
             column_sizes: None,
             split_offsets: None,
+            lower_bounds: None,
+            upper_bounds: None,
+            sort_order_id: None,
             case_sensitive: false,
         };
 
@@ -679,6 +682,9 @@ mod tests {
             name_mapping: None,
             column_sizes: None,
             split_offsets: None,
+            lower_bounds: None,
+            upper_bounds: None,
+            sort_order_id: None,
             case_sensitive: false,
         };
 
@@ -896,6 +902,9 @@ mod tests {
             name_mapping: None,
             column_sizes: None,
             split_offsets: None,
+            lower_bounds: None,
+            upper_bounds: None,
+            sort_order_id: None,
             case_sensitive: false,
         };
 
