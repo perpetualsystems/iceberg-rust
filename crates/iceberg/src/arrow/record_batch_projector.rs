@@ -117,6 +117,31 @@ impl RecordBatchProjector {
         )
     }
 
+    /// Create RecordBatchProjector by resolving fields from Arrow field names.
+    ///
+    /// Each name may be either a top-level field name or a dot-separated path
+    /// through nested struct fields.
+    pub(crate) fn new_by_names(original_schema: SchemaRef, field_names: &[String]) -> Result<Self> {
+        let mut field_indices = Vec::with_capacity(field_names.len());
+        let mut fields = Vec::with_capacity(field_names.len());
+        for name in field_names {
+            let mut field_index = vec![];
+            let field =
+                Self::fetch_field_index_by_name(original_schema.fields(), &mut field_index, name)?
+                    .ok_or_else(|| {
+                        Error::new(ErrorKind::Unexpected, "Field not found")
+                            .with_context("field_name", name.clone())
+                    })?;
+            fields.push(field.clone());
+            field_indices.push(field_index);
+        }
+        let projected_schema = Arc::new(Schema::new(fields));
+        Ok(Self {
+            field_indices,
+            projected_schema,
+        })
+    }
+
     fn fetch_field_index<F1, F2>(
         fields: &Fields,
         index_vec: &mut Vec<usize>,
@@ -149,6 +174,57 @@ impl RecordBatchProjector {
                 index_vec.push(pos);
                 return Ok(Some(res));
             }
+        }
+        Ok(None)
+    }
+
+    fn fetch_field_index_by_name(
+        fields: &Fields,
+        index_vec: &mut Vec<usize>,
+        target_field_name: &str,
+    ) -> Result<Option<FieldRef>> {
+        let mut path = target_field_name.split('.');
+        let Some(first) = path.next() else {
+            return Ok(None);
+        };
+        Self::fetch_field_index_by_name_path(fields, index_vec, first, path)
+    }
+
+    fn fetch_field_index_by_name_path<'a>(
+        fields: &Fields,
+        index_vec: &mut Vec<usize>,
+        target_name: &str,
+        mut remaining_path: impl Iterator<Item = &'a str> + Clone,
+    ) -> Result<Option<FieldRef>> {
+        for (pos, field) in fields.iter().enumerate() {
+            if field.name() != target_name {
+                continue;
+            }
+
+            let Some(next_name) = remaining_path.next() else {
+                index_vec.push(pos);
+                return Ok(Some(field.clone()));
+            };
+
+            let DataType::Struct(inner) = field.data_type() else {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    "Cannot resolve nested field by name through non-struct field",
+                )
+                .with_context("field_name", field.name().to_string()));
+            };
+
+            if let Some(res) = Self::fetch_field_index_by_name_path(
+                inner,
+                index_vec,
+                next_name,
+                remaining_path.clone(),
+            )? {
+                index_vec.push(pos);
+                return Ok(Some(res));
+            }
+
+            return Ok(None);
         }
         Ok(None)
     }
@@ -186,6 +262,17 @@ impl RecordBatchProjector {
         projector.project_column(batch.columns())
     }
 
+    /// Project columns by looking up each target field name in the runtime
+    /// batch's Arrow schema. Names may be dot-separated paths through nested
+    /// struct fields.
+    pub fn project_columns_by_name(
+        batch: &RecordBatch,
+        target_field_names: &[String],
+    ) -> Result<Vec<ArrayRef>> {
+        let projector = Self::new_by_names(batch.schema(), target_field_names)?;
+        projector.project_column(batch.columns())
+    }
+
     pub(crate) fn get_column_by_field_index(
         batch: &[ArrayRef],
         field_index: &[usize],
@@ -215,7 +302,8 @@ impl RecordBatchProjector {
 mod test {
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray, StructArray};
+    use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, StringArray, StructArray};
+    use arrow_buffer::NullBuffer;
     use arrow_schema::{DataType, Field, Fields, Schema};
 
     use crate::arrow::record_batch_projector::RecordBatchProjector;
@@ -346,6 +434,181 @@ mod test {
         let projector =
             RecordBatchProjector::new(schema.clone(), &[3], field_id_fetch_func, |_| true);
         assert!(projector.is_ok());
+    }
+
+    #[test]
+    fn test_record_batch_projector_name_lookup_top_level_and_nested() {
+        let inner_fields = vec![
+            Field::new("inner_field1", DataType::Int32, false),
+            Field::new("inner_field2", DataType::Utf8, false),
+        ];
+        let fields = vec![
+            Field::new(
+                "field2",
+                DataType::Struct(Fields::from(inner_fields.clone())),
+                false,
+            ),
+            Field::new("field1", DataType::Int32, false),
+        ];
+        let schema = Arc::new(Schema::new(fields));
+        let field_names = vec!["field1".to_string(), "field2.inner_field2".to_string()];
+
+        let projector = RecordBatchProjector::new_by_names(schema.clone(), &field_names).unwrap();
+
+        assert_eq!(projector.field_indices.len(), 2);
+        assert_eq!(projector.field_indices[0], vec![1]);
+        assert_eq!(projector.field_indices[1], vec![1, 0]);
+        assert_eq!(projector.projected_schema_ref().fields().len(), 2);
+        assert_eq!(projector.projected_schema_ref().field(0).name(), "field1");
+        assert_eq!(
+            projector.projected_schema_ref().field(1).name(),
+            "inner_field2"
+        );
+
+        let inner_int_array = Arc::new(Int32Array::from(vec![4, 5, 6])) as ArrayRef;
+        let inner_string_array = Arc::new(StringArray::from(vec!["x", "y", "z"])) as ArrayRef;
+        let struct_array = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(inner_fields[0].clone()),
+                inner_int_array as ArrayRef,
+            ),
+            (
+                Arc::new(inner_fields[1].clone()),
+                inner_string_array as ArrayRef,
+            ),
+        ])) as ArrayRef;
+        let int_array = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![struct_array, int_array]).unwrap();
+
+        let projected_batch = projector.project_batch(batch).unwrap();
+        assert_eq!(projected_batch.num_columns(), 2);
+        let projected_int_array = projected_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let projected_inner_string_array = projected_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        assert_eq!(projected_int_array.values(), &[1, 2, 3]);
+        assert_eq!(projected_inner_string_array.value(0), "x");
+        assert_eq!(projected_inner_string_array.value(1), "y");
+        assert_eq!(projected_inner_string_array.value(2), "z");
+    }
+
+    #[test]
+    fn test_project_columns_by_name_uses_runtime_schema_order() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("b", DataType::Int32, false),
+            Field::new("a", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![10, 20, 30])) as ArrayRef,
+        ])
+        .unwrap();
+        let field_names = vec!["a".to_string(), "b".to_string()];
+
+        let columns = RecordBatchProjector::project_columns_by_name(&batch, &field_names).unwrap();
+
+        assert_eq!(columns.len(), 2);
+        let a = columns[0].as_any().downcast_ref::<Int32Array>().unwrap();
+        let b = columns[1].as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(a.values(), &[10, 20, 30]);
+        assert_eq!(b.values(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn test_project_columns_by_name_preserves_nested_nulls() {
+        let inner_fields = Fields::from(vec![Field::new("inner_field", DataType::Int32, true)]);
+        let fields = vec![Field::new(
+            "field2",
+            DataType::Struct(inner_fields.clone()),
+            true,
+        )];
+        let schema = Arc::new(Schema::new(fields));
+        let inner_int_array = Arc::new(Int32Array::from(vec![Some(1), Some(2), None]));
+        let nulls = NullBuffer::from(vec![true, false, true]);
+        let struct_array = Arc::new(StructArray::new(
+            inner_fields,
+            vec![inner_int_array],
+            Some(nulls),
+        )) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![struct_array]).unwrap();
+        let field_names = vec!["field2.inner_field".to_string()];
+
+        let columns = RecordBatchProjector::project_columns_by_name(&batch, &field_names).unwrap();
+
+        assert_eq!(columns.len(), 1);
+        let projected = columns[0].as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(projected.len(), 3);
+        assert_eq!(projected.value(0), 1);
+        assert!(projected.is_null(1));
+        assert!(projected.is_null(2));
+    }
+
+    #[test]
+    fn test_name_field_not_found() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "field1",
+            DataType::Int32,
+            false,
+        )]));
+        let field_names = vec!["missing".to_string()];
+
+        let projector = RecordBatchProjector::new_by_names(schema, &field_names);
+
+        assert!(projector.is_err());
+        assert!(
+            projector
+                .unwrap_err()
+                .to_string()
+                .contains("Field not found")
+        );
+    }
+
+    #[test]
+    fn test_nested_name_field_not_found() {
+        let inner_fields = vec![Field::new("inner_field1", DataType::Int32, false)];
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "field2",
+            DataType::Struct(Fields::from(inner_fields)),
+            false,
+        )]));
+        let field_names = vec!["field2.missing".to_string()];
+
+        let projector = RecordBatchProjector::new_by_names(schema, &field_names);
+
+        assert!(projector.is_err());
+        assert!(
+            projector
+                .unwrap_err()
+                .to_string()
+                .contains("Field not found")
+        );
+    }
+
+    #[test]
+    fn test_nested_name_through_non_struct_field() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "field1",
+            DataType::Int32,
+            false,
+        )]));
+        let field_names = vec!["field1.inner_field".to_string()];
+
+        let projector = RecordBatchProjector::new_by_names(schema, &field_names);
+
+        assert!(projector.is_err());
+        assert!(
+            projector
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot resolve nested field by name through non-struct field")
+        );
     }
 
     #[test]

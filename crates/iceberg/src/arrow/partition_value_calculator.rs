@@ -27,26 +27,32 @@ use arrow_schema::{DataType, Schema as ArrowSchema};
 
 use super::record_batch_projector::{RecordBatchProjector, parquet_field_id};
 use super::schema::schema_to_arrow_schema;
-use super::type_to_arrow_type;
+use super::{FieldMatchMode, type_to_arrow_type};
 use crate::spec::{PartitionSpec, Schema, StructType, Type};
 use crate::transform::{BoxedTransformFunction, create_transform_function};
 use crate::{Error, ErrorKind, Result};
 
 /// Calculator for partition values in Iceberg tables.
 ///
-/// Source columns are pulled by cached position when the runtime batch's
-/// shape matches the iceberg-derived arrow schema (modulo metadata), and by
-/// runtime `PARQUET:field_id` lookup otherwise. The fallback exists because
-/// optimizer passes like DataFusion's projection unification can reshape the
-/// input batch out from under cached positions.
+/// In the default id matching mode, source columns are pulled by cached
+/// position when the runtime batch's shape matches the iceberg-derived arrow
+/// schema (modulo metadata), and by runtime `PARQUET:field_id` lookup
+/// otherwise. The fallback exists because optimizer passes like DataFusion's
+/// projection unification can reshape the input batch out from under cached
+/// positions.
+///
+/// Name matching mode resolves source columns from the runtime batch by the
+/// table schema source names instead.
 #[derive(Debug)]
 pub struct PartitionValueCalculator {
     source_field_ids: Vec<i32>,
+    source_field_names: Vec<String>,
     cached_projector: RecordBatchProjector,
     expected_field_ids: Vec<i64>,
     transform_functions: Vec<BoxedTransformFunction>,
     partition_type: StructType,
     partition_arrow_type: DataType,
+    match_mode: FieldMatchMode,
 }
 
 impl PartitionValueCalculator {
@@ -67,6 +73,19 @@ impl PartitionValueCalculator {
     /// - The partition spec is unpartitioned
     /// - Transform function creation fails
     pub fn try_new(partition_spec: &PartitionSpec, table_schema: &Schema) -> Result<Self> {
+        Self::try_new_with_match_mode(partition_spec, table_schema, FieldMatchMode::Id)
+    }
+
+    /// Create a new PartitionValueCalculator with a source-field matching mode.
+    ///
+    /// `FieldMatchMode::Id` preserves the existing behavior. `FieldMatchMode::Name`
+    /// resolves runtime source columns by the table schema field names for the
+    /// partition source ids.
+    pub fn try_new_with_match_mode(
+        partition_spec: &PartitionSpec,
+        table_schema: &Schema,
+        match_mode: FieldMatchMode,
+    ) -> Result<Self> {
         if partition_spec.is_unpartitioned() {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -87,6 +106,25 @@ impl PartitionValueCalculator {
             .iter()
             .map(|pf| pf.source_id)
             .collect();
+
+        let source_field_names: Vec<String> = partition_spec
+            .fields()
+            .iter()
+            .map(|pf| {
+                table_schema
+                    .name_by_field_id(pf.source_id)
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "Cannot find partition source field with id `{}` in schema",
+                                pf.source_id
+                            ),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let expected_arrow_schema = Arc::new(schema_to_arrow_schema(table_schema)?);
         let cached_projector = RecordBatchProjector::new(
@@ -119,11 +157,13 @@ impl PartitionValueCalculator {
 
         Ok(Self {
             source_field_ids,
+            source_field_names,
             cached_projector,
             expected_field_ids,
             transform_functions,
             partition_type,
             partition_arrow_type,
+            match_mode,
         })
     }
 
@@ -159,10 +199,20 @@ impl PartitionValueCalculator {
     /// - Transform application fails
     /// - StructArray construction fails
     pub fn calculate(&self, batch: &RecordBatch) -> Result<ArrayRef> {
-        let source_columns = if positions_aligned(&self.expected_field_ids, batch.schema_ref()) {
-            self.cached_projector.project_column(batch.columns())?
-        } else {
-            RecordBatchProjector::project_columns_by_field_id(batch, &self.source_field_ids)?
+        let source_columns = match self.match_mode {
+            FieldMatchMode::Id => {
+                if positions_aligned(&self.expected_field_ids, batch.schema_ref()) {
+                    self.cached_projector.project_column(batch.columns())?
+                } else {
+                    RecordBatchProjector::project_columns_by_field_id(
+                        batch,
+                        &self.source_field_ids,
+                    )?
+                }
+            }
+            FieldMatchMode::Name => {
+                RecordBatchProjector::project_columns_by_name(batch, &self.source_field_names)?
+            }
         };
 
         // Get expected struct fields for the result
@@ -324,6 +374,67 @@ mod tests {
         .unwrap();
 
         let result = calculator.calculate(&batch).unwrap();
+        let struct_array = result.as_any().downcast_ref::<StructArray>().unwrap();
+        let value_partition = struct_array
+            .column_by_name("value_partition")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        assert_eq!(value_partition.value(0), 100);
+        assert_eq!(value_partition.value(1), 200);
+        assert_eq!(value_partition.value(2), 300);
+    }
+
+    /// Name mode supports write paths whose runtime columns have the right
+    /// names but no target `PARQUET:field_id` metadata.
+    #[test]
+    fn test_partition_calculator_name_mode_runtime_name_lookup() {
+        let table_schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "value", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(3, "tag", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let partition_spec = PartitionSpecBuilder::new(Arc::new(table_schema.clone()))
+            .add_partition_field("value", "value_partition", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // Shape-different runtime batch with correct source names but no
+        // field-id metadata. This is the shape Phantom DML can produce after
+        // computed/retargeted projections.
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("tag", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+
+        let batch = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            Arc::new(Int32Array::from(vec![100, 200, 300])),
+        ])
+        .unwrap();
+
+        let id_calculator =
+            PartitionValueCalculator::try_new(&partition_spec, &table_schema).unwrap();
+        assert!(
+            id_calculator.calculate(&batch).is_err(),
+            "default id mode should still require field-id metadata for reshaped batches"
+        );
+
+        let name_calculator = PartitionValueCalculator::try_new_with_match_mode(
+            &partition_spec,
+            &table_schema,
+            FieldMatchMode::Name,
+        )
+        .unwrap();
+        let result = name_calculator.calculate(&batch).unwrap();
         let struct_array = result.as_any().downcast_ref::<StructArray>().unwrap();
         let value_partition = struct_array
             .column_by_name("value_partition")

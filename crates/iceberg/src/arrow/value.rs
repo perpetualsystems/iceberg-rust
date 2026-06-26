@@ -438,7 +438,7 @@ impl SchemaWithPartnerVisitor<ArrayRef> for ArrowArrayToIcebergStructConverter {
 /// against schema evolution where field names might change but IDs remain stable.
 /// The name matching mode can be useful in scenarios where field IDs are not available
 /// or when working with systems that don't preserve field IDs.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FieldMatchMode {
     /// Match fields by their ID stored in Arrow field metadata
     Id,
