@@ -27,8 +27,8 @@ use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{ColumnarValue, ExecutionPlan};
 use iceberg::arrow::{
-    PROJECTED_PARTITION_VALUE_COLUMN, PartitionValueCalculator, schema_to_arrow_schema,
-    strip_metadata_from_schema,
+    FieldMatchMode, PROJECTED_PARTITION_VALUE_COLUMN, PartitionValueCalculator,
+    schema_to_arrow_schema, strip_metadata_from_schema,
 };
 use iceberg::spec::PartitionSpec;
 use iceberg::table::Table;
@@ -51,6 +51,16 @@ use crate::to_datafusion_error;
 pub fn project_with_partition(
     input: Arc<dyn ExecutionPlan>,
     table: &Table,
+) -> DFResult<Arc<dyn ExecutionPlan>> {
+    project_with_partition_with_match_mode(input, table, FieldMatchMode::Id)
+}
+
+/// Extends an ExecutionPlan with partition value calculations for Iceberg tables
+/// using the requested partition-source matching mode.
+pub fn project_with_partition_with_match_mode(
+    input: Arc<dyn ExecutionPlan>,
+    table: &Table,
+    match_mode: FieldMatchMode,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
     let metadata = table.metadata();
     let partition_spec = metadata.default_partition_spec();
@@ -79,9 +89,12 @@ pub fn project_with_partition(
         )));
     }
 
-    let calculator =
-        PartitionValueCalculator::try_new(partition_spec.as_ref(), table_schema.as_ref())
-            .map_err(to_datafusion_error)?;
+    let calculator = PartitionValueCalculator::try_new_with_match_mode(
+        partition_spec.as_ref(),
+        table_schema.as_ref(),
+        match_mode,
+    )
+    .map_err(to_datafusion_error)?;
 
     let mut projection_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
         Vec::with_capacity(input_schema.fields().len() + 1);
@@ -732,6 +745,129 @@ mod tests {
 
         // Without runtime field-id lookup, the cached positions select
         // column `d` (Day=[100, 200]) instead of `c` (Day=[0, 1]).
+        assert_eq!(partitions, vec![0, 1]);
+    }
+
+    /// Name mode covers DML-like plans whose runtime batches keep source
+    /// column names but do not carry target `PARQUET:field_id` metadata after
+    /// projection rewrites.
+    #[tokio::test]
+    async fn test_partition_expr_name_mode_survives_projection_unification_without_field_ids() {
+        use std::collections::HashMap;
+
+        use datafusion::arrow::array::{Int32Array, TimestampMicrosecondArray};
+        use datafusion::arrow::datatypes::TimeUnit;
+        use datafusion::common::ScalarValue;
+        use datafusion::config::ConfigOptions;
+        use datafusion::datasource::{MemTable, TableProvider};
+        use datafusion::physical_expr::expressions::Literal;
+        use datafusion::physical_optimizer::PhysicalOptimizerRule;
+        use datafusion::physical_optimizer::projection_pushdown::ProjectionPushdown;
+        use datafusion::prelude::SessionContext;
+        use iceberg::TableIdent;
+        use iceberg::io::FileIO;
+        use iceberg::spec::{
+            FormatVersion, NestedField, PrimitiveType, Schema, SortOrder, TableMetadataBuilder,
+            Transform, Type,
+        };
+
+        let table_schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "a", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "b", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::required(3, "c", Type::Primitive(PrimitiveType::Timestamptz))
+                        .into(),
+                    NestedField::required(4, "d", Type::Primitive(PrimitiveType::Timestamptz))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let partition_spec = iceberg::spec::PartitionSpec::builder(table_schema.clone())
+            .add_partition_field("c", "c_day", Transform::Day)
+            .unwrap()
+            .build()
+            .unwrap();
+        let sort_order = SortOrder::builder().build(&table_schema).unwrap();
+        let table_metadata = TableMetadataBuilder::new(
+            (*table_schema).clone(),
+            partition_spec,
+            sort_order,
+            "/test/table".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let table = iceberg::table::Table::builder()
+            .metadata(table_metadata.metadata)
+            .identifier(TableIdent::from_strs(["test", "table"]).unwrap())
+            .file_io(FileIO::new_with_fs())
+            .metadata_location("/test/metadata.json".to_string())
+            .build()
+            .unwrap();
+
+        let source_arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new(
+                "c",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                false,
+            ),
+            Field::new(
+                "d",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                false,
+            ),
+        ]));
+
+        const MICROS_PER_DAY: i64 = 86_400_000_000;
+        let batch = RecordBatch::try_new(source_arrow_schema.clone(), vec![
+            Arc::new(Int32Array::from(vec![10, 20])),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![0, MICROS_PER_DAY]).with_timezone("+00:00"),
+            ),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![100 * MICROS_PER_DAY, 200 * MICROS_PER_DAY])
+                    .with_timezone("+00:00"),
+            ),
+        ])
+        .unwrap();
+
+        let ctx = SessionContext::new();
+        let mem_table = MemTable::try_new(source_arrow_schema, vec![vec![batch]]).unwrap();
+        let source_plan = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+
+        let null_b: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Utf8(None)));
+        let aligned_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = vec![
+            (Arc::new(Column::new("a", 0)), "a".to_string()),
+            (null_b, "b".to_string()),
+            (Arc::new(Column::new("c", 1)), "c".to_string()),
+            (Arc::new(Column::new("d", 2)), "d".to_string()),
+        ];
+        let aligned_plan: Arc<dyn ExecutionPlan> =
+            Arc::new(ProjectionExec::try_new(aligned_exprs, source_plan).unwrap());
+
+        let unoptimized_plan =
+            project_with_partition_with_match_mode(aligned_plan, &table, FieldMatchMode::Name)
+                .unwrap();
+        let optimized_plan = ProjectionPushdown::new()
+            .optimize(unoptimized_plan, &ConfigOptions::default())
+            .unwrap();
+
+        assert!(
+            !optimized_plan.children()[0].as_any().is::<ProjectionExec>(),
+            "ProjectionPushdown did not fuse the two ProjectionExecs",
+        );
+
+        let results = datafusion::physical_plan::collect(optimized_plan, ctx.task_ctx())
+            .await
+            .unwrap();
+        let partitions = extract_c_day_partitions(&results);
+
         assert_eq!(partitions, vec![0, 1]);
     }
 
