@@ -481,8 +481,9 @@ mod tests {
     }
 
     pub(crate) async fn collect_alive_files(snapshot: &Snapshot, table: &Table) -> Vec<String> {
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
+        let manifest_list = table
+            .manifest_list_reader(&Arc::new(snapshot.clone()))
+            .load()
             .await
             .unwrap();
         let mut alive_files: Vec<String> = Vec::new();
@@ -744,10 +745,8 @@ mod test_row_lineage {
 
         // Check written manifest for first_row_id
         let manifest_list = table
-            .metadata()
-            .current_snapshot()
-            .unwrap()
-            .load_manifest_list(table.file_io(), table.metadata())
+            .manifest_list_reader(table.metadata().current_snapshot().unwrap())
+            .load()
             .await
             .unwrap();
 
@@ -772,10 +771,8 @@ mod test_row_lineage {
 
         // Check written manifest for first_row_id
         let manifest_list = table
-            .metadata()
-            .current_snapshot()
-            .unwrap()
-            .load_manifest_list(table.file_io(), table.metadata())
+            .manifest_list_reader(table.metadata().current_snapshot().unwrap())
+            .load()
             .await
             .unwrap();
         assert_eq!(manifest_list.entries().len(), 2);

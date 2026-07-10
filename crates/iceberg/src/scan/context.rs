@@ -32,6 +32,7 @@ use crate::spec::{
     ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList, NameMapping, SchemaRef,
     SnapshotRef, TableMetadataRef,
 };
+use crate::util::snapshot::ancestors_between;
 use crate::{Error, ErrorKind, Result};
 
 /// Wraps a [`ManifestFile`] alongside the objects that are needed
@@ -387,22 +388,4 @@ impl PlanContext {
         }
         Ok(contexts)
     }
-}
-
-fn ancestors_between(
-    table_metadata: &TableMetadataRef,
-    latest_snapshot_id: i64,
-    oldest_snapshot_id: Option<i64>,
-) -> impl Iterator<Item = SnapshotRef> {
-    let mut next = table_metadata.snapshot_by_id(latest_snapshot_id).cloned();
-    std::iter::from_fn(move || {
-        let snapshot = next.take()?;
-        if oldest_snapshot_id == Some(snapshot.snapshot_id()) {
-            return None;
-        }
-        next = snapshot
-            .parent_snapshot_id()
-            .and_then(|id| table_metadata.snapshot_by_id(id).cloned());
-        Some(snapshot)
-    })
 }

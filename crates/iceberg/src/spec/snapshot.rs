@@ -26,8 +26,7 @@ use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
 use crate::error::{Result, timestamp_ms_to_utc};
-use crate::io::FileIO;
-use crate::spec::{ManifestList, SchemaId, SchemaRef, TableMetadata};
+use crate::spec::{SchemaId, SchemaRef, TableMetadata};
 use crate::{Error, ErrorKind};
 
 /// The ref name of the main branch of the table.
@@ -143,20 +142,6 @@ impl Snapshot {
     #[inline]
     pub fn manifest_list(&self) -> &str {
         &self.manifest_list
-    }
-
-    /// Load this snapshot's manifest list without table-level encryption.
-    ///
-    /// New table code should use `Table::manifest_list_reader`, which also
-    /// handles encrypted manifest lists. This compatibility helper keeps the
-    /// transaction actions usable for plain tables.
-    pub async fn load_manifest_list(
-        &self,
-        file_io: &FileIO,
-        table_metadata: &TableMetadata,
-    ) -> Result<ManifestList> {
-        let bytes = file_io.new_input(&self.manifest_list)?.read().await?;
-        ManifestList::parse_with_version(&bytes, table_metadata.format_version())
     }
 
     /// Get summary of the snapshot

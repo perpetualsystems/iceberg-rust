@@ -128,8 +128,6 @@ These items are now unnecessary or should be treated as migration debt.
 | Priority | Candidate | Why it can be removed or replaced | Suggested action |
 | --- | --- | --- | --- |
 | High | Per-action `key_metadata` fields and `set_key_metadata` methods in the fork maintenance actions | Apache currently rejects encrypted writes, and `SnapshotProducer` rejects these values. The methods cannot successfully produce encrypted manifests. | Remove the setters and plumbing, or replace them with Apache's encrypted-output workflow when encrypted writes are implemented. |
-| High | `Snapshot::load_manifest_list` compatibility helper | Apache's `Table::manifest_list_reader` handles encrypted manifest lists. The helper is retained only because fork actions still call the legacy plain-file API. | Migrate fork actions to `Table::manifest_list_reader`, then delete the helper. This is required before those actions can participate in encrypted-table support. |
-| Medium | Local `ancestors_between` in `scan/context.rs` | Apache now has `crate::util::snapshot::ancestors_between` with the same inclusive/exclusive traversal contract. | Use the shared utility and delete the local copy. |
 | Medium | `prptl_utils` module boundary | It is still needed because Apache has no `ListPacker` equivalent, but the module name advertises its temporary origin. | Keep the algorithm; consider moving it to a normal `util::bin_packing` module when the fork-only namespace is no longer useful. |
 | Low | Compatibility builder defaults on the five `FileScanTask` planning fields | They are intentional for source compatibility, but they make omission indistinguishable from an unavailable manifest metric. | Keep unless a future major version explicitly makes scan metadata mandatory. |
 

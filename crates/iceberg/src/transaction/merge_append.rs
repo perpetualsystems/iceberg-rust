@@ -175,11 +175,10 @@ impl SnapshotProduceOperation for MergeAppendOperation {
             return Ok(vec![]);
         };
 
-        let manifest_list = snapshot
-            .load_manifest_list(
-                snapshot_produce.table.file_io(),
-                &snapshot_produce.table.metadata_ref(),
-            )
+        let manifest_list = snapshot_produce
+            .table
+            .manifest_list_reader(snapshot)
+            .load()
             .await?;
 
         let current_manifests: Vec<ManifestFile> = manifest_list.entries().to_vec();
@@ -224,10 +223,8 @@ mod tests {
 
     async fn manifest_count(table: &crate::table::Table) -> usize {
         table
-            .metadata()
-            .current_snapshot()
-            .unwrap()
-            .load_manifest_list(table.file_io(), table.metadata())
+            .manifest_list_reader(table.metadata().current_snapshot().unwrap())
+            .load()
             .await
             .unwrap()
             .entries()
@@ -315,10 +312,7 @@ mod tests {
         let table = merge_append_files(table, vec![f1, f2, f3]).await;
 
         let snap = table.metadata().current_snapshot().unwrap();
-        let ml = snap
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let ml = table.manifest_list_reader(snap).load().await.unwrap();
         let manifest = ml.entries()[0]
             .load_manifest(table.file_io())
             .await
@@ -520,10 +514,7 @@ mod tests {
         let table = merge_append_files(table, vec![f1]).await;
 
         let snap = table.metadata().current_snapshot().unwrap();
-        let ml = snap
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let ml = table.manifest_list_reader(snap).load().await.unwrap();
 
         // Both spec 0 and spec 1 manifests must be present.
         let spec_ids: Vec<i32> = ml.entries().iter().map(|e| e.partition_spec_id).collect();
@@ -754,10 +745,7 @@ mod tests {
 
         let snap = table.metadata().current_snapshot().unwrap();
         let current_snap_id = snap.snapshot_id();
-        let ml = snap
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let ml = table.manifest_list_reader(snap).load().await.unwrap();
         let mut prior_tombstones = 0u64;
         for entry in ml.entries() {
             let manifest = entry.load_manifest(table.file_io()).await.unwrap();
@@ -785,10 +773,7 @@ mod tests {
 
         let snap = table.metadata().current_snapshot().unwrap();
         let expected_seq = snap.sequence_number();
-        let ml = snap
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let ml = table.manifest_list_reader(snap).load().await.unwrap();
         let manifest = ml.entries()[0]
             .load_manifest(table.file_io())
             .await

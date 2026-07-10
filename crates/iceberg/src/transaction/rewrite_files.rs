@@ -268,11 +268,10 @@ impl SnapshotProduceOperation for RewriteOperation {
             return Ok(vec![]);
         };
 
-        let manifest_list = snapshot
-            .load_manifest_list(
-                snapshot_produce.table.file_io(),
-                &snapshot_produce.table.metadata_ref(),
-            )
+        let manifest_list = snapshot_produce
+            .table
+            .manifest_list_reader(snapshot)
+            .load()
             .await?;
         let current_manifests: Vec<ManifestFile> = manifest_list.entries().to_vec();
         self.state
@@ -431,8 +430,9 @@ mod tests {
             "Requirements should include RefSnapshotIdMatch"
         );
 
-        let manifest_list = new_snapshot
-            .load_manifest_list(table_with_files.file_io(), table_with_files.metadata())
+        let manifest_list = table_with_files
+            .manifest_list_reader(&Arc::new(new_snapshot.clone()))
+            .load()
             .await
             .unwrap();
 
@@ -626,8 +626,9 @@ mod tests {
         let new_snapshot = unwrap_add_snapshot(&updates);
         let alive_files = collect_alive_files(new_snapshot, &table_with_files).await;
 
-        let manifest_list = new_snapshot
-            .load_manifest_list(table_with_files.file_io(), table_with_files.metadata())
+        let manifest_list = table_with_files
+            .manifest_list_reader(&Arc::new(new_snapshot.clone()))
+            .load()
             .await
             .unwrap();
         let mut existing_entries: Vec<(String, Option<i64>)> = Vec::new();
@@ -846,8 +847,9 @@ mod tests {
 
         let new_snapshot = unwrap_add_snapshot(&updates);
 
-        let manifest_list = new_snapshot
-            .load_manifest_list(table1.file_io(), table1.metadata())
+        let manifest_list = table1
+            .manifest_list_reader(&Arc::new(new_snapshot.clone()))
+            .load()
             .await
             .unwrap();
 
@@ -965,10 +967,8 @@ mod tests {
         let table = append_files(table, vec![f2.clone()]).await;
 
         let initial_manifest_count = table
-            .metadata()
-            .current_snapshot()
-            .unwrap()
-            .load_manifest_list(table.file_io(), table.metadata())
+            .manifest_list_reader(table.metadata().current_snapshot().unwrap())
+            .load()
             .await
             .unwrap()
             .entries()
@@ -1002,10 +1002,8 @@ mod tests {
         let table = apply_updates_to_table(&table, &updates);
 
         let final_count = table
-            .metadata()
-            .current_snapshot()
-            .unwrap()
-            .load_manifest_list(table.file_io(), table.metadata())
+            .manifest_list_reader(table.metadata().current_snapshot().unwrap())
+            .load()
             .await
             .unwrap()
             .entries()
@@ -1050,10 +1048,8 @@ mod tests {
         }
 
         let pre_count = t
-            .metadata()
-            .current_snapshot()
-            .unwrap()
-            .load_manifest_list(t.file_io(), t.metadata())
+            .manifest_list_reader(t.metadata().current_snapshot().unwrap())
+            .load()
             .await
             .unwrap()
             .entries()
@@ -1069,10 +1065,8 @@ mod tests {
         let t = apply_updates_to_table(&t, &updates);
 
         let post_count = t
-            .metadata()
-            .current_snapshot()
-            .unwrap()
-            .load_manifest_list(t.file_io(), t.metadata())
+            .manifest_list_reader(t.metadata().current_snapshot().unwrap())
+            .load()
             .await
             .unwrap()
             .entries()
@@ -1137,10 +1131,7 @@ mod tests {
         let table = apply_updates_to_table(&table, &updates);
 
         let snap = table.metadata().current_snapshot().unwrap();
-        let manifest_list = snap
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snap).load().await.unwrap();
         let mut found = None;
         for ml in manifest_list.entries() {
             let manifest = ml.load_manifest(table.file_io()).await.unwrap();
@@ -1351,10 +1342,8 @@ mod tests {
         let table = append_files(table, vec![f2.clone()]).await;
 
         let pre_count = table
-            .metadata()
-            .current_snapshot()
-            .unwrap()
-            .load_manifest_list(table.file_io(), table.metadata())
+            .manifest_list_reader(table.metadata().current_snapshot().unwrap())
+            .load()
             .await
             .unwrap()
             .entries()
@@ -1376,10 +1365,7 @@ mod tests {
         let table = apply_updates_to_table(&table, &updates);
 
         let snap = table.metadata().current_snapshot().unwrap();
-        let manifest_list = snap
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snap).load().await.unwrap();
 
         // The 2 carry-forward data manifests have < 3 entries but are NOT the new
         // manifest's bin, so the guard must NOT protect them — they should be merged
@@ -1492,10 +1478,8 @@ mod tests {
         }
 
         let pre_count = t
-            .metadata()
-            .current_snapshot()
-            .unwrap()
-            .load_manifest_list(t.file_io(), t.metadata())
+            .manifest_list_reader(t.metadata().current_snapshot().unwrap())
+            .load()
             .await
             .unwrap()
             .entries()
@@ -1513,8 +1497,9 @@ mod tests {
         let t = apply_updates_to_table(&t, &updates);
 
         let snap = t.metadata().current_snapshot().unwrap();
-        let post_count = snap
-            .load_manifest_list(t.file_io(), t.metadata())
+        let post_count = t
+            .manifest_list_reader(snap)
+            .load()
             .await
             .unwrap()
             .entries()
@@ -1563,8 +1548,9 @@ mod tests {
             t = apply_updates_to_table(&t, &updates);
 
             let snap = t.metadata().current_snapshot().unwrap();
-            let count = snap
-                .load_manifest_list(t.file_io(), t.metadata())
+            let count = t
+                .manifest_list_reader(snap)
+                .load()
                 .await
                 .unwrap()
                 .entries()
@@ -1611,8 +1597,9 @@ mod tests {
         let prior_snap_id = prior_snap.snapshot_id();
         let prior_seq_num = prior_snap.sequence_number();
 
-        let existing_manifests: Vec<crate::spec::ManifestFile> = prior_snap
-            .load_manifest_list(table.file_io(), table.metadata())
+        let existing_manifests: Vec<crate::spec::ManifestFile> = table
+            .manifest_list_reader(prior_snap)
+            .load()
             .await
             .unwrap()
             .entries()
@@ -1692,10 +1679,8 @@ mod tests {
 
         // Confirm tombstone is present before compaction.
         let pre_ml = table
-            .metadata()
-            .current_snapshot()
-            .unwrap()
-            .load_manifest_list(table.file_io(), table.metadata())
+            .manifest_list_reader(table.metadata().current_snapshot().unwrap())
+            .load()
             .await
             .unwrap();
         assert!(
@@ -1722,10 +1707,7 @@ mod tests {
 
         // Tombstone path must be absent from the new snapshot's manifest list.
         let snap = table.metadata().current_snapshot().unwrap();
-        let post_ml = snap
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let post_ml = table.manifest_list_reader(snap).load().await.unwrap();
         assert!(
             !post_ml
                 .entries()
