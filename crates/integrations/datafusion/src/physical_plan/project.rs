@@ -200,7 +200,7 @@ impl std::hash::Hash for PartitionExpr {
 #[cfg(test)]
 mod tests {
     use as_any::AsAny;
-    use datafusion::arrow::array::{ArrayRef, Int32Array, StructArray};
+    use datafusion::arrow::array::{Array, ArrayRef, Int32Array, StructArray};
     use datafusion::arrow::datatypes::{DataType, Field, Fields};
     use datafusion::physical_plan::empty::EmptyExec;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, StructType, Transform, Type};
@@ -320,10 +320,13 @@ mod tests {
         let result = expr.evaluate(&batch).unwrap();
         match result {
             ColumnarValue::Array(array) => {
-                let struct_array = array.as_any().downcast_ref::<StructArray>().unwrap();
+                let struct_array = Array::as_any(array.as_ref())
+                    .downcast_ref::<StructArray>()
+                    .unwrap();
                 let id_partition = struct_array
                     .column_by_name("id_partition")
                     .unwrap()
+                    .as_ref()
                     .as_any()
                     .downcast_ref::<Int32Array>()
                     .unwrap();
@@ -396,10 +399,13 @@ mod tests {
         let calculator = PartitionValueCalculator::try_new(&partition_spec, &table_schema).unwrap();
         let array = calculator.calculate(&batch).unwrap();
 
-        let struct_array = array.as_any().downcast_ref::<StructArray>().unwrap();
+        let struct_array = Array::as_any(array.as_ref())
+            .downcast_ref::<StructArray>()
+            .unwrap();
         let city_partition = struct_array
             .column_by_name("city_partition")
             .unwrap()
+            .as_ref()
             .as_any()
             .downcast_ref::<datafusion::arrow::array::StringArray>()
             .unwrap();
@@ -668,6 +674,7 @@ mod tests {
             .identifier(TableIdent::from_strs(["test", "table"]).unwrap())
             .file_io(FileIO::new_with_fs())
             .metadata_location("/test/metadata.json".to_string())
+            .runtime(test_runtime())
             .build()
             .unwrap();
 
@@ -808,6 +815,7 @@ mod tests {
             .identifier(TableIdent::from_strs(["test", "table"]).unwrap())
             .file_io(FileIO::new_with_fs())
             .metadata_location("/test/metadata.json".to_string())
+            .runtime(test_runtime())
             .build()
             .unwrap();
 
