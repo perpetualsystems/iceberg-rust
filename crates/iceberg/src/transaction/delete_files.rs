@@ -156,9 +156,7 @@ async fn collect_alive_paths(table: &Table, paths: &HashSet<String>) -> Result<H
     let Some(current_snapshot) = table.metadata().current_snapshot() else {
         return Ok(HashSet::new());
     };
-    let manifest_list = current_snapshot
-        .load_manifest_list(table.file_io(), &table.metadata_ref())
-        .await?;
+    let manifest_list = table.manifest_list_reader(current_snapshot).load().await?;
     let mut found = HashSet::new();
     for ml_entry in manifest_list.entries() {
         let manifest = table.object_cache().get_manifest(ml_entry).await?;
@@ -271,11 +269,10 @@ impl SnapshotProduceOperation for DeleteFilesOperation {
             return Ok(vec![]);
         };
 
-        let manifest_list = snapshot
-            .load_manifest_list(
-                snapshot_produce.table.file_io(),
-                &snapshot_produce.table.metadata_ref(),
-            )
+        let manifest_list = snapshot_produce
+            .table
+            .manifest_list_reader(snapshot)
+            .load()
             .await?;
 
         let current_manifests: Vec<ManifestFile> = manifest_list.entries().to_vec();
