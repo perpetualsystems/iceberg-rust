@@ -204,28 +204,3 @@ mod tests {
         assert!(!parse_with(Some("true")));
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use iceberg::io::S3_PATH_STYLE_ACCESS;
-
-    use super::s3_config_parse;
-
-    fn parse_with(prop: Option<&str>) -> bool {
-        let mut props = HashMap::new();
-        if let Some(v) = prop {
-            props.insert(S3_PATH_STYLE_ACCESS.to_string(), v.to_string());
-        }
-        s3_config_parse(props).unwrap().enable_virtual_host_style
-    }
-
-    #[test]
-    fn s3_config_parse_path_style_access() {
-        // Match Iceberg S3FileIOProperties.PATH_STYLE_ACCESS_DEFAULT = false.
-        assert!(parse_with(None));
-        assert!(parse_with(Some("false")));
-        assert!(!parse_with(Some("true")));
-    }
-}
