@@ -199,6 +199,7 @@ impl std::hash::Hash for PartitionExpr {
 
 #[cfg(test)]
 mod tests {
+    use as_any::AsAny;
     use datafusion::arrow::array::{ArrayRef, Int32Array, StructArray};
     use datafusion::arrow::datatypes::{DataType, Field, Fields};
     use datafusion::physical_plan::empty::EmptyExec;
@@ -880,17 +881,17 @@ mod tests {
                 .schema()
                 .index_of(PROJECTED_PARTITION_VALUE_COLUMN)
                 .expect("_partition column missing from output");
-            let struct_array = batch
-                .column(partition_idx)
-                .as_any()
+            let struct_array = Array::as_any(batch.column(partition_idx).as_ref())
                 .downcast_ref::<StructArray>()
                 .expect("_partition should be a StructArray");
-            let c_day = struct_array
-                .column_by_name("c_day")
-                .expect("c_day field missing from _partition struct")
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .expect("c_day should be Date32 (Day transform output)");
+            let c_day = Array::as_any(
+                struct_array
+                    .column_by_name("c_day")
+                    .expect("c_day field missing from _partition struct")
+                    .as_ref(),
+            )
+            .downcast_ref::<Date32Array>()
+            .expect("c_day should be Date32 (Day transform output)");
             for i in 0..c_day.len() {
                 out.push(c_day.value(i));
             }

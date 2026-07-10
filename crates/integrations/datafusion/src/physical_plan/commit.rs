@@ -327,10 +327,6 @@ mod tests {
             "MockWriteExec"
         }
 
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> Arc<ArrowSchema> {
             self.schema.clone()
         }
