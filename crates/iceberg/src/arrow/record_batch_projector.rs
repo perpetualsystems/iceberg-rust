@@ -41,7 +41,7 @@ pub struct RecordBatchProjector {
 /// Read a `PARQUET:field_id` from `field`'s metadata, parsing it as `i64`.
 ///
 /// Returns `Ok(None)` when the field has no field-id metadata, and an error
-/// when the metadata is present but unparseable.
+/// when the metadata is present but unparsable.
 pub(crate) fn parquet_field_id(field: &Field) -> Result<Option<i64>> {
     let Some(value) = field.metadata().get(PARQUET_FIELD_ID_META_KEY) else {
         return Ok(None);
