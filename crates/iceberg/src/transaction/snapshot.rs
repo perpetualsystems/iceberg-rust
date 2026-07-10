@@ -235,10 +235,6 @@ impl<'a> SnapshotProducer<'a> {
         self.commit_uuid
     }
 
-    pub(crate) fn key_metadata(&self) -> Option<&[u8]> {
-        self.key_metadata.as_deref()
-    }
-
     pub(crate) fn validate_added_data_files(&self) -> Result<()> {
         for data_file in &self.added_data_files {
             if data_file.content_type() != crate::spec::DataContentType::Data {
@@ -513,7 +509,6 @@ impl<'a> SnapshotProducer<'a> {
         let builder = ManifestWriterBuilder::new(
             output_file,
             Some(self.snapshot_id),
-            self.key_metadata.clone(),
             self.table.metadata().current_schema().clone(),
             self.table
                 .metadata()
@@ -719,8 +714,9 @@ impl<'a> SnapshotProducer<'a> {
         // The current snapshot becomes the parent of the new one being created.
         let previous_snapshot = table_metadata.current_snapshot();
 
-        let mut additional_properties = summary_collector.build();
-        additional_properties.extend(self.snapshot_properties.clone());
+        // Computed metrics must win over user-supplied snapshot properties.
+        let mut additional_properties = self.snapshot_properties.clone();
+        additional_properties.extend(summary_collector.build());
 
         let summary = Summary {
             operation: snapshot_produce_operation.operation(),
@@ -753,6 +749,12 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_produce_operation: OP,
         process: MP,
     ) -> Result<CommitResult> {
+        if self.key_metadata.is_some() {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "Writing encrypted manifests is not yet supported",
+            ));
+        }
         let manifest_list_path = self.generate_manifest_list_file_path(0);
         let next_seq_num = self.table.metadata().next_sequence_number();
         let first_row_id = self.table.metadata().next_row_id();
@@ -760,14 +762,18 @@ impl<'a> SnapshotProducer<'a> {
             FormatVersion::V1 => ManifestListWriter::v1(
                 self.table
                     .file_io()
-                    .new_output(manifest_list_path.clone())?,
+                    .new_output(manifest_list_path.clone())?
+                    .writer()
+                    .await?,
                 self.snapshot_id,
                 self.table.metadata().current_snapshot_id(),
             ),
             FormatVersion::V2 => ManifestListWriter::v2(
                 self.table
                     .file_io()
-                    .new_output(manifest_list_path.clone())?,
+                    .new_output(manifest_list_path.clone())?
+                    .writer()
+                    .await?,
                 self.snapshot_id,
                 self.table.metadata().current_snapshot_id(),
                 next_seq_num,
@@ -775,7 +781,9 @@ impl<'a> SnapshotProducer<'a> {
             FormatVersion::V3 => ManifestListWriter::v3(
                 self.table
                     .file_io()
-                    .new_output(manifest_list_path.clone())?,
+                    .new_output(manifest_list_path.clone())?
+                    .writer()
+                    .await?,
                 self.snapshot_id,
                 self.table.metadata().current_snapshot_id(),
                 next_seq_num,

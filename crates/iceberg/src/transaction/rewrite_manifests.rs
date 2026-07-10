@@ -243,13 +243,11 @@ impl TransactionAction for RewriteManifestsAction {
                     let file_io = file_io.clone();
                     let schema = schema.clone();
                     let partition_spec = partition_spec.clone();
-                    let key_metadata = self.key_metadata.clone();
                     async move {
                         let output_file = file_io.new_output(path)?;
                         let builder = ManifestWriterBuilder::new(
                             output_file,
                             Some(new_snapshot_id),
-                            key_metadata,
                             schema,
                             partition_spec,
                         );
@@ -589,9 +587,8 @@ mod tests {
 
         let manifest_path = format!("{location}/metadata/test-tombstone-manifest.avro");
         let output = file_io.new_output(&manifest_path).unwrap();
-        let mut writer =
-            ManifestWriterBuilder::new(output, Some(snap_id), None, schema, partition_spec)
-                .build_v2_data();
+        let mut writer = ManifestWriterBuilder::new(output, Some(snap_id), schema, partition_spec)
+            .build_v2_data();
 
         // Two alive entries with different partitions.
         writer
@@ -624,7 +621,8 @@ mod tests {
 
         let ml_path = format!("{location}/metadata/snap-tombstone-{snap_id}.avro");
         let ml_output = file_io.new_output(&ml_path).unwrap();
-        let mut ml_writer = ManifestListWriter::v2(ml_output, snap_id, None, seq_num);
+        let mut ml_writer =
+            ManifestListWriter::v2(ml_output.writer().await.unwrap(), snap_id, None, seq_num);
         ml_writer
             .add_manifests(std::iter::once(manifest_file))
             .unwrap();
@@ -706,7 +704,6 @@ mod tests {
         let mut data_writer = ManifestWriterBuilder::new(
             data_output,
             Some(snap_id),
-            None,
             schema.clone(),
             partition_spec.clone(),
         )
@@ -746,14 +743,9 @@ mod tests {
             .with_spec_id(0)
             .build()
             .unwrap();
-        let mut del_writer = ManifestWriterBuilder::new(
-            del_output,
-            Some(snap_id),
-            None,
-            del_schema,
-            del_partition_spec,
-        )
-        .build_v2_deletes();
+        let mut del_writer =
+            ManifestWriterBuilder::new(del_output, Some(snap_id), del_schema, del_partition_spec)
+                .build_v2_deletes();
         // Write a position delete file entry.
         del_writer
             .add_existing_file(
@@ -778,7 +770,8 @@ mod tests {
 
         let ml_path = format!("{location}/metadata/snap-delete-{snap_id}.avro");
         let ml_output = file_io.new_output(&ml_path).unwrap();
-        let mut ml_writer = ManifestListWriter::v2(ml_output, snap_id, None, seq_num);
+        let mut ml_writer =
+            ManifestListWriter::v2(ml_output.writer().await.unwrap(), snap_id, None, seq_num);
         ml_writer
             .add_manifests([data_manifest_file, del_manifest_file].into_iter())
             .unwrap();

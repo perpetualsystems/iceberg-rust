@@ -59,6 +59,7 @@ mod merging_state;
 pub use action::*;
 mod append;
 mod delete_files;
+mod expire_snapshots;
 mod merge_append;
 mod rewrite_files;
 mod rewrite_manifests;
@@ -67,6 +68,7 @@ mod snapshot;
 mod sort_order;
 mod update_location;
 mod update_properties;
+mod update_schema;
 mod update_statistics;
 mod upgrade_format_version;
 
@@ -74,6 +76,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder, RetryableWithContext};
+pub use update_schema::AddColumn;
 
 use crate::error::Result;
 use crate::spec::TableProperties;
@@ -81,6 +84,7 @@ use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
 use crate::transaction::delete_files::DeleteFilesAction;
+use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
 use crate::transaction::merge_append::MergeAppendAction;
 use crate::transaction::rewrite_files::RewriteFilesAction;
 use crate::transaction::rewrite_manifests::RewriteManifestsAction;
@@ -88,9 +92,10 @@ use crate::transaction::row_delta::RowDeltaAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_properties::UpdatePropertiesAction;
+use crate::transaction::update_schema::UpdateSchemaAction;
 use crate::transaction::update_statistics::UpdateStatisticsAction;
 use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
-use crate::{Catalog, TableCommit, TableRequirement, TableUpdate};
+use crate::{Catalog, Error, ErrorKind, TableCommit, TableRequirement, TableUpdate};
 
 /// Table transaction.
 #[derive(Clone)]
@@ -148,6 +153,11 @@ impl Transaction {
     /// Update table's property.
     pub fn update_table_properties(&self) -> UpdatePropertiesAction {
         UpdatePropertiesAction::new()
+    }
+
+    /// Creates an update schema action.
+    pub fn update_schema(&self) -> UpdateSchemaAction {
+        UpdateSchemaAction::new()
     }
 
     /// Creates a fast append action.
@@ -216,6 +226,11 @@ impl Transaction {
         UpdateStatisticsAction::new()
     }
 
+    /// Expire snapshots from the table metadata.
+    pub fn expire_snapshots(&self) -> ExpireSnapshotsAction {
+        ExpireSnapshotsAction::new()
+    }
+
     /// Commit transaction.
     pub async fn commit(self, catalog: &dyn Catalog) -> Result<Table> {
         if self.actions.is_empty() {
@@ -224,6 +239,13 @@ impl Transaction {
         }
 
         let table_props = self.table.metadata().table_properties()?;
+
+        if table_props.encryption_key_id.is_some() {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "Cannot commit to an encrypted table: encrypted writes are not yet supported",
+            ));
+        }
 
         let backoff = Self::build_backoff(table_props)?;
         let tx = self;
@@ -311,6 +333,7 @@ mod tests {
         TableMetadata,
     };
     use crate::table::Table;
+    use crate::test_utils::test_runtime;
     use crate::transaction::{ApplyTransactionAction, Transaction, TransactionAction};
     use crate::{Catalog, Error, ErrorKind, TableCreation, TableIdent};
 
@@ -329,6 +352,7 @@ mod tests {
             .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
             .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
             .file_io(FileIO::new_with_memory())
+            .runtime(test_runtime())
             .build()
             .unwrap()
     }
@@ -348,6 +372,7 @@ mod tests {
             .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
             .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
             .file_io(FileIO::new_with_memory())
+            .runtime(test_runtime())
             .build()
             .unwrap()
     }
@@ -367,6 +392,7 @@ mod tests {
             .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
             .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
             .file_io(FileIO::new_with_memory())
+            .runtime(test_runtime())
             .build()
             .unwrap()
     }
