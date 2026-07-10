@@ -177,8 +177,6 @@ impl ExecutionPlan for IcebergCommitExec {
 
         let table = self.table.clone();
         let input_plan = self.input.clone();
-        let count_schema = Arc::clone(&self.count_schema);
-
         // todo revisit this
         let spec_id = self.table.metadata().default_partition_spec_id();
         let partition_type = self.table.metadata().default_partition_type().clone();
@@ -235,9 +233,9 @@ impl ExecutionPlan for IcebergCommitExec {
                 data_files.extend(batch_files);
             }
 
-            // If no data files were collected, return an empty result
+            // Avoid a no-op snapshot while preserving DataFusion's DML count contract.
             if data_files.is_empty() {
-                return Ok(RecordBatch::new_empty(count_schema));
+                return Self::make_count_batch(0);
             }
 
             // Create a transaction and commit the data files
@@ -517,6 +515,75 @@ mod tests {
 
         assert!(manifest_files.contains(&"path/to/file1.parquet".to_string()));
         assert!(manifest_files.contains(&"path/to/file2.parquet".to_string()));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iceberg_commit_exec_empty_insert() -> Result<(), Box<dyn std::error::Error>> {
+        let catalog = Arc::new(
+            MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_string(),
+                        "memory://root".to_string(),
+                    )]),
+                )
+                .await
+                .unwrap(),
+        );
+
+        let namespace = NamespaceIdent::new("test_empty_insert".to_string());
+        catalog.create_namespace(&namespace, HashMap::new()).await?;
+
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()?;
+        let table_creation = TableCreation::builder()
+            .name("empty_insert_table".to_string())
+            .schema(schema)
+            .location("memory://root/empty_insert_table".to_string())
+            .properties(HashMap::new())
+            .build();
+
+        let table = catalog.create_table(&namespace, table_creation).await?;
+        let snapshot_count_before = table.metadata().snapshots().len();
+        let input_exec = Arc::new(MockWriteExec::new(vec![]));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            DATA_FILES_COL_NAME,
+            DataType::Utf8,
+            false,
+        )]));
+        let commit_exec =
+            IcebergCommitExec::new(table.clone(), catalog.clone(), input_exec, arrow_schema);
+
+        let batches = collect(commit_exec.execute(0, Arc::new(TaskContext::default()))?).await?;
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 1);
+
+        let count = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(count.value(0), 0);
+
+        let updated_table = catalog
+            .load_table(
+                &TableIdent::from_strs(["test_empty_insert", "empty_insert_table"]).unwrap(),
+            )
+            .await?;
+        assert_eq!(
+            updated_table.metadata().snapshots().len(),
+            snapshot_count_before
+        );
+        assert!(updated_table.metadata().current_snapshot().is_none());
 
         Ok(())
     }
