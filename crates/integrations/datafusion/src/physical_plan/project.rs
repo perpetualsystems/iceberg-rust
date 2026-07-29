@@ -199,7 +199,8 @@ impl std::hash::Hash for PartitionExpr {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::arrow::array::{ArrayRef, Int32Array, StructArray};
+    use as_any::AsAny;
+    use datafusion::arrow::array::{Array, ArrayRef, Int32Array, StructArray};
     use datafusion::arrow::datatypes::{DataType, Field, Fields};
     use datafusion::physical_plan::empty::EmptyExec;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, StructType, Transform, Type};
@@ -319,10 +320,13 @@ mod tests {
         let result = expr.evaluate(&batch).unwrap();
         match result {
             ColumnarValue::Array(array) => {
-                let struct_array = array.as_any().downcast_ref::<StructArray>().unwrap();
+                let struct_array = Array::as_any(array.as_ref())
+                    .downcast_ref::<StructArray>()
+                    .unwrap();
                 let id_partition = struct_array
                     .column_by_name("id_partition")
                     .unwrap()
+                    .as_ref()
                     .as_any()
                     .downcast_ref::<Int32Array>()
                     .unwrap();
@@ -395,10 +399,13 @@ mod tests {
         let calculator = PartitionValueCalculator::try_new(&partition_spec, &table_schema).unwrap();
         let array = calculator.calculate(&batch).unwrap();
 
-        let struct_array = array.as_any().downcast_ref::<StructArray>().unwrap();
+        let struct_array = Array::as_any(array.as_ref())
+            .downcast_ref::<StructArray>()
+            .unwrap();
         let city_partition = struct_array
             .column_by_name("city_partition")
             .unwrap()
+            .as_ref()
             .as_any()
             .downcast_ref::<datafusion::arrow::array::StringArray>()
             .unwrap();
@@ -667,6 +674,7 @@ mod tests {
             .identifier(TableIdent::from_strs(["test", "table"]).unwrap())
             .file_io(FileIO::new_with_fs())
             .metadata_location("/test/metadata.json".to_string())
+            .runtime(test_runtime())
             .build()
             .unwrap();
 
@@ -807,6 +815,7 @@ mod tests {
             .identifier(TableIdent::from_strs(["test", "table"]).unwrap())
             .file_io(FileIO::new_with_fs())
             .metadata_location("/test/metadata.json".to_string())
+            .runtime(test_runtime())
             .build()
             .unwrap();
 
@@ -880,17 +889,17 @@ mod tests {
                 .schema()
                 .index_of(PROJECTED_PARTITION_VALUE_COLUMN)
                 .expect("_partition column missing from output");
-            let struct_array = batch
-                .column(partition_idx)
-                .as_any()
+            let struct_array = Array::as_any(batch.column(partition_idx).as_ref())
                 .downcast_ref::<StructArray>()
                 .expect("_partition should be a StructArray");
-            let c_day = struct_array
-                .column_by_name("c_day")
-                .expect("c_day field missing from _partition struct")
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .expect("c_day should be Date32 (Day transform output)");
+            let c_day = Array::as_any(
+                struct_array
+                    .column_by_name("c_day")
+                    .expect("c_day field missing from _partition struct")
+                    .as_ref(),
+            )
+            .downcast_ref::<Date32Array>()
+            .expect("c_day should be Date32 (Day transform output)");
             for i in 0..c_day.len() {
                 out.push(c_day.value(i));
             }

@@ -303,16 +303,13 @@ impl<'a> SnapshotProducer<'a> {
             None => (0, None),
         };
 
-        let metadata_ref = self.table.metadata_ref();
         let mut current = Some(parent.clone());
         while let Some(snap) = current {
             if Some(snap.snapshot_id()) == final_starting_snapshot_id {
                 break;
             }
 
-            let manifest_list = snap
-                .load_manifest_list(self.table.file_io(), &metadata_ref)
-                .await?;
+            let manifest_list = self.table.manifest_list_reader(&snap).load().await?;
 
             for ml_entry in manifest_list.entries() {
                 if ml_entry.content != ManifestContentType::Deletes {
@@ -393,8 +390,10 @@ impl<'a> SnapshotProducer<'a> {
 
         let mut referenced_files = Vec::new();
         if let Some(current_snapshot) = self.table.metadata().current_snapshot() {
-            let manifest_list = current_snapshot
-                .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
+            let manifest_list = self
+                .table
+                .manifest_list_reader(current_snapshot)
+                .load()
                 .await?;
             for manifest_list_entry in manifest_list.entries() {
                 let manifest = self
@@ -441,8 +440,10 @@ impl<'a> SnapshotProducer<'a> {
             ));
         };
 
-        let manifest_list = current_snapshot
-            .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
+        let manifest_list = self
+            .table
+            .manifest_list_reader(current_snapshot)
+            .load()
             .await?;
 
         let mut found_files = HashSet::new();

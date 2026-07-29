@@ -32,7 +32,11 @@ use crate::spec::{
     ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList, NameMapping, SchemaRef,
     SnapshotRef, TableMetadataRef,
 };
+use crate::util::snapshot::ancestors_between;
 use crate::{Error, ErrorKind, Result};
+
+/// Predicate applied to individual manifest entries during a scan.
+type ManifestEntryFilterFn = dyn Fn(&ManifestEntryRef) -> bool + Send + Sync;
 
 /// Wraps a [`ManifestFile`] alongside the objects that are needed
 /// to process it in a thread-safe manner
@@ -49,7 +53,7 @@ pub(crate) struct ManifestFileContext {
     delete_file_index: DeleteFileIndex,
     name_mapping: Option<Arc<NameMapping>>,
     case_sensitive: bool,
-    filter_fn: Option<Arc<dyn Fn(&ManifestEntryRef) -> bool + Send + Sync>>,
+    filter_fn: Option<Arc<ManifestEntryFilterFn>>,
 }
 
 /// Wraps a [`ManifestEntryRef`] alongside the objects that are needed
@@ -286,7 +290,7 @@ impl PlanContext {
         partition_filter: Option<Arc<BoundPredicate>>,
         sender: Sender<ManifestEntryContext>,
         delete_file_index: DeleteFileIndex,
-        filter_fn: Option<Arc<dyn Fn(&ManifestEntryRef) -> bool + Send + Sync>>,
+        filter_fn: Option<Arc<ManifestEntryFilterFn>>,
     ) -> ManifestFileContext {
         let bound_predicates =
             if let (Some(ref partition_bound_predicate), Some(snapshot_bound_predicate)) =
@@ -336,17 +340,16 @@ impl PlanContext {
             .map(|snapshot| snapshot.snapshot_id())
             .collect();
         let filter_snapshot_ids = snapshot_ids.clone();
-        let filter_fn: Arc<dyn Fn(&ManifestEntryRef) -> bool + Send + Sync> =
-            Arc::new(move |entry| {
-                matches!(entry.status(), crate::spec::ManifestStatus::Added)
-                    && matches!(
-                        entry.data_file().content_type(),
-                        crate::spec::DataContentType::Data
-                    )
-                    && entry
-                        .snapshot_id()
-                        .is_none_or(|id| filter_snapshot_ids.contains(&id))
-            });
+        let filter_fn: Arc<ManifestEntryFilterFn> = Arc::new(move |entry| {
+            matches!(entry.status(), crate::spec::ManifestStatus::Added)
+                && matches!(
+                    entry.data_file().content_type(),
+                    crate::spec::DataContentType::Data
+                )
+                && entry
+                    .snapshot_id()
+                    .is_none_or(|id| filter_snapshot_ids.contains(&id))
+        });
         let mut contexts = Vec::new();
         for snapshot in snapshots {
             let manifest_list = self
@@ -387,22 +390,4 @@ impl PlanContext {
         }
         Ok(contexts)
     }
-}
-
-fn ancestors_between(
-    table_metadata: &TableMetadataRef,
-    latest_snapshot_id: i64,
-    oldest_snapshot_id: Option<i64>,
-) -> impl Iterator<Item = SnapshotRef> {
-    let mut next = table_metadata.snapshot_by_id(latest_snapshot_id).cloned();
-    std::iter::from_fn(move || {
-        let snapshot = next.take()?;
-        if oldest_snapshot_id == Some(snapshot.snapshot_id()) {
-            return None;
-        }
-        next = snapshot
-            .parent_snapshot_id()
-            .and_then(|id| table_metadata.snapshot_by_id(id).cloned());
-        Some(snapshot)
-    })
 }

@@ -209,11 +209,10 @@ impl SnapshotProduceOperation for RowDeltaOperation {
             return Ok(vec![]);
         };
 
-        let manifest_list = snapshot
-            .load_manifest_list(
-                snapshot_produce.table.file_io(),
-                &snapshot_produce.table.metadata_ref(),
-            )
+        let manifest_list = snapshot_produce
+            .table
+            .manifest_list_reader(snapshot)
+            .load()
             .await?;
 
         let current_manifests: Vec<ManifestFile> = manifest_list.entries().to_vec();
@@ -269,10 +268,7 @@ mod tests {
         let table = apply_updates_to_table(&table, &updates);
 
         let snapshot = table.metadata().current_snapshot().unwrap();
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
 
         let deletes_manifests: Vec<_> = manifest_list
             .entries()
@@ -313,10 +309,7 @@ mod tests {
         let table = apply_updates_to_table(&table, &updates);
 
         let snapshot = table.metadata().current_snapshot().unwrap();
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
 
         let deletes_count: usize = manifest_list
             .entries()

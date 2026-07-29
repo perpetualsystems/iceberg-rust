@@ -95,9 +95,7 @@ impl TransactionAction for RewriteManifestsAction {
             return Ok(ActionCommit::new(vec![], requirements));
         };
 
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), &table.metadata_ref())
-            .await?;
+        let manifest_list = table.manifest_list_reader(snapshot).load().await?;
 
         // Classify manifests: keep DELETE manifests and single-partition DATA manifests;
         // group alive entries from cross-partition DATA manifests for rewriting.
@@ -425,8 +423,9 @@ mod tests {
             panic!("expected AddSnapshot");
         };
 
-        let manifest_list = new_snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
+        let manifest_list = table
+            .manifest_list_reader(&Arc::new(new_snapshot.clone()))
+            .load()
             .await
             .unwrap();
 
@@ -475,8 +474,9 @@ mod tests {
             panic!("expected AddSnapshot");
         };
 
-        let manifest_list = new_snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
+        let manifest_list = table
+            .manifest_list_reader(&Arc::new(new_snapshot.clone()))
+            .load()
             .await
             .unwrap();
 
@@ -506,8 +506,9 @@ mod tests {
 
         // Collect original snapshot_id and sequence_number from the current snapshot's manifests.
         let orig_snapshot = table.metadata().current_snapshot().unwrap();
-        let orig_manifest_list = orig_snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
+        let orig_manifest_list = table
+            .manifest_list_reader(orig_snapshot)
+            .load()
             .await
             .unwrap();
 
@@ -533,8 +534,9 @@ mod tests {
             panic!("expected AddSnapshot");
         };
 
-        let new_manifest_list = new_snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
+        let new_manifest_list = table
+            .manifest_list_reader(&Arc::new(new_snapshot.clone()))
+            .load()
             .await
             .unwrap();
 
@@ -669,8 +671,9 @@ mod tests {
             panic!("expected AddSnapshot");
         };
 
-        let manifest_list = new_snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
+        let manifest_list = table
+            .manifest_list_reader(&Arc::new(new_snapshot.clone()))
+            .load()
             .await
             .unwrap();
 
@@ -818,8 +821,9 @@ mod tests {
             panic!("expected AddSnapshot");
         };
 
-        let manifest_list = new_snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
+        let manifest_list = table
+            .manifest_list_reader(&Arc::new(new_snapshot.clone()))
+            .load()
             .await
             .unwrap();
 
@@ -865,8 +869,9 @@ mod tests {
                 } else {
                     panic!("expected AddSnapshot");
                 };
-                let ml = snapshot
-                    .load_manifest_list(table.file_io(), table.metadata())
+                let ml = table
+                    .manifest_list_reader(&Arc::new(snapshot.clone()))
+                    .load()
                     .await
                     .unwrap();
                 ml.entries()

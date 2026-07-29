@@ -253,9 +253,8 @@ impl<'a> TableScanBuilder<'a> {
                 }
             }
         }
-        let snapshot = match self.snapshot_id {
-            Some(snapshot_id) => self
-                .table
+        let snapshot = if let Some(snapshot_id) = self.snapshot_id {
+            self.table
                 .metadata()
                 .snapshot_by_id(snapshot_id)
                 .ok_or_else(|| {
@@ -264,25 +263,39 @@ impl<'a> TableScanBuilder<'a> {
                         format!("Snapshot with id {snapshot_id} not found"),
                     )
                 })?
-                .clone(),
-            None => {
-                let Some(current_snapshot_id) = self.table.metadata().current_snapshot() else {
-                    return Ok(TableScan {
-                        batch_size: self.batch_size,
-                        column_names: self.column_names,
-                        file_io: self.table.file_io().clone(),
-                        plan_context: None,
-                        concurrency_limit_data_files: self.concurrency_limit_data_files,
-                        concurrency_limit_manifest_entries: self.concurrency_limit_manifest_entries,
-                        concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
-                        row_group_filtering_enabled: self.row_group_filtering_enabled,
-                        row_selection_enabled: self.row_selection_enabled,
-                        arrow_schema_override: self.arrow_schema_override,
-                        runtime: self.table.runtime().clone(),
-                    });
-                };
-                current_snapshot_id.clone()
-            }
+                .clone()
+        } else if let Some(to_snapshot_id) = self.to_snapshot_id {
+            // For an incremental scan, anchor projection, predicate binding, and
+            // schema resolution to the inclusive end snapshot (`to_snapshot_id`)
+            // rather than the table's current snapshot, which may be newer and
+            // carry an evolved schema. Existence was validated above.
+            self.table
+                .metadata()
+                .snapshot_by_id(to_snapshot_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("to_snapshot_id {to_snapshot_id} not found in table metadata"),
+                    )
+                })?
+                .clone()
+        } else {
+            let Some(current_snapshot_id) = self.table.metadata().current_snapshot() else {
+                return Ok(TableScan {
+                    batch_size: self.batch_size,
+                    column_names: self.column_names,
+                    file_io: self.table.file_io().clone(),
+                    plan_context: None,
+                    concurrency_limit_data_files: self.concurrency_limit_data_files,
+                    concurrency_limit_manifest_entries: self.concurrency_limit_manifest_entries,
+                    concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
+                    row_group_filtering_enabled: self.row_group_filtering_enabled,
+                    row_selection_enabled: self.row_selection_enabled,
+                    arrow_schema_override: self.arrow_schema_override,
+                    runtime: self.table.runtime().clone(),
+                });
+            };
+            current_snapshot_id.clone()
         };
 
         let schema = snapshot.schema(self.table.metadata())?;
@@ -1374,6 +1387,31 @@ pub mod tests {
 
         let table_scan = table.scan().select_all().build().unwrap();
         assert!(table_scan.column_names.is_none());
+    }
+
+    #[test]
+    fn test_incremental_scan_anchors_to_end_snapshot_not_current() {
+        // Regression: an incremental scan must resolve its snapshot (and thus its
+        // projection/predicate schema) from the inclusive `to_snapshot_id`, not
+        // from the table's current snapshot, which may be newer and carry an
+        // evolved schema. See example_table_metadata_v2.json for the ids below.
+        let table = TableTestFixture::new().table;
+
+        let to_snapshot_id = 3051729675574597004; // parent of the current snapshot
+        let current_snapshot_id = 3055729675574597004;
+        assert_eq!(
+            table.metadata().current_snapshot().unwrap().snapshot_id(),
+            current_snapshot_id,
+            "fixture precondition: current snapshot differs from to_snapshot_id"
+        );
+
+        let scan = table.scan().to_snapshot_id(to_snapshot_id).build().unwrap();
+
+        assert_eq!(
+            scan.snapshot().unwrap().snapshot_id(),
+            to_snapshot_id,
+            "incremental scan should anchor to to_snapshot_id, not the current snapshot"
+        );
     }
 
     #[test]
