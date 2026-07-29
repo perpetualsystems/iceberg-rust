@@ -136,6 +136,12 @@ impl FileScanTaskReader {
             .next()
             .is_some_and(|f| f.metadata().get(PARQUET_FIELD_ID_META_KEY).is_none());
 
+        // Position-based fallback applies only when the file has no embedded field IDs
+        // AND no name mapping is available. With a name mapping, field IDs are assigned
+        // to the Arrow schema below, and projection/predicate planning must use them
+        // (see #2403).
+        let use_position_fallback = missing_field_ids && task.name_mapping.is_none();
+
         // Three-branch schema resolution strategy matching Java's ReadConf constructor
         //
         // Per Iceberg spec Column Projection rules:
@@ -168,8 +174,6 @@ impl FileScanTaskReader {
                 add_fallback_field_ids_to_arrow_schema(arrow_metadata.schema())
             };
 
-            // If the caller supplied an Arrow schema override, apply it to the
-            // assigned-ID schema so the Parquet decoder produces the caller's types.
             let arrow_schema =
                 apply_arrow_schema_override(&arrow_schema, self.arrow_schema_override.as_deref());
             let options = ArrowReaderOptions::new().with_schema(arrow_schema);
@@ -183,10 +187,6 @@ impl FileScanTaskReader {
                 },
             )?
         } else if let Some(override_schema) = self.arrow_schema_override.as_deref() {
-            // Branch 1+override: file has embedded field IDs and caller supplied an Arrow
-            // schema override. Remap the file's arrow schema field-by-field to the
-            // caller's types so the Parquet decoder produces them directly (zero-copy
-            // for types that share the same physical encoding, e.g. Utf8View ↔ Utf8).
             let remapped =
                 apply_arrow_schema_override(arrow_metadata.schema(), Some(override_schema));
             let options = ArrowReaderOptions::new().with_schema(remapped);
@@ -194,7 +194,7 @@ impl FileScanTaskReader {
                 |e| {
                     Error::new(
                         ErrorKind::Unexpected,
-                        "Failed to create ArrowReaderMetadata with overridden schema",
+                        "Failed to apply Arrow schema override",
                     )
                     .with_source(e)
                 },
@@ -238,15 +238,16 @@ impl FileScanTaskReader {
             .collect();
 
         // Create projection mask based on field IDs
-        // - If file has embedded IDs: field-ID-based projection (missing_field_ids=false)
-        // - If name mapping applied: field-ID-based projection (missing_field_ids=true but IDs now match)
-        // - If fallback IDs: position-based projection (missing_field_ids=true)
+        // - If file has embedded IDs: field-ID-based projection
+        // - If name mapping applied: field-ID-based projection using the IDs the name
+        //   mapping assigned to the Arrow schema
+        // - Otherwise: position-based fallback projection
         let projection_mask = ArrowReader::get_arrow_projection_mask(
             &project_field_ids_without_metadata,
             &task.schema,
             record_batch_stream_builder.parquet_schema(),
             record_batch_stream_builder.schema(),
-            missing_field_ids, // Whether to use position-based (true) or field-ID-based (false) projection
+            use_position_fallback, // Whether to use position-based (true) or field-ID-based (false) projection
         )?;
 
         record_batch_stream_builder =
@@ -331,7 +332,9 @@ impl FileScanTaskReader {
         if let Some(predicate) = final_predicate {
             let (iceberg_field_ids, field_id_map) = ArrowReader::build_field_id_set_and_map(
                 record_batch_stream_builder.parquet_schema(),
+                record_batch_stream_builder.schema(),
                 &predicate,
+                use_position_fallback,
             )?;
 
             let row_filter = ArrowReader::get_row_filter(
@@ -366,13 +369,13 @@ impl FileScanTaskReader {
             }
 
             if self.row_selection_enabled {
-                row_selection = Some(ArrowReader::get_row_selection_for_filter_predicate(
+                row_selection = ArrowReader::get_row_selection_for_filter_predicate(
                     &predicate,
                     record_batch_stream_builder.metadata(),
                     &selected_row_group_indices,
                     &field_id_map,
                     &task.schema,
-                )?);
+                )?;
             }
         }
 
@@ -485,6 +488,7 @@ mod tests {
     use parquet::file::properties::WriterProperties;
     use tempfile::TempDir;
 
+    use crate::Runtime;
     use crate::arrow::ArrowReaderBuilder;
     use crate::io::FileIO;
     use crate::scan::{FileScanTask, FileScanTaskStream};
@@ -516,30 +520,19 @@ mod tests {
         project_field_ids: Vec<i32>,
     ) -> Vec<RecordBatch> {
         let file_io = FileIO::new_with_fs();
-        let reader = ArrowReaderBuilder::new(file_io).build();
+        let reader = ArrowReaderBuilder::new(file_io, Runtime::current()).build();
 
         let file_size = std::fs::metadata(file_path).unwrap().len();
-        let task = FileScanTask {
-            file_size_in_bytes: file_size,
-            start: 0,
-            length: file_size,
-            record_count: None,
-            data_file_path: file_path.to_string(),
-            data_file_format: DataFileFormat::Parquet,
-            schema,
-            project_field_ids,
-            predicate: None,
-            deletes: vec![],
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            column_sizes: None,
-            split_offsets: None,
-            lower_bounds: None,
-            upper_bounds: None,
-            sort_order_id: None,
-            case_sensitive: false,
-        };
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(file_size)
+            .with_start(0)
+            .with_length(file_size)
+            .with_data_file_path(file_path.to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema)
+            .with_project_field_ids(project_field_ids)
+            .with_case_sensitive(false)
+            .build();
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
         reader
@@ -732,81 +725,54 @@ mod tests {
         }
 
         // Read with concurrency=1 (fast-path)
-        let reader = ArrowReaderBuilder::new(file_io)
+        let reader = ArrowReaderBuilder::new(file_io, Runtime::current())
             .with_data_file_concurrency_limit(1)
             .build();
 
         // Create tasks in a specific order: file_0, file_1, file_2
         let tasks = vec![
-            Ok(FileScanTask {
-                file_size_in_bytes: std::fs::metadata(format!("{table_location}/file_0.parquet"))
-                    .unwrap()
-                    .len(),
-                start: 0,
-                length: 0,
-                record_count: None,
-                data_file_path: format!("{table_location}/file_0.parquet"),
-                data_file_format: DataFileFormat::Parquet,
-                schema: schema.clone(),
-                project_field_ids: vec![1, 2],
-                predicate: None,
-                deletes: vec![],
-                partition: None,
-                partition_spec: None,
-                name_mapping: None,
-                column_sizes: None,
-                split_offsets: None,
-                lower_bounds: None,
-                upper_bounds: None,
-                sort_order_id: None,
-                case_sensitive: false,
-            }),
-            Ok(FileScanTask {
-                file_size_in_bytes: std::fs::metadata(format!("{table_location}/file_1.parquet"))
-                    .unwrap()
-                    .len(),
-                start: 0,
-                length: 0,
-                record_count: None,
-                data_file_path: format!("{table_location}/file_1.parquet"),
-                data_file_format: DataFileFormat::Parquet,
-                schema: schema.clone(),
-                project_field_ids: vec![1, 2],
-                predicate: None,
-                deletes: vec![],
-                partition: None,
-                partition_spec: None,
-                name_mapping: None,
-                column_sizes: None,
-                split_offsets: None,
-                lower_bounds: None,
-                upper_bounds: None,
-                sort_order_id: None,
-                case_sensitive: false,
-            }),
-            Ok(FileScanTask {
-                file_size_in_bytes: std::fs::metadata(format!("{table_location}/file_2.parquet"))
-                    .unwrap()
-                    .len(),
-                start: 0,
-                length: 0,
-                record_count: None,
-                data_file_path: format!("{table_location}/file_2.parquet"),
-                data_file_format: DataFileFormat::Parquet,
-                schema: schema.clone(),
-                project_field_ids: vec![1, 2],
-                predicate: None,
-                deletes: vec![],
-                partition: None,
-                partition_spec: None,
-                name_mapping: None,
-                column_sizes: None,
-                split_offsets: None,
-                lower_bounds: None,
-                upper_bounds: None,
-                sort_order_id: None,
-                case_sensitive: false,
-            }),
+            Ok(FileScanTask::builder()
+                .with_file_size_in_bytes(
+                    std::fs::metadata(format!("{table_location}/file_0.parquet"))
+                        .unwrap()
+                        .len(),
+                )
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(format!("{table_location}/file_0.parquet"))
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(schema.clone())
+                .with_project_field_ids(vec![1, 2])
+                .with_case_sensitive(false)
+                .build()),
+            Ok(FileScanTask::builder()
+                .with_file_size_in_bytes(
+                    std::fs::metadata(format!("{table_location}/file_1.parquet"))
+                        .unwrap()
+                        .len(),
+                )
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(format!("{table_location}/file_1.parquet"))
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(schema.clone())
+                .with_project_field_ids(vec![1, 2])
+                .with_case_sensitive(false)
+                .build()),
+            Ok(FileScanTask::builder()
+                .with_file_size_in_bytes(
+                    std::fs::metadata(format!("{table_location}/file_2.parquet"))
+                        .unwrap()
+                        .len(),
+                )
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(format!("{table_location}/file_2.parquet"))
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(schema.clone())
+                .with_project_field_ids(vec![1, 2])
+                .with_case_sensitive(false)
+                .build()),
         ];
 
         let tasks_stream = Box::pin(futures::stream::iter(tasks)) as FileScanTaskStream;

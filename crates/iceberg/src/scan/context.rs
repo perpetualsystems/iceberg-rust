@@ -18,8 +18,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use futures::StreamExt;
-use futures::stream::BoxStream;
+use futures::channel::mpsc::Sender;
+use futures::{SinkExt, TryFutureExt};
 
 use crate::delete_file_index::DeleteFileIndex;
 use crate::expr::{Bind, BoundPredicate, Predicate};
@@ -29,138 +29,146 @@ use crate::scan::{
     PartitionFilterCache,
 };
 use crate::spec::{
-    DataContentType, ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList,
-    ManifestStatus, Operation, SchemaRef, SnapshotRef, TableMetadataRef,
+    ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList, NameMapping, SchemaRef,
+    SnapshotRef, TableMetadataRef,
 };
 use crate::{Error, ErrorKind, Result};
-
-type ManifestEntryFilterFn = dyn Fn(&ManifestEntryRef) -> bool + Send + Sync;
 
 /// Wraps a [`ManifestFile`] alongside the objects that are needed
 /// to process it in a thread-safe manner
 pub(crate) struct ManifestFileContext {
     manifest_file: ManifestFile,
+
+    sender: Sender<ManifestEntryContext>,
+
     field_ids: Arc<Vec<i32>>,
     bound_predicates: Option<Arc<BoundPredicates>>,
     object_cache: Arc<ObjectCache>,
     snapshot_schema: SchemaRef,
     expression_evaluator_cache: Arc<ExpressionEvaluatorCache>,
+    delete_file_index: DeleteFileIndex,
+    name_mapping: Option<Arc<NameMapping>>,
     case_sensitive: bool,
-    /// Filter manifest entries (e.g., only newly added files for incremental scans).
-    filter_fn: Option<Arc<ManifestEntryFilterFn>>,
+    filter_fn: Option<Arc<dyn Fn(&ManifestEntryRef) -> bool + Send + Sync>>,
 }
 
 /// Wraps a [`ManifestEntryRef`] alongside the objects that are needed
 /// to process it in a thread-safe manner
 pub(crate) struct ManifestEntryContext {
     pub manifest_entry: ManifestEntryRef,
+
     pub expression_evaluator_cache: Arc<ExpressionEvaluatorCache>,
     pub field_ids: Arc<Vec<i32>>,
     pub bound_predicates: Option<Arc<BoundPredicates>>,
     pub partition_spec_id: i32,
     pub snapshot_schema: SchemaRef,
+    pub delete_file_index: DeleteFileIndex,
+    pub name_mapping: Option<Arc<NameMapping>>,
     pub case_sensitive: bool,
 }
 
 impl ManifestFileContext {
     /// Consumes this [`ManifestFileContext`], fetching its Manifest from FileIO and then
-    /// streaming its constituent [`ManifestEntries`]
-    pub(crate) async fn fetch_manifest_and_stream_entries(
-        self,
-    ) -> Result<BoxStream<'static, Result<ManifestEntryContext>>> {
+    /// streaming its constituent [`ManifestEntries`] to the channel provided in the context
+    pub(crate) async fn fetch_manifest_and_stream_manifest_entries(self) -> Result<()> {
         let ManifestFileContext {
             object_cache,
             manifest_file,
             bound_predicates,
             snapshot_schema,
             field_ids,
+            mut sender,
             expression_evaluator_cache,
+            delete_file_index,
+            name_mapping,
             case_sensitive,
             filter_fn,
         } = self;
-        let filter_fn = filter_fn.unwrap_or_else(|| Arc::new(|_| true));
 
         let manifest = object_cache.get_manifest(&manifest_file).await?;
 
-        Ok(async_stream::stream! {
-            for manifest_entry in manifest.entries().iter().filter(|e| filter_fn(e)) {
-                yield Ok(ManifestEntryContext {
-                    manifest_entry: manifest_entry.clone(),
-                    expression_evaluator_cache: expression_evaluator_cache.clone(),
-                    field_ids: field_ids.clone(),
-                    partition_spec_id: manifest_file.partition_spec_id,
-                    bound_predicates: bound_predicates.clone(),
-                    snapshot_schema: snapshot_schema.clone(),
-                    case_sensitive,
-                });
-            }
-        }
-        .boxed())
-    }
+        for manifest_entry in manifest
+            .entries()
+            .iter()
+            .filter(|entry| filter_fn.as_ref().is_none_or(|filter| filter(entry)))
+        {
+            let manifest_entry_context = ManifestEntryContext {
+                // TODO: refactor to avoid the expensive ManifestEntry clone
+                manifest_entry: manifest_entry.clone(),
+                expression_evaluator_cache: expression_evaluator_cache.clone(),
+                field_ids: field_ids.clone(),
+                partition_spec_id: manifest_file.partition_spec_id,
+                bound_predicates: bound_predicates.clone(),
+                snapshot_schema: snapshot_schema.clone(),
+                delete_file_index: delete_file_index.clone(),
+                name_mapping: name_mapping.clone(),
+                case_sensitive,
+            };
 
-    pub(crate) fn is_delete(&self) -> bool {
-        self.manifest_file.content == ManifestContentType::Deletes
+            sender
+                .send(manifest_entry_context)
+                .map_err(|_| Error::new(ErrorKind::Unexpected, "mpsc channel SendError"))
+                .await?;
+        }
+
+        Ok(())
     }
 }
 
 impl ManifestEntryContext {
     /// consume this `ManifestEntryContext`, returning a `FileScanTask`
     /// created from it
-    pub(crate) fn into_file_scan_task(
-        self,
-        delete_file_index: Arc<DeleteFileIndex>,
-    ) -> Result<FileScanTask> {
-        let deletes = delete_file_index.get_deletes_for_data_file(
-            self.manifest_entry.data_file(),
-            self.manifest_entry.sequence_number(),
-        );
+    pub(crate) async fn into_file_scan_task(self) -> Result<FileScanTask> {
+        let deletes = self
+            .delete_file_index
+            .get_deletes_for_data_file(
+                self.manifest_entry.data_file(),
+                self.manifest_entry.sequence_number(),
+            )
+            .await;
 
-        Ok(FileScanTask {
-            file_size_in_bytes: self.manifest_entry.file_size_in_bytes(),
-            start: 0,
-            length: self.manifest_entry.file_size_in_bytes(),
-            record_count: Some(self.manifest_entry.record_count()),
-
-            data_file_path: self.manifest_entry.file_path().to_string(),
-            data_file_format: self.manifest_entry.file_format(),
-
-            schema: self.snapshot_schema,
-            project_field_ids: self.field_ids.to_vec(),
-            predicate: self
-                .bound_predicates
-                .map(|x| x.as_ref().snapshot_bound_predicate.clone()),
-
-            deletes,
-
-            // Include partition data and spec from manifest entry
-            partition: Some(self.manifest_entry.data_file.partition.clone()),
+        Ok(FileScanTask::builder()
+            .with_file_size_in_bytes(self.manifest_entry.file_size_in_bytes())
+            .with_start(0)
+            .with_length(self.manifest_entry.file_size_in_bytes())
+            .with_record_count(Some(self.manifest_entry.record_count()))
+            .with_data_file_path(self.manifest_entry.file_path().to_string())
+            .with_data_file_format(self.manifest_entry.file_format())
+            .with_schema(self.snapshot_schema)
+            .with_project_field_ids(self.field_ids.to_vec())
+            .with_predicate(
+                self.bound_predicates
+                    .map(|x| x.as_ref().snapshot_bound_predicate.clone()),
+            )
+            .with_deletes(deletes)
+            .with_partition(Some(self.manifest_entry.data_file.partition.clone()))
             // TODO: Pass actual PartitionSpec through context chain for native flow
-            partition_spec: None,
-            // TODO: Extract name_mapping from table metadata property "schema.name-mapping.default"
-            name_mapping: None,
-            column_sizes: Some(self.manifest_entry.data_file().column_sizes().clone()),
-            split_offsets: self
-                .manifest_entry
-                .data_file()
-                .split_offsets()
-                .map(|s| s.to_vec()),
-            lower_bounds: {
-                let bounds = self.manifest_entry.data_file().lower_bounds();
-                (!bounds.is_empty()).then(|| bounds.clone())
-            },
-            upper_bounds: {
-                let bounds = self.manifest_entry.data_file().upper_bounds();
-                (!bounds.is_empty()).then(|| bounds.clone())
-            },
-            sort_order_id: self.manifest_entry.data_file().sort_order_id(),
-            case_sensitive: self.case_sensitive,
-        })
+            .with_partition_spec(None)
+            .with_name_mapping(self.name_mapping)
+            .with_column_sizes(Some(self.manifest_entry.data_file().column_sizes().clone()))
+            .with_split_offsets(
+                self.manifest_entry
+                    .data_file()
+                    .split_offsets()
+                    .map(|offsets| offsets.to_vec()),
+            )
+            .with_lower_bounds(
+                (!self.manifest_entry.data_file().lower_bounds().is_empty())
+                    .then(|| self.manifest_entry.data_file().lower_bounds().clone()),
+            )
+            .with_upper_bounds(
+                (!self.manifest_entry.data_file().upper_bounds().is_empty())
+                    .then(|| self.manifest_entry.data_file().upper_bounds().clone()),
+            )
+            .with_sort_order_id(self.manifest_entry.data_file().sort_order_id())
+            .with_case_sensitive(self.case_sensitive)
+            .build())
     }
 }
 
 /// PlanContext wraps a [`SnapshotRef`] alongside all the other
 /// objects that are required to perform a scan file plan.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct PlanContext {
     pub snapshot: SnapshotRef,
 
@@ -171,14 +179,12 @@ pub(crate) struct PlanContext {
     pub snapshot_bound_predicate: Option<Arc<BoundPredicate>>,
     pub object_cache: Arc<ObjectCache>,
     pub field_ids: Arc<Vec<i32>>,
+    pub name_mapping: Option<Arc<NameMapping>>,
 
     pub partition_filter_cache: Arc<PartitionFilterCache>,
     pub manifest_evaluator_cache: Arc<ManifestEvaluatorCache>,
     pub expression_evaluator_cache: Arc<ExpressionEvaluatorCache>,
-
-    /// Exclusive start snapshot for incremental scan. `None` means scan from the beginning.
     pub from_snapshot_id: Option<i64>,
-    /// Inclusive end snapshot for incremental scan. When set, enables incremental scan mode.
     pub to_snapshot_id: Option<i64>,
 }
 
@@ -211,50 +217,77 @@ impl PlanContext {
         Ok(partition_filter)
     }
 
-    pub(crate) fn build_manifest_file_context_iter(
+    pub(crate) fn build_manifest_file_contexts(
         &self,
         manifest_list: Arc<ManifestList>,
-    ) -> impl Iterator<Item = Result<ManifestFileContext>> {
-        let has_predicate = self.predicate.is_some();
+        tx_data: Sender<ManifestEntryContext>,
+        delete_file_idx: DeleteFileIndex,
+        delete_file_tx: Sender<ManifestEntryContext>,
+    ) -> Result<Box<impl Iterator<Item = Result<ManifestFileContext>> + 'static>> {
+        let mut manifest_files = manifest_list.entries().iter().collect::<Vec<_>>();
+        // Sort manifest files to process delete manifests first.
+        // This avoids a deadlock where the producer blocks on sending data manifest entries
+        // (because the data channel is full) while the delete manifest consumer is waiting
+        // for delete manifest entries (which haven't been produced yet).
+        // By processing delete manifests first, we ensure the delete consumer can finish,
+        // which then allows the data consumer to start draining the data channel.
+        manifest_files.sort_by_key(|m| match m.content {
+            ManifestContentType::Deletes => 0,
+            ManifestContentType::Data => 1,
+        });
 
-        (0..manifest_list.entries().len())
-            .map(move |i| manifest_list.entries()[i].clone())
-            .filter_map(move |manifest_file| {
-                // TODO: replace closure when `try_blocks` stabilizes
-                (|| {
-                    let partition_bound_predicate = if has_predicate {
-                        let predicate = self.get_partition_filter(&manifest_file)?;
+        // TODO: Ideally we could ditch this intermediate Vec as we return an iterator.
+        let mut filtered_mfcs = vec![];
+        for manifest_file in manifest_files {
+            let tx = if manifest_file.content == ManifestContentType::Deletes {
+                delete_file_tx.clone()
+            } else {
+                tx_data.clone()
+            };
 
-                        if !self
-                            .manifest_evaluator_cache
-                            .get(manifest_file.partition_spec_id, predicate.clone())
-                            .eval(&manifest_file)?
-                        {
-                            return Ok(None); // Skip this file.
-                        }
-                        Some(predicate)
-                    } else {
-                        None
-                    };
+            let partition_bound_predicate = if self.predicate.is_some() {
+                let partition_bound_predicate = self.get_partition_filter(manifest_file)?;
 
-                    let context = self.create_manifest_file_context(
-                        manifest_file,
-                        partition_bound_predicate,
-                        None,
-                    )?;
+                // evaluate the ManifestFile against the partition filter. Skip
+                // if it cannot contain any matching rows
+                if !self
+                    .manifest_evaluator_cache
+                    .get(
+                        manifest_file.partition_spec_id,
+                        partition_bound_predicate.clone(),
+                    )
+                    .eval(manifest_file)?
+                {
+                    continue;
+                }
 
-                    Ok(Some(context))
-                })()
-                .transpose()
-            })
+                Some(partition_bound_predicate)
+            } else {
+                None
+            };
+
+            let mfc = self.create_manifest_file_context(
+                manifest_file,
+                partition_bound_predicate,
+                tx,
+                delete_file_idx.clone(),
+                None,
+            );
+
+            filtered_mfcs.push(Ok(mfc));
+        }
+
+        Ok(Box::new(filtered_mfcs.into_iter()))
     }
 
     fn create_manifest_file_context(
         &self,
-        manifest_file: ManifestFile,
+        manifest_file: &ManifestFile,
         partition_filter: Option<Arc<BoundPredicate>>,
-        filter_fn: Option<Arc<ManifestEntryFilterFn>>,
-    ) -> Result<ManifestFileContext> {
+        sender: Sender<ManifestEntryContext>,
+        delete_file_index: DeleteFileIndex,
+        filter_fn: Option<Arc<dyn Fn(&ManifestEntryRef) -> bool + Send + Sync>>,
+    ) -> ManifestFileContext {
         let bound_predicates =
             if let (Some(ref partition_bound_predicate), Some(snapshot_bound_predicate)) =
                 (partition_filter, &self.snapshot_bound_predicate)
@@ -267,149 +300,109 @@ impl PlanContext {
                 None
             };
 
-        Ok(ManifestFileContext {
-            manifest_file,
+        ManifestFileContext {
+            manifest_file: manifest_file.clone(),
             bound_predicates,
+            sender,
             object_cache: self.object_cache.clone(),
             snapshot_schema: self.snapshot_schema.clone(),
             field_ids: self.field_ids.clone(),
             expression_evaluator_cache: self.expression_evaluator_cache.clone(),
+            delete_file_index,
+            name_mapping: self.name_mapping.clone(),
             case_sensitive: self.case_sensitive,
             filter_fn,
-        })
+        }
     }
 
-    /// Build manifest file contexts for an incremental scan.
-    /// Only returns manifest files from snapshots between `from_snapshot_id`
-    /// (exclusive) and `to_snapshot_id` (inclusive), filtering entries to only
-    /// newly added data files.
-    ///
-    /// - Data files in `Append` and `Overwrite` snapshots are included.
-    /// - Delete files are ignored.
-    /// - `Replace` snapshots (e.g., compaction) are skipped.
-    pub(crate) async fn build_manifest_file_contexts_for_incremental_scan(
+    pub(crate) async fn build_incremental_manifest_file_contexts(
         &self,
         from_snapshot_id: Option<i64>,
         to_snapshot_id: i64,
+        sender: Sender<ManifestEntryContext>,
+        delete_file_index: DeleteFileIndex,
     ) -> Result<Vec<Result<ManifestFileContext>>> {
         let snapshots: Vec<SnapshotRef> =
             ancestors_between(&self.table_metadata, to_snapshot_id, from_snapshot_id)
                 .filter(|snapshot| {
                     matches!(
                         snapshot.summary().operation,
-                        Operation::Append | Operation::Overwrite
+                        crate::spec::Operation::Append | crate::spec::Operation::Overwrite
                     )
                 })
                 .collect();
-
-        let snapshot_ids: HashSet<i64> = snapshots.iter().map(|s| s.snapshot_id()).collect();
-
-        // Build a filter that only passes newly-added data file entries
-        // whose snapshot_id is in the range
-        let snapshot_ids_for_filter = snapshot_ids.clone();
-        let filter_fn: Arc<ManifestEntryFilterFn> = Arc::new(move |entry: &ManifestEntryRef| {
-            matches!(entry.status(), ManifestStatus::Added)
-                && matches!(entry.data_file().content_type(), DataContentType::Data)
-                && entry
-                    .snapshot_id()
-                    .is_none_or(|id| snapshot_ids_for_filter.contains(&id))
-        });
-
-        let has_predicate = self.predicate.is_some();
+        let snapshot_ids: HashSet<i64> = snapshots
+            .iter()
+            .map(|snapshot| snapshot.snapshot_id())
+            .collect();
+        let filter_snapshot_ids = snapshot_ids.clone();
+        let filter_fn: Arc<dyn Fn(&ManifestEntryRef) -> bool + Send + Sync> =
+            Arc::new(move |entry| {
+                matches!(entry.status(), crate::spec::ManifestStatus::Added)
+                    && matches!(
+                        entry.data_file().content_type(),
+                        crate::spec::DataContentType::Data
+                    )
+                    && entry
+                        .snapshot_id()
+                        .is_none_or(|id| filter_snapshot_ids.contains(&id))
+            });
         let mut contexts = Vec::new();
-
-        for snapshot in &snapshots {
+        for snapshot in snapshots {
             let manifest_list = self
                 .object_cache
-                .get_manifest_list(snapshot, &self.table_metadata)
+                .get_manifest_list(&snapshot, &self.table_metadata)
                 .await?;
-
             for manifest_file in manifest_list.entries() {
-                // Only include manifests that were written by one of the snapshots in our range
                 if !snapshot_ids.contains(&manifest_file.added_snapshot_id) {
                     continue;
                 }
-
                 if manifest_file.content == ManifestContentType::Deletes {
                     return Err(Error::new(
                         ErrorKind::FeatureUnsupported,
-                        format!(
-                            "Incremental scan does not support delete files. \
-                             Snapshot {} contains a delete manifest.",
-                            manifest_file.added_snapshot_id
-                        ),
+                        "Incremental scan does not support delete manifests",
                     ));
                 }
-
-                // Apply partition filter if predicate exists
-                let partition_bound_predicate = if has_predicate {
+                let partition_filter = if self.predicate.is_some() {
                     let predicate = self.get_partition_filter(manifest_file)?;
                     if !self
                         .manifest_evaluator_cache
                         .get(manifest_file.partition_spec_id, predicate.clone())
                         .eval(manifest_file)?
                     {
-                        continue; // Skip this manifest
+                        continue;
                     }
                     Some(predicate)
                 } else {
                     None
                 };
-
-                let context = self.create_manifest_file_context(
-                    manifest_file.clone(),
-                    partition_bound_predicate,
+                contexts.push(Ok(self.create_manifest_file_context(
+                    manifest_file,
+                    partition_filter,
+                    sender.clone(),
+                    delete_file_index.clone(),
                     Some(filter_fn.clone()),
-                )?;
-                contexts.push(Ok(context));
+                )));
             }
         }
-
         Ok(contexts)
     }
 }
 
-struct Ancestors {
-    next: Option<SnapshotRef>,
-    get_snapshot: Box<dyn Fn(i64) -> Option<SnapshotRef> + Send>,
-}
-
-impl Iterator for Ancestors {
-    type Item = SnapshotRef;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let snapshot = self.next.take()?;
-        let result = snapshot.clone();
-        self.next = snapshot
-            .parent_snapshot_id()
-            .and_then(|id| (self.get_snapshot)(id));
-        Some(result)
-    }
-}
-
-/// Iterate starting from `latest_snapshot_id` (inclusive) to `oldest_snapshot_id` (exclusive).
-/// If `oldest_snapshot_id` is `None`, iterates to the root snapshot.
 fn ancestors_between(
     table_metadata: &TableMetadataRef,
     latest_snapshot_id: i64,
     oldest_snapshot_id: Option<i64>,
-) -> Box<dyn Iterator<Item = SnapshotRef> + Send> {
-    if oldest_snapshot_id == Some(latest_snapshot_id) {
-        return Box::new(std::iter::empty());
-    }
-
-    let Some(snapshot) = table_metadata.snapshot_by_id(latest_snapshot_id) else {
-        return Box::new(std::iter::empty());
-    };
-
-    let table_metadata = table_metadata.clone();
-    let ancestors = Ancestors {
-        next: Some(snapshot.clone()),
-        get_snapshot: Box::new(move |id| table_metadata.snapshot_by_id(id).cloned()),
-    };
-
-    match oldest_snapshot_id {
-        Some(oldest) => Box::new(ancestors.take_while(move |s| s.snapshot_id() != oldest)),
-        None => Box::new(ancestors),
-    }
+) -> impl Iterator<Item = SnapshotRef> {
+    let mut next = table_metadata.snapshot_by_id(latest_snapshot_id).cloned();
+    std::iter::from_fn(move || {
+        let snapshot = next.take()?;
+        if oldest_snapshot_id == Some(snapshot.snapshot_id()) {
+            return None;
+        }
+        next = snapshot
+            .parent_snapshot_id()
+            .and_then(|id| table_metadata.snapshot_by_id(id).cloned());
+        Some(snapshot)
+    })
 }

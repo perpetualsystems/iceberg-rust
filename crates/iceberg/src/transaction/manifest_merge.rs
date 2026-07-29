@@ -193,13 +193,7 @@ impl ManifestMergeManager {
         );
 
         let output_file = file_io.new_output(&path)?;
-        let builder = ManifestWriterBuilder::new(
-            output_file,
-            Some(snap_id),
-            producer.key_metadata().map(<[u8]>::to_vec),
-            schema,
-            spec,
-        );
+        let builder = ManifestWriterBuilder::new(output_file, Some(snap_id), schema, spec);
         // The merge never crosses content boundaries: data and delete manifests
         // get separate managers in Java, and only the data path is built here.
         let content = bin[0].content;

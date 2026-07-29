@@ -28,8 +28,7 @@ use parquet::arrow::{ArrowSchemaConverter, PARQUET_FIELD_ID_META_KEY, Projection
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 
 use super::{ArrowReader, CollectFieldIdVisitor};
-use crate::arrow::arrow_schema_to_schema;
-use crate::arrow::schema::get_field_id_from_metadata;
+use crate::arrow::{arrow_schema_to_schema, get_field_id_from_metadata};
 use crate::error::Result;
 use crate::expr::BoundPredicate;
 use crate::expr::visitors::bound_predicate_visitor::visit;
@@ -39,7 +38,9 @@ use crate::{Error, ErrorKind};
 impl ArrowReader {
     pub(super) fn build_field_id_set_and_map(
         parquet_schema: &SchemaDescriptor,
+        arrow_schema: &ArrowSchemaRef,
         predicate: &BoundPredicate,
+        use_position_fallback: bool,
     ) -> Result<(HashSet<i32>, HashMap<i32, usize>)> {
         // Collects all Iceberg field IDs referenced in the filter predicate
         let mut collector = CollectFieldIdVisitor {
@@ -49,10 +50,13 @@ impl ArrowReader {
 
         let iceberg_field_ids = collector.field_ids();
 
-        // Without embedded field IDs, we fall back to position-based mapping for compatibility
         let field_id_map = match build_field_id_map(parquet_schema)? {
             Some(map) => map,
-            None => build_fallback_field_id_map(parquet_schema),
+            // No embedded field IDs and no name mapping: position-based fallback
+            None if use_position_fallback => build_fallback_field_id_map(parquet_schema),
+            // No embedded field IDs, but a name mapping assigned them to the Arrow
+            // schema: resolve columns through the mapped Arrow field-id metadata
+            None => build_field_id_map_from_arrow_schema(arrow_schema),
         };
 
         Ok((iceberg_field_ids, field_id_map))
@@ -85,7 +89,7 @@ impl ArrowReader {
         iceberg_schema_of_task: &Schema,
         parquet_schema: &SchemaDescriptor,
         arrow_schema: &ArrowSchemaRef,
-        use_fallback: bool, // Whether file lacks embedded field IDs (e.g., migrated from Hive/Spark)
+        use_fallback: bool, // Position-based fallback: file lacks embedded field IDs and no name mapping assigned any
     ) -> Result<ProjectionMask> {
         fn type_promotion_is_valid(
             file_type: Option<&PrimitiveType>,
@@ -309,6 +313,30 @@ pub(super) fn build_fallback_field_id_map(
     column_map
 }
 
+/// Builds a mapping from field IDs to leaf column indices using the field-id metadata
+/// carried by the Arrow schema.
+///
+/// Used for Parquet files without embedded field IDs when a name mapping has assigned
+/// IDs to the Arrow schema (see [`apply_name_mapping_to_arrow_schema`]): the Parquet
+/// schema descriptor itself still has no IDs, but the Arrow leaves are flattened in the
+/// same depth-first order as Parquet leaf columns, so the Arrow leaf index lines up with
+/// the Parquet column index. Columns the mapping did not match carry no field-id
+/// metadata and are simply absent from the map.
+fn build_field_id_map_from_arrow_schema(arrow_schema: &ArrowSchemaRef) -> HashMap<i32, usize> {
+    let mut column_map = HashMap::new();
+    arrow_schema.fields().filter_leaves(|idx, field| {
+        if let Some(field_id) = field
+            .metadata()
+            .get(PARQUET_FIELD_ID_META_KEY)
+            .and_then(|value| i32::from_str(value).ok())
+        {
+            column_map.insert(field_id, idx);
+        }
+        false
+    });
+    column_map
+}
+
 /// Apply name mapping to Arrow schema for Parquet files lacking field IDs.
 ///
 /// Assigns Iceberg field IDs based on column names using the name mapping,
@@ -415,70 +443,39 @@ pub(super) fn add_fallback_field_ids_to_arrow_schema(
     ))
 }
 
-/// Remap the data types of `file_schema`'s top-level fields to match `override_schema`
-/// by `PARQUET:field_id`. A field is only coerced to the override's type when the two
-/// share the file field's Parquet physical layout at every leaf (e.g. `Utf8` → `Utf8View`,
-/// both BYTE_ARRAY) — reinterpretation with no decode-time work. Incompatible overrides
-/// (e.g. `Int32` → `Int64`, from Iceberg type promotion) are dropped and the
-/// `RecordBatchTransformer` casts via `arrow::cast()` downstream. Fields without a matching
-/// ID in the override are preserved as-is. When `override_schema` is `None`, returns
-/// `file_schema` unchanged.
+/// Applies a caller-supplied Arrow layout only to fields that share the file's
+/// Parquet physical representation. Matching by field id preserves schema evolution.
 pub(super) fn apply_arrow_schema_override(
     file_schema: &ArrowSchemaRef,
     override_schema: Option<&ArrowSchema>,
-) -> Arc<ArrowSchema> {
+) -> ArrowSchemaRef {
     let Some(override_schema) = override_schema else {
         return Arc::clone(file_schema);
     };
-
-    // Field-IDs are Iceberg's stable identity for a column across schema evolution; names
-    // and positions can diverge between file and override, so matching by ID is the only
-    // safe way to pair them.
-    let mut override_fields: HashMap<i32, &FieldRef> = HashMap::new();
-    for field in override_schema.fields() {
-        if let Ok(id) = get_field_id_from_metadata(field) {
-            override_fields.insert(id, field);
-        }
-    }
-
-    // Empty ID map (e.g. override schema authored without field-IDs) means we have no way
-    // to pair fields; skip rather than silently dropping all overrides by position.
+    let override_fields: HashMap<i32, &FieldRef> = override_schema
+        .fields()
+        .iter()
+        .filter_map(|field| get_field_id_from_metadata(field).ok().map(|id| (id, field)))
+        .collect();
     if override_fields.is_empty() {
         return Arc::clone(file_schema);
     }
-
-    // Walk the file schema, not the override: the result must align to the file's shape
-    // so `ArrowReaderOptions::with_schema` accepts it.
     let mut changed = false;
-    let remapped: Vec<FieldRef> = file_schema
+    let fields: Vec<FieldRef> = file_schema
         .fields()
         .iter()
         .map(|file_field| {
-            let override_field = get_field_id_from_metadata(file_field)
+            let Some(override_field) = get_field_id_from_metadata(file_field)
                 .ok()
-                .and_then(|id| override_fields.get(&id).copied());
-
-            // No override for this field (column not in override, or file field missing
-            // an ID — common for files materialized via name-mapping): keep file's type.
-            let Some(override_field) = override_field else {
+                .and_then(|id| override_fields.get(&id).copied())
+            else {
                 return file_field.clone();
             };
-            // Fast path: identical types need no work and no physical-compat probe.
-            if override_field.data_type() == file_field.data_type() {
+            if override_field.data_type() == file_field.data_type()
+                || !physically_compatible(file_field, override_field)
+            {
                 return file_field.clone();
             }
-            // The caller's override type doesn't share Parquet physical encoding with the
-            // file (e.g. Iceberg int→long promotion: Int64 hint vs INT32 storage). We
-            // can't ask the decoder to do the cross-physical-type cast — leave the file's
-            // type in place and rely on `RecordBatchTransformer` to `arrow::cast()` the
-            // decoded batch up to the caller's expected type downstream.
-            if !physically_compatible(file_field, override_field) {
-                return file_field.clone();
-            }
-            // Physically compatible (e.g. Utf8→Utf8View, both BYTE_ARRAY): the decoder
-            // can produce the override type zero-copy. Preserve the file field's name,
-            // nullability, and metadata (including its field-ID) so downstream paths
-            // still identify it correctly.
             changed = true;
             Arc::new(
                 Field::new(
@@ -490,10 +487,9 @@ pub(super) fn apply_arrow_schema_override(
             )
         })
         .collect();
-
     if changed {
         Arc::new(ArrowSchema::new_with_metadata(
-            remapped,
+            fields,
             file_schema.metadata().clone(),
         ))
     } else {
@@ -501,22 +497,17 @@ pub(super) fn apply_arrow_schema_override(
     }
 }
 
-/// Returns true when both Arrow fields convert to the same Parquet physical layout at
-/// every leaf — i.e. the caller can freely coerce one to the other at decode time
-/// without changing how bytes are read. Delegates the Arrow → Parquet physical-type
-/// mapping to `ArrowSchemaConverter`. Returns false on any conversion failure.
-pub(super) fn physically_compatible(a: &FieldRef, b: &FieldRef) -> bool {
+fn physically_compatible(a: &FieldRef, b: &FieldRef) -> bool {
     fn convert(field: &FieldRef) -> Option<SchemaDescriptor> {
-        let schema = ArrowSchema::new(vec![field.clone()]);
-        ArrowSchemaConverter::new().convert(&schema).ok()
+        ArrowSchemaConverter::new()
+            .convert(&ArrowSchema::new(vec![field.clone()]))
+            .ok()
     }
-    let (Some(da), Some(db)) = (convert(a), convert(b)) else {
+    let (Some(a), Some(b)) = (convert(a), convert(b)) else {
         return false;
     };
-    if da.num_columns() != db.num_columns() {
-        return false;
-    }
-    (0..da.num_columns()).all(|i| da.column(i).physical_type() == db.column(i).physical_type())
+    a.num_columns() == b.num_columns()
+        && (0..a.num_columns()).all(|i| a.column(i).physical_type() == b.column(i).physical_type())
 }
 
 #[cfg(test)]
@@ -526,8 +517,8 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::cast::AsArray;
-    use arrow_array::{ArrayRef, RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema, TimeUnit};
+    use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
     use futures::TryStreamExt;
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY, ProjectionMask};
     use parquet::basic::Compression;
@@ -536,12 +527,14 @@ mod tests {
     use parquet::schema::types::SchemaDescriptor;
     use tempfile::TempDir;
 
-    use crate::ErrorKind;
     use crate::arrow::{ArrowReader, ArrowReaderBuilder};
     use crate::expr::{Bind, Reference};
     use crate::io::FileIO;
     use crate::scan::{FileScanTask, FileScanTaskStream};
-    use crate::spec::{DataFileFormat, Datum, NestedField, PrimitiveType, Schema, Type};
+    use crate::spec::{
+        DataFileFormat, Datum, MappedField, NameMapping, NestedField, PrimitiveType, Schema, Type,
+    };
+    use crate::{ErrorKind, Runtime};
 
     #[test]
     fn test_arrow_projection_mask() {
@@ -681,31 +674,22 @@ message schema {
         writer.close().unwrap();
 
         // Read the old Parquet file using the NEW schema (with column 'b')
-        let reader = ArrowReaderBuilder::new(file_io).build();
+        let reader = ArrowReaderBuilder::new(file_io, Runtime::current()).build();
         let tasks = Box::pin(futures::stream::iter(
-            vec![Ok(FileScanTask {
-                file_size_in_bytes: std::fs::metadata(format!("{table_location}/old_file.parquet"))
-                    .unwrap()
-                    .len(),
-                start: 0,
-                length: 0,
-                record_count: None,
-                data_file_path: format!("{table_location}/old_file.parquet"),
-                data_file_format: DataFileFormat::Parquet,
-                schema: new_schema.clone(),
-                project_field_ids: vec![1, 2], // Request both columns 'a' and 'b'
-                predicate: None,
-                deletes: vec![],
-                partition: None,
-                partition_spec: None,
-                name_mapping: None,
-                column_sizes: None,
-                split_offsets: None,
-                lower_bounds: None,
-                upper_bounds: None,
-                sort_order_id: None,
-                case_sensitive: false,
-            })]
+            vec![Ok(FileScanTask::builder()
+                .with_file_size_in_bytes(
+                    std::fs::metadata(format!("{table_location}/old_file.parquet"))
+                        .unwrap()
+                        .len(),
+                )
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(format!("{table_location}/old_file.parquet"))
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(new_schema.clone())
+                .with_project_field_ids(vec![1, 2]) // Request both columns 'a' and 'b'
+                .with_case_sensitive(false)
+                .build())]
             .into_iter(),
         )) as FileScanTaskStream;
 
@@ -788,32 +772,23 @@ message schema {
         writer.write(&to_write).expect("Writing batch");
         writer.close().unwrap();
 
-        let reader = ArrowReaderBuilder::new(file_io).build();
+        let reader = ArrowReaderBuilder::new(file_io, Runtime::current()).build();
 
         let tasks = Box::pin(futures::stream::iter(
-            vec![Ok(FileScanTask {
-                file_size_in_bytes: std::fs::metadata(format!("{table_location}/1.parquet"))
-                    .unwrap()
-                    .len(),
-                start: 0,
-                length: 0,
-                record_count: None,
-                data_file_path: format!("{table_location}/1.parquet"),
-                data_file_format: DataFileFormat::Parquet,
-                schema: schema.clone(),
-                project_field_ids: vec![1, 2],
-                predicate: None,
-                deletes: vec![],
-                partition: None,
-                partition_spec: None,
-                name_mapping: None,
-                column_sizes: None,
-                split_offsets: None,
-                lower_bounds: None,
-                upper_bounds: None,
-                sort_order_id: None,
-                case_sensitive: false,
-            })]
+            vec![Ok(FileScanTask::builder()
+                .with_file_size_in_bytes(
+                    std::fs::metadata(format!("{table_location}/1.parquet"))
+                        .unwrap()
+                        .len(),
+                )
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(format!("{table_location}/1.parquet"))
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(schema.clone())
+                .with_project_field_ids(vec![1, 2])
+                .with_case_sensitive(false)
+                .build())]
             .into_iter(),
         )) as FileScanTaskStream;
 
@@ -842,6 +817,212 @@ message schema {
         assert_eq!(age_array.value(0), 30);
         assert_eq!(age_array.value(1), 25);
         assert_eq!(age_array.value(2), 35);
+    }
+
+    /// Regression test for #2403: when a Parquet file lacks embedded field IDs but a
+    /// name mapping is present, projection must use the field IDs assigned by the name
+    /// mapping — not the position-based fallback (field_id N → column N-1).
+    ///
+    /// The scenario uses a file whose physical column order does not line up with the
+    /// Iceberg field IDs: physical columns are `[name, subdept]` while the mapping
+    /// assigns `name → 2` and `subdept → 4`. The position fallback would project
+    /// field 2 from physical column 1 (`subdept`) and drop field 4 (column 3 is out of
+    /// range), silently misreading data.
+    #[tokio::test]
+    async fn test_read_parquet_with_name_mapping_uses_mapped_field_ids() {
+        // Iceberg schema: physical file order does NOT match field-id order.
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::optional(3, "dept", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::optional(4, "subdept", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        // Migrated Parquet file: no field-id metadata, physical columns [name, subdept].
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("subdept", DataType::Utf8, true),
+        ]));
+
+        let name_mapping = Arc::new(NameMapping::new(vec![
+            MappedField::new(Some(2), vec!["name".to_string()], vec![]),
+            MappedField::new(Some(4), vec!["subdept".to_string()], vec![]),
+        ]));
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap().to_string();
+        let file_io = FileIO::new_with_fs();
+
+        let name_col = Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])) as ArrayRef;
+        let subdept_col = Arc::new(StringArray::from(vec!["comms", "tax", "audit"])) as ArrayRef;
+
+        let to_write =
+            RecordBatch::try_new(arrow_schema.clone(), vec![name_col, subdept_col]).unwrap();
+
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let file = File::create(format!("{table_location}/1.parquet")).unwrap();
+        let mut writer = ArrowWriter::try_new(file, to_write.schema(), Some(props)).unwrap();
+        writer.write(&to_write).expect("Writing batch");
+        writer.close().unwrap();
+
+        let reader = ArrowReaderBuilder::new(file_io, Runtime::current()).build();
+
+        let tasks = Box::pin(futures::stream::iter(
+            vec![Ok(FileScanTask::builder()
+                .with_file_size_in_bytes(
+                    std::fs::metadata(format!("{table_location}/1.parquet"))
+                        .unwrap()
+                        .len(),
+                )
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(format!("{table_location}/1.parquet"))
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(schema.clone())
+                .with_project_field_ids(vec![2, 4])
+                .with_case_sensitive(false)
+                .with_name_mapping(Some(name_mapping))
+                .build())]
+            .into_iter(),
+        )) as FileScanTaskStream;
+
+        let result = reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        let batch = &result[0];
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.num_columns(), 2);
+
+        // field 2 (`name`) must come from physical column 0, not be NULL-filled.
+        let name_array = batch.column(0).as_string::<i32>();
+        assert_eq!(
+            name_array.null_count(),
+            0,
+            "`name` was NULL-filled: name mapping was ignored and position fallback was used"
+        );
+        assert_eq!(name_array.value(0), "Alice");
+        assert_eq!(name_array.value(1), "Bob");
+        assert_eq!(name_array.value(2), "Charlie");
+
+        // field 4 (`subdept`) must come from physical column 1.
+        let subdept_array = batch.column(1).as_string::<i32>();
+        assert_eq!(subdept_array.null_count(), 0);
+        assert_eq!(subdept_array.value(0), "comms");
+        assert_eq!(subdept_array.value(1), "tax");
+        assert_eq!(subdept_array.value(2), "audit");
+    }
+
+    /// Regression test for #2403, predicate side: with a name mapping present, predicate
+    /// pushdown must resolve field IDs via the mapping rather than the position fallback,
+    /// which would evaluate the filter against the wrong physical column.
+    #[tokio::test]
+    async fn test_predicate_on_name_mapped_file_uses_mapped_field_ids() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::optional(3, "dept", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::optional(4, "subdept", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("subdept", DataType::Utf8, true),
+        ]));
+
+        let name_mapping = Arc::new(NameMapping::new(vec![
+            MappedField::new(Some(2), vec!["name".to_string()], vec![]),
+            MappedField::new(Some(4), vec!["subdept".to_string()], vec![]),
+        ]));
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap().to_string();
+        let file_io = FileIO::new_with_fs();
+
+        // Engineered so that filtering the wrong physical column yields different rows:
+        // `name` and `subdept` both contain the value "Alice", on different rows.
+        let name_col = Arc::new(StringArray::from(vec!["Alice", "Bob", "Sue"])) as ArrayRef;
+        let subdept_col = Arc::new(StringArray::from(vec!["Bob", "Alice", "Alice"])) as ArrayRef;
+
+        let to_write =
+            RecordBatch::try_new(arrow_schema.clone(), vec![name_col, subdept_col]).unwrap();
+
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let file = File::create(format!("{table_location}/1.parquet")).unwrap();
+        let mut writer = ArrowWriter::try_new(file, to_write.schema(), Some(props)).unwrap();
+        writer.write(&to_write).expect("Writing batch");
+        writer.close().unwrap();
+
+        let predicate = Reference::new("name").equal_to(Datum::string("Alice"));
+
+        let reader = ArrowReaderBuilder::new(file_io, Runtime::current())
+            .with_row_group_filtering_enabled(true)
+            .with_row_selection_enabled(true)
+            .build();
+
+        let tasks = Box::pin(futures::stream::iter(
+            vec![Ok(FileScanTask::builder()
+                .with_file_size_in_bytes(
+                    std::fs::metadata(format!("{table_location}/1.parquet"))
+                        .unwrap()
+                        .len(),
+                )
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(format!("{table_location}/1.parquet"))
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(schema.clone())
+                .with_project_field_ids(vec![2, 4])
+                .with_case_sensitive(false)
+                .with_name_mapping(Some(name_mapping))
+                .with_predicate(Some(predicate.bind(schema, true).unwrap()))
+                .build())]
+            .into_iter(),
+        )) as FileScanTaskStream;
+
+        let result = reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+
+        let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 1,
+            "filter `name = \"Alice\"` matched the wrong rows: predicate was evaluated \
+             against the wrong physical column"
+        );
+
+        let batch = &result[0];
+        let name_array = batch.column(0).as_string::<i32>();
+        assert_eq!(name_array.value(0), "Alice");
+        let subdept_array = batch.column(1).as_string::<i32>();
+        assert_eq!(subdept_array.value(0), "Bob");
     }
 
     /// Test reading Parquet files without field IDs with partial projection.
@@ -895,32 +1076,23 @@ message schema {
         writer.write(&to_write).expect("Writing batch");
         writer.close().unwrap();
 
-        let reader = ArrowReaderBuilder::new(file_io).build();
+        let reader = ArrowReaderBuilder::new(file_io, Runtime::current()).build();
 
         let tasks = Box::pin(futures::stream::iter(
-            vec![Ok(FileScanTask {
-                file_size_in_bytes: std::fs::metadata(format!("{table_location}/1.parquet"))
-                    .unwrap()
-                    .len(),
-                start: 0,
-                length: 0,
-                record_count: None,
-                data_file_path: format!("{table_location}/1.parquet"),
-                data_file_format: DataFileFormat::Parquet,
-                schema: schema.clone(),
-                project_field_ids: vec![1, 3],
-                predicate: None,
-                deletes: vec![],
-                partition: None,
-                partition_spec: None,
-                name_mapping: None,
-                column_sizes: None,
-                split_offsets: None,
-                lower_bounds: None,
-                upper_bounds: None,
-                sort_order_id: None,
-                case_sensitive: false,
-            })]
+            vec![Ok(FileScanTask::builder()
+                .with_file_size_in_bytes(
+                    std::fs::metadata(format!("{table_location}/1.parquet"))
+                        .unwrap()
+                        .len(),
+                )
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(format!("{table_location}/1.parquet"))
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(schema.clone())
+                .with_project_field_ids(vec![1, 3])
+                .with_case_sensitive(false)
+                .build())]
             .into_iter(),
         )) as FileScanTaskStream;
 
@@ -991,32 +1163,23 @@ message schema {
         writer.write(&to_write).expect("Writing batch");
         writer.close().unwrap();
 
-        let reader = ArrowReaderBuilder::new(file_io).build();
+        let reader = ArrowReaderBuilder::new(file_io, Runtime::current()).build();
 
         let tasks = Box::pin(futures::stream::iter(
-            vec![Ok(FileScanTask {
-                file_size_in_bytes: std::fs::metadata(format!("{table_location}/1.parquet"))
-                    .unwrap()
-                    .len(),
-                start: 0,
-                length: 0,
-                record_count: None,
-                data_file_path: format!("{table_location}/1.parquet"),
-                data_file_format: DataFileFormat::Parquet,
-                schema: schema.clone(),
-                project_field_ids: vec![1, 2, 3],
-                predicate: None,
-                deletes: vec![],
-                partition: None,
-                partition_spec: None,
-                name_mapping: None,
-                column_sizes: None,
-                split_offsets: None,
-                lower_bounds: None,
-                upper_bounds: None,
-                sort_order_id: None,
-                case_sensitive: false,
-            })]
+            vec![Ok(FileScanTask::builder()
+                .with_file_size_in_bytes(
+                    std::fs::metadata(format!("{table_location}/1.parquet"))
+                        .unwrap()
+                        .len(),
+                )
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(format!("{table_location}/1.parquet"))
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(schema.clone())
+                .with_project_field_ids(vec![1, 2, 3])
+                .with_case_sensitive(false)
+                .build())]
             .into_iter(),
         )) as FileScanTaskStream;
 
@@ -1101,32 +1264,23 @@ message schema {
         }
         writer.close().unwrap();
 
-        let reader = ArrowReaderBuilder::new(file_io).build();
+        let reader = ArrowReaderBuilder::new(file_io, Runtime::current()).build();
 
         let tasks = Box::pin(futures::stream::iter(
-            vec![Ok(FileScanTask {
-                file_size_in_bytes: std::fs::metadata(format!("{table_location}/1.parquet"))
-                    .unwrap()
-                    .len(),
-                start: 0,
-                length: 0,
-                record_count: None,
-                data_file_path: format!("{table_location}/1.parquet"),
-                data_file_format: DataFileFormat::Parquet,
-                schema: schema.clone(),
-                project_field_ids: vec![1, 2],
-                predicate: None,
-                deletes: vec![],
-                partition: None,
-                partition_spec: None,
-                name_mapping: None,
-                column_sizes: None,
-                split_offsets: None,
-                lower_bounds: None,
-                upper_bounds: None,
-                sort_order_id: None,
-                case_sensitive: false,
-            })]
+            vec![Ok(FileScanTask::builder()
+                .with_file_size_in_bytes(
+                    std::fs::metadata(format!("{table_location}/1.parquet"))
+                        .unwrap()
+                        .len(),
+                )
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(format!("{table_location}/1.parquet"))
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(schema.clone())
+                .with_project_field_ids(vec![1, 2])
+                .with_case_sensitive(false)
+                .build())]
             .into_iter(),
         )) as FileScanTaskStream;
 
@@ -1240,32 +1394,23 @@ message schema {
         writer.write(&to_write).expect("Writing batch");
         writer.close().unwrap();
 
-        let reader = ArrowReaderBuilder::new(file_io).build();
+        let reader = ArrowReaderBuilder::new(file_io, Runtime::current()).build();
 
         let tasks = Box::pin(futures::stream::iter(
-            vec![Ok(FileScanTask {
-                file_size_in_bytes: std::fs::metadata(format!("{table_location}/1.parquet"))
-                    .unwrap()
-                    .len(),
-                start: 0,
-                length: 0,
-                record_count: None,
-                data_file_path: format!("{table_location}/1.parquet"),
-                data_file_format: DataFileFormat::Parquet,
-                schema: schema.clone(),
-                project_field_ids: vec![1, 2],
-                predicate: None,
-                deletes: vec![],
-                partition: None,
-                partition_spec: None,
-                name_mapping: None,
-                column_sizes: None,
-                split_offsets: None,
-                lower_bounds: None,
-                upper_bounds: None,
-                sort_order_id: None,
-                case_sensitive: false,
-            })]
+            vec![Ok(FileScanTask::builder()
+                .with_file_size_in_bytes(
+                    std::fs::metadata(format!("{table_location}/1.parquet"))
+                        .unwrap()
+                        .len(),
+                )
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(format!("{table_location}/1.parquet"))
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(schema.clone())
+                .with_project_field_ids(vec![1, 2])
+                .with_case_sensitive(false)
+                .build())]
             .into_iter(),
         )) as FileScanTaskStream;
 
@@ -1346,32 +1491,23 @@ message schema {
         writer.write(&to_write).expect("Writing batch");
         writer.close().unwrap();
 
-        let reader = ArrowReaderBuilder::new(file_io).build();
+        let reader = ArrowReaderBuilder::new(file_io, Runtime::current()).build();
 
         let tasks = Box::pin(futures::stream::iter(
-            vec![Ok(FileScanTask {
-                file_size_in_bytes: std::fs::metadata(format!("{table_location}/1.parquet"))
-                    .unwrap()
-                    .len(),
-                start: 0,
-                length: 0,
-                record_count: None,
-                data_file_path: format!("{table_location}/1.parquet"),
-                data_file_format: DataFileFormat::Parquet,
-                schema: schema.clone(),
-                project_field_ids: vec![1, 5, 2],
-                predicate: None,
-                deletes: vec![],
-                partition: None,
-                partition_spec: None,
-                name_mapping: None,
-                column_sizes: None,
-                split_offsets: None,
-                lower_bounds: None,
-                upper_bounds: None,
-                sort_order_id: None,
-                case_sensitive: false,
-            })]
+            vec![Ok(FileScanTask::builder()
+                .with_file_size_in_bytes(
+                    std::fs::metadata(format!("{table_location}/1.parquet"))
+                        .unwrap()
+                        .len(),
+                )
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(format!("{table_location}/1.parquet"))
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(schema.clone())
+                .with_project_field_ids(vec![1, 5, 2])
+                .with_case_sensitive(false)
+                .build())]
             .into_iter(),
         )) as FileScanTaskStream;
 
@@ -1462,35 +1598,27 @@ message schema {
         let predicate = Reference::new("id").less_than(Datum::int(5));
 
         // Enable both row_group_filtering and row_selection - triggered the panic
-        let reader = ArrowReaderBuilder::new(file_io)
+        let reader = ArrowReaderBuilder::new(file_io, Runtime::current())
             .with_row_group_filtering_enabled(true)
             .with_row_selection_enabled(true)
             .build();
 
         let tasks = Box::pin(futures::stream::iter(
-            vec![Ok(FileScanTask {
-                file_size_in_bytes: std::fs::metadata(format!("{table_location}/1.parquet"))
-                    .unwrap()
-                    .len(),
-                start: 0,
-                length: 0,
-                record_count: None,
-                data_file_path: format!("{table_location}/1.parquet"),
-                data_file_format: DataFileFormat::Parquet,
-                schema: schema.clone(),
-                project_field_ids: vec![1, 2, 3],
-                predicate: Some(predicate.bind(schema, true).unwrap()),
-                deletes: vec![],
-                partition: None,
-                partition_spec: None,
-                name_mapping: None,
-                column_sizes: None,
-                split_offsets: None,
-                lower_bounds: None,
-                upper_bounds: None,
-                sort_order_id: None,
-                case_sensitive: false,
-            })]
+            vec![Ok(FileScanTask::builder()
+                .with_file_size_in_bytes(
+                    std::fs::metadata(format!("{table_location}/1.parquet"))
+                        .unwrap()
+                        .len(),
+                )
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(format!("{table_location}/1.parquet"))
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(schema.clone())
+                .with_project_field_ids(vec![1, 2, 3])
+                .with_case_sensitive(false)
+                .with_predicate(Some(predicate.bind(schema, true).unwrap()))
+                .build())]
             .into_iter(),
         )) as FileScanTaskStream;
 
@@ -1615,31 +1743,24 @@ message schema {
         writer.close().unwrap();
 
         // Read the Parquet file with partition spec and data
-        let reader = ArrowReaderBuilder::new(file_io).build();
+        let reader = ArrowReaderBuilder::new(file_io, Runtime::current()).build();
         let tasks = Box::pin(futures::stream::iter(
-            vec![Ok(FileScanTask {
-                file_size_in_bytes: std::fs::metadata(format!("{table_location}/data.parquet"))
-                    .unwrap()
-                    .len(),
-                start: 0,
-                length: 0,
-                record_count: None,
-                data_file_path: format!("{table_location}/data.parquet"),
-                data_file_format: DataFileFormat::Parquet,
-                schema: schema.clone(),
-                project_field_ids: vec![1, 2],
-                predicate: None,
-                deletes: vec![],
-                partition: Some(partition_data),
-                partition_spec: Some(partition_spec),
-                name_mapping: None,
-                column_sizes: None,
-                split_offsets: None,
-                lower_bounds: None,
-                upper_bounds: None,
-                sort_order_id: None,
-                case_sensitive: false,
-            })]
+            vec![Ok(FileScanTask::builder()
+                .with_file_size_in_bytes(
+                    std::fs::metadata(format!("{table_location}/data.parquet"))
+                        .unwrap()
+                        .len(),
+                )
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(format!("{table_location}/data.parquet"))
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(schema.clone())
+                .with_project_field_ids(vec![1, 2])
+                .with_case_sensitive(false)
+                .with_partition(Some(partition_data))
+                .with_partition_spec(Some(partition_spec))
+                .build())]
             .into_iter(),
         )) as FileScanTaskStream;
 
@@ -1830,33 +1951,23 @@ message schema {
 
         let predicate = Reference::new("id").greater_than(Datum::int(1));
 
-        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs())
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
             .with_row_group_filtering_enabled(true)
             .with_row_selection_enabled(true)
             .build();
 
         let tasks = Box::pin(futures::stream::iter(
-            vec![Ok(FileScanTask {
-                file_size_in_bytes: std::fs::metadata(&file_path).unwrap().len(),
-                start: 0,
-                length: 0,
-                record_count: None,
-                data_file_path: file_path,
-                data_file_format: DataFileFormat::Parquet,
-                schema: iceberg_schema.clone(),
-                project_field_ids: vec![4],
-                predicate: Some(predicate.bind(iceberg_schema, true).unwrap()),
-                deletes: vec![],
-                partition: None,
-                partition_spec: None,
-                name_mapping: None,
-                column_sizes: None,
-                split_offsets: None,
-                lower_bounds: None,
-                upper_bounds: None,
-                sort_order_id: None,
-                case_sensitive: false,
-            })]
+            vec![Ok(FileScanTask::builder()
+                .with_file_size_in_bytes(std::fs::metadata(&file_path).unwrap().len())
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(file_path)
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(iceberg_schema.clone())
+                .with_project_field_ids(vec![4])
+                .with_case_sensitive(false)
+                .with_predicate(Some(predicate.bind(iceberg_schema, true).unwrap()))
+                .build())]
             .into_iter(),
         )) as FileScanTaskStream;
 
@@ -1879,291 +1990,5 @@ message schema {
             })
             .collect();
         assert_eq!(ids, vec![2, 3]);
-    }
-
-    fn field_with_id(name: &str, dt: DataType, nullable: bool, id: i32) -> FieldRef {
-        Arc::new(
-            Field::new(name, dt, nullable).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                id.to_string(),
-            )])),
-        )
-    }
-
-    fn make_scan_task(
-        path: String,
-        schema: crate::spec::SchemaRef,
-        project_field_ids: Vec<i32>,
-    ) -> FileScanTask {
-        FileScanTask {
-            file_size_in_bytes: std::fs::metadata(&path).unwrap().len(),
-            start: 0,
-            length: 0,
-            record_count: None,
-            data_file_path: path,
-            data_file_format: DataFileFormat::Parquet,
-            schema,
-            project_field_ids,
-            predicate: None,
-            deletes: vec![],
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            column_sizes: None,
-            split_offsets: None,
-            lower_bounds: None,
-            upper_bounds: None,
-            sort_order_id: None,
-            case_sensitive: false,
-        }
-    }
-
-    #[test]
-    fn test_physically_compatible() {
-        let int32 = field_with_id("a", DataType::Int32, false, 1);
-        let int64 = field_with_id("a", DataType::Int64, false, 1);
-        let utf8 = field_with_id("s", DataType::Utf8, false, 2);
-        let utf8_view = field_with_id("s", DataType::Utf8View, false, 2);
-        let large_utf8 = field_with_id("s", DataType::LargeUtf8, false, 2);
-        let binary = field_with_id("b", DataType::Binary, false, 3);
-        let binary_view = field_with_id("b", DataType::BinaryView, false, 3);
-        let float32 = field_with_id("f", DataType::Float32, false, 4);
-        let float64 = field_with_id("f", DataType::Float64, false, 4);
-
-        assert!(!super::physically_compatible(&int32, &int64));
-        assert!(!super::physically_compatible(&float32, &float64));
-
-        assert!(super::physically_compatible(&utf8, &utf8_view));
-        assert!(super::physically_compatible(&utf8, &large_utf8));
-        assert!(super::physically_compatible(&binary, &binary_view));
-
-        assert!(super::physically_compatible(&int32, &int32));
-
-        let list_i32 = Arc::new(Field::new(
-            "l",
-            DataType::List(field_with_id("element", DataType::Int32, true, 11)),
-            true,
-        )) as FieldRef;
-        let list_i64 = Arc::new(Field::new(
-            "l",
-            DataType::List(field_with_id("element", DataType::Int64, true, 11)),
-            true,
-        )) as FieldRef;
-        assert!(!super::physically_compatible(&list_i32, &list_i64));
-
-        let struct_i32 = Arc::new(Field::new(
-            "s",
-            DataType::Struct(arrow_schema::Fields::from(vec![field_with_id(
-                "x",
-                DataType::Int32,
-                false,
-                21,
-            )])),
-            false,
-        )) as FieldRef;
-        let struct_i64 = Arc::new(Field::new(
-            "s",
-            DataType::Struct(arrow_schema::Fields::from(vec![field_with_id(
-                "x",
-                DataType::Int64,
-                false,
-                21,
-            )])),
-            false,
-        )) as FieldRef;
-        assert!(!super::physically_compatible(&struct_i32, &struct_i64));
-    }
-
-    #[test]
-    fn test_apply_arrow_schema_override_drops_incompatible() {
-        let file = Arc::new(ArrowSchema::new(vec![field_with_id(
-            "a",
-            DataType::Int32,
-            false,
-            1,
-        )]));
-        let override_schema = ArrowSchema::new(vec![field_with_id("a", DataType::Int64, false, 1)]);
-
-        let result = super::apply_arrow_schema_override(&file, Some(&override_schema));
-        assert_eq!(result.field(0).data_type(), &DataType::Int32);
-    }
-
-    #[test]
-    fn test_apply_arrow_schema_override_applies_compatible() {
-        let file = Arc::new(ArrowSchema::new(vec![field_with_id(
-            "s",
-            DataType::Utf8,
-            false,
-            1,
-        )]));
-        let override_schema =
-            ArrowSchema::new(vec![field_with_id("s", DataType::Utf8View, false, 1)]);
-
-        let result = super::apply_arrow_schema_override(&file, Some(&override_schema));
-        assert_eq!(result.field(0).data_type(), &DataType::Utf8View);
-    }
-
-    #[test]
-    fn test_apply_arrow_schema_override_mixed() {
-        let file = Arc::new(ArrowSchema::new(vec![
-            field_with_id("a", DataType::Int32, false, 1),
-            field_with_id("s", DataType::Utf8, false, 2),
-        ]));
-        let override_schema = ArrowSchema::new(vec![
-            field_with_id("a", DataType::Int64, false, 1),
-            field_with_id("s", DataType::Utf8View, false, 2),
-        ]);
-
-        let result = super::apply_arrow_schema_override(&file, Some(&override_schema));
-        assert_eq!(result.field(0).data_type(), &DataType::Int32);
-        assert_eq!(result.field(1).data_type(), &DataType::Utf8View);
-    }
-
-    /// Regression test for the type-promotion path: when DataFusion (or any caller) passes
-    /// the post-promotion current Arrow schema as the reader's `arrow_schema_override`, and
-    /// the file was written before the promotion, the reader must not ask the Parquet decoder
-    /// to produce the promoted type directly. The override is physically incompatible with
-    /// the file's INT32 storage; the `RecordBatchTransformer` casts Int32 → Int64 downstream.
-    #[tokio::test]
-    async fn test_read_with_incompatible_override_falls_back_and_casts() {
-        use arrow_array::Int32Array;
-
-        let table_schema = Arc::new(
-            Schema::builder()
-                .with_schema_id(2)
-                .with_fields(vec![
-                    NestedField::required(1, "a", Type::Primitive(PrimitiveType::Long)).into(),
-                ])
-                .build()
-                .unwrap(),
-        );
-
-        let file_arrow_schema = Arc::new(ArrowSchema::new(vec![field_with_id(
-            "a",
-            DataType::Int32,
-            false,
-            1,
-        )]));
-
-        let tmp_dir = TempDir::new().unwrap();
-        let data_path = format!("{}/a.parquet", tmp_dir.path().to_str().unwrap());
-        let data = Arc::new(Int32Array::from(vec![1i32, 2, 3])) as ArrayRef;
-        let batch = RecordBatch::try_new(file_arrow_schema.clone(), vec![data]).unwrap();
-        let file = File::create(&data_path).unwrap();
-        let mut writer = ArrowWriter::try_new(file, file_arrow_schema.clone(), None).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-
-        let override_schema = Arc::new(ArrowSchema::new(vec![field_with_id(
-            "a",
-            DataType::Int64,
-            false,
-            1,
-        )]));
-
-        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs())
-            .with_arrow_schema(override_schema)
-            .build();
-        let task = make_scan_task(data_path, table_schema.clone(), vec![1]);
-        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
-        let batches: Vec<RecordBatch> = reader
-            .read(tasks)
-            .unwrap()
-            .stream()
-            .try_collect()
-            .await
-            .unwrap();
-
-        assert_eq!(batches.len(), 1);
-        let out = &batches[0];
-        assert_eq!(out.num_columns(), 1);
-        assert_eq!(out.schema().field(0).data_type(), &DataType::Int64);
-        let col = out
-            .column(0)
-            .as_primitive::<arrow_array::types::Int64Type>();
-        assert_eq!(col.values(), &[1i64, 2, 3]);
-    }
-
-    /// Same regression but nested: a promoted field inside a struct must still be cast by
-    /// the transformer, not rejected by the Parquet decoder.
-    #[tokio::test]
-    async fn test_read_with_incompatible_override_in_struct() {
-        use arrow_array::{Int32Array, StructArray};
-
-        let table_schema = Arc::new(
-            Schema::builder()
-                .with_schema_id(2)
-                .with_fields(vec![
-                    NestedField::required(
-                        1,
-                        "s",
-                        Type::Struct(crate::spec::StructType::new(vec![
-                            NestedField::required(2, "x", Type::Primitive(PrimitiveType::Long))
-                                .into(),
-                        ])),
-                    )
-                    .into(),
-                ])
-                .build()
-                .unwrap(),
-        );
-
-        let struct_field = |child_type: DataType| -> FieldRef {
-            Arc::new(
-                Field::new(
-                    "s",
-                    DataType::Struct(arrow_schema::Fields::from(vec![field_with_id(
-                        "x", child_type, false, 2,
-                    )])),
-                    false,
-                )
-                .with_metadata(HashMap::from([(
-                    PARQUET_FIELD_ID_META_KEY.to_string(),
-                    "1".to_string(),
-                )])),
-            )
-        };
-        let file_arrow_schema = Arc::new(ArrowSchema::new(vec![struct_field(DataType::Int32)]));
-
-        let tmp_dir = TempDir::new().unwrap();
-        let data_path = format!("{}/s.parquet", tmp_dir.path().to_str().unwrap());
-        let inner = Arc::new(Int32Array::from(vec![10i32, 20, 30])) as ArrayRef;
-        let struct_array = Arc::new(StructArray::from(vec![(
-            field_with_id("x", DataType::Int32, false, 2),
-            inner,
-        )])) as ArrayRef;
-        let batch = RecordBatch::try_new(file_arrow_schema.clone(), vec![struct_array]).unwrap();
-        let file = File::create(&data_path).unwrap();
-        let mut writer = ArrowWriter::try_new(file, file_arrow_schema.clone(), None).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-
-        let override_schema = Arc::new(ArrowSchema::new(vec![struct_field(DataType::Int64)]));
-
-        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs())
-            .with_arrow_schema(override_schema)
-            .build();
-        let task = make_scan_task(data_path, table_schema.clone(), vec![1]);
-        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
-        let batches: Vec<RecordBatch> = reader
-            .read(tasks)
-            .unwrap()
-            .stream()
-            .try_collect()
-            .await
-            .unwrap();
-
-        assert_eq!(batches.len(), 1);
-        let out = &batches[0];
-        let struct_col = out
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow_array::StructArray>()
-            .unwrap();
-        assert_eq!(struct_col.column(0).data_type(), &DataType::Int64);
-        let inner = struct_col
-            .column(0)
-            .as_primitive::<arrow_array::types::Int64Type>();
-        assert_eq!(inner.values(), &[10i64, 20, 30]);
     }
 }

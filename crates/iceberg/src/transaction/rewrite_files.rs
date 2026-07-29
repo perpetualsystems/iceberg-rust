@@ -1627,7 +1627,6 @@ mod tests {
         let mut writer = ManifestWriterBuilder::new(
             output,
             Some(prior_snap_id),
-            None,
             table.metadata().current_schema().clone(),
             table.metadata().default_partition_spec().as_ref().clone(),
         )
@@ -1653,7 +1652,7 @@ mod tests {
         );
         let ml_output = table.file_io().new_output(&injected_ml_path).unwrap();
         let mut ml_writer = ManifestListWriter::v2(
-            ml_output,
+            ml_output.writer().await.unwrap(),
             injected_snap_id,
             Some(prior_snap_id),
             injected_seq_num,

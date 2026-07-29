@@ -21,6 +21,7 @@ use arrow_schema::SchemaRef as ArrowSchemaRef;
 
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::io::FileIO;
+use crate::runtime::Runtime;
 use crate::util::available_parallelism;
 
 /// Default gap between byte ranges below which they are coalesced into a
@@ -58,17 +59,13 @@ pub struct ArrowReaderBuilder {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
-    /// Optional caller-supplied table-level Arrow schema. When set, the reader uses
-    /// it in place of `schema_to_arrow_schema(snapshot)` when deriving target types
-    /// for the underlying Parquet decoder and the record-batch transformer. Used to
-    /// pin Arrow layouts (e.g. `Utf8View`, `BinaryView`) that share the same Parquet
-    /// physical encoding as the default mapping but avoid an `i32`-offset downcast.
+    runtime: Runtime,
     arrow_schema_override: Option<ArrowSchemaRef>,
 }
 
 impl ArrowReaderBuilder {
     /// Create a new ArrowReaderBuilder
-    pub fn new(file_io: FileIO) -> Self {
+    pub fn new(file_io: FileIO, runtime: Runtime) -> Self {
         let num_cpus = available_parallelism().get();
 
         ArrowReaderBuilder {
@@ -78,17 +75,13 @@ impl ArrowReaderBuilder {
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
             parquet_read_options: ParquetReadOptions::builder().build(),
+            runtime,
             arrow_schema_override: None,
         }
     }
 
-    /// Override the table-level Arrow schema used by the reader.
-    ///
-    /// The override must carry `PARQUET:field_id` metadata on each top-level field
-    /// so that projection and schema-evolution matching still work by field ID. The
-    /// override may only diverge from the default mapping in ways that share the
-    /// same Parquet physical encoding (e.g. `Utf8View` vs `Utf8`, `BinaryView` vs
-    /// `LargeBinary` — all BYTE_ARRAY).
+    /// Override the Arrow schema used by the Parquet decoder where its physical
+    /// layout is compatible with the file schema.
     pub fn with_arrow_schema(mut self, arrow_schema: ArrowSchemaRef) -> Self {
         self.arrow_schema_override = Some(arrow_schema);
         self
@@ -153,6 +146,7 @@ impl ArrowReaderBuilder {
             delete_file_loader: CachingDeleteFileLoader::new(
                 self.file_io.clone(),
                 self.concurrency_limit_data_files,
+                self.runtime.clone(),
             ),
             concurrency_limit_data_files: self.concurrency_limit_data_files,
             row_group_filtering_enabled: self.row_group_filtering_enabled,
@@ -176,7 +170,5 @@ pub struct ArrowReader {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
-
-    /// See [`ArrowReaderBuilder::with_arrow_schema`].
     pub(super) arrow_schema_override: Option<ArrowSchemaRef>,
 }

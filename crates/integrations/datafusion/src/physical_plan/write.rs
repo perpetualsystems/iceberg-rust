@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -139,10 +138,6 @@ impl ExecutionPlan for IcebergWriteExec {
         "IcebergWriteExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     /// Prevents the introduction of additional `RepartitionExec` and processing input in parallel.
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
         vec![false]
@@ -239,8 +234,8 @@ impl ExecutionPlan for IcebergWriteExec {
 
         let file_io = self.table.file_io().clone();
         // todo location_gen and file_name_gen should be configurable
-        let location_generator = DefaultLocationGenerator::new(self.table.metadata().clone())
-            .map_err(to_datafusion_error)?;
+        let location_generator =
+            DefaultLocationGenerator::new(self.table.metadata()).map_err(to_datafusion_error)?;
         // todo filename prefix/suffix should be configurable
         let file_name_generator =
             DefaultFileNameGenerator::new(Uuid::now_v7().to_string(), None, file_format);

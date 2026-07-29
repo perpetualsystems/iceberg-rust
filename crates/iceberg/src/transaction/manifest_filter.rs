@@ -241,13 +241,8 @@ async fn write_residual(
     );
 
     let output_file = file_io.new_output(path)?;
-    let builder = ManifestWriterBuilder::new(
-        output_file,
-        Some(producer.snapshot_id()),
-        producer.key_metadata().map(<[u8]>::to_vec),
-        schema,
-        spec,
-    );
+    let builder =
+        ManifestWriterBuilder::new(output_file, Some(producer.snapshot_id()), schema, spec);
     let mut writer = match (fmt, source.content) {
         (FormatVersion::V1, _) => builder.build_v1(),
         (FormatVersion::V2, ManifestContentType::Data) => builder.build_v2_data(),
