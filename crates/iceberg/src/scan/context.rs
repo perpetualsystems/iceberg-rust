@@ -150,6 +150,14 @@ impl ManifestEntryContext {
             .with_partition_spec(None)
             .with_name_mapping(self.name_mapping)
             .with_column_sizes(Some(self.manifest_entry.data_file().column_sizes().clone()))
+            .with_null_value_counts(
+                (!self
+                    .manifest_entry
+                    .data_file()
+                    .null_value_counts()
+                    .is_empty())
+                .then(|| self.manifest_entry.data_file().null_value_counts().clone()),
+            )
             .with_split_offsets(
                 self.manifest_entry
                     .data_file()

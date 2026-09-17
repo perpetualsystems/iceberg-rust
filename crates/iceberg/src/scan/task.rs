@@ -125,6 +125,15 @@ pub struct FileScanTask {
     #[builder(default)]
     pub column_sizes: Option<HashMap<i32, u64>>,
 
+    /// Per-column null counts (field_id -> null_count) from the manifest
+    /// entry. `None` when the manifest records no null counts (never
+    /// `Some` of an empty map). Planning-only, like `column_sizes`.
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
+    #[builder(default)]
+    pub null_value_counts: Option<HashMap<i32, u64>>,
+
     /// Row group split offsets from the manifest entry.
     /// Used for sub-file parallelism without re-reading manifests.
     #[serde(default)]
