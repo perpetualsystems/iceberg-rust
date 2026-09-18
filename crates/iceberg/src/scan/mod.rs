@@ -957,6 +957,7 @@ pub mod tests {
                                 .file_format(DataFileFormat::Parquet)
                                 .file_size_in_bytes(parquet_file_size)
                                 .record_count(1)
+                                .null_value_counts(HashMap::from([(1, 0)]))
                                 .partition(Struct::from_iter([Some(Literal::long(100))]))
                                 .key_metadata(None)
                                 .build()
@@ -980,6 +981,7 @@ pub mod tests {
                                 .file_format(DataFileFormat::Parquet)
                                 .file_size_in_bytes(parquet_file_size)
                                 .record_count(1)
+                                .null_value_counts(HashMap::from([(1, 0)]))
                                 .partition(Struct::from_iter([Some(Literal::long(200))]))
                                 .build()
                                 .unwrap(),
@@ -1002,6 +1004,7 @@ pub mod tests {
                                 .file_format(DataFileFormat::Parquet)
                                 .file_size_in_bytes(parquet_file_size)
                                 .record_count(1)
+                                .null_value_counts(HashMap::from([(1, 1)]))
                                 .partition(Struct::from_iter([Some(Literal::long(300))]))
                                 .build()
                                 .unwrap(),
@@ -1610,6 +1613,8 @@ pub mod tests {
             tasks[1].data_file_path,
             format!("{}/3.parquet", &fixture.table_location)
         );
+        assert_eq!(tasks[0].null_value_counts, Some(HashMap::from([(1, 0)])));
+        assert_eq!(tasks[1].null_value_counts, Some(HashMap::from([(1, 1)])));
     }
 
     #[tokio::test]
