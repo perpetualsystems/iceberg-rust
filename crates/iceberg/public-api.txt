@@ -10,6 +10,7 @@ pub fn iceberg::arrow::PartitionValueCalculator::calculate(&self, batch: &arrow_
 pub fn iceberg::arrow::PartitionValueCalculator::partition_arrow_type(&self) -> &arrow_schema::datatype::DataType
 pub fn iceberg::arrow::PartitionValueCalculator::partition_type(&self) -> &iceberg::spec::StructType
 pub fn iceberg::arrow::PartitionValueCalculator::try_new(partition_spec: &iceberg::spec::PartitionSpec, table_schema: &iceberg::spec::Schema) -> iceberg::Result<Self>
+pub fn iceberg::arrow::PartitionValueCalculator::try_new_with_match_mode(partition_spec: &iceberg::spec::PartitionSpec, table_schema: &iceberg::spec::Schema, match_mode: iceberg::arrow::FieldMatchMode) -> iceberg::Result<Self>
 impl core::fmt::Debug for iceberg::arrow::PartitionValueCalculator
 pub fn iceberg::arrow::PartitionValueCalculator::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub mod iceberg::arrow::record_batch_partition_splitter
@@ -25,6 +26,8 @@ pub struct iceberg::arrow::record_batch_projector::RecordBatchProjector
 impl iceberg::arrow::record_batch_projector::RecordBatchProjector
 pub fn iceberg::arrow::record_batch_projector::RecordBatchProjector::from_iceberg_schema(iceberg_schema: alloc::sync::Arc<iceberg::spec::Schema>, target_field_ids: &[i32]) -> iceberg::Result<Self>
 pub fn iceberg::arrow::record_batch_projector::RecordBatchProjector::project_column(&self, batch: &[arrow_array::array::ArrayRef]) -> iceberg::Result<alloc::vec::Vec<arrow_array::array::ArrayRef>>
+pub fn iceberg::arrow::record_batch_projector::RecordBatchProjector::project_columns_by_field_id(batch: &arrow_array::record_batch::RecordBatch, target_field_ids: &[i32]) -> iceberg::Result<alloc::vec::Vec<arrow_array::array::ArrayRef>>
+pub fn iceberg::arrow::record_batch_projector::RecordBatchProjector::project_columns_by_name(batch: &arrow_array::record_batch::RecordBatch, target_field_names: &[alloc::string::String]) -> iceberg::Result<alloc::vec::Vec<arrow_array::array::ArrayRef>>
 impl core::clone::Clone for iceberg::arrow::record_batch_projector::RecordBatchProjector
 pub fn iceberg::arrow::record_batch_projector::RecordBatchProjector::clone(&self) -> iceberg::arrow::record_batch_projector::RecordBatchProjector
 impl core::cmp::Eq for iceberg::arrow::record_batch_projector::RecordBatchProjector
@@ -71,6 +74,7 @@ pub struct iceberg::arrow::ArrowReaderBuilder
 impl iceberg::arrow::ArrowReaderBuilder
 pub fn iceberg::arrow::ArrowReaderBuilder::build(self) -> iceberg::arrow::ArrowReader
 pub fn iceberg::arrow::ArrowReaderBuilder::new(file_io: iceberg::io::FileIO, runtime: iceberg::Runtime) -> Self
+pub fn iceberg::arrow::ArrowReaderBuilder::with_arrow_schema(self, arrow_schema: arrow_schema::schema::SchemaRef) -> Self
 pub fn iceberg::arrow::ArrowReaderBuilder::with_batch_size(self, batch_size: usize) -> Self
 pub fn iceberg::arrow::ArrowReaderBuilder::with_data_file_concurrency_limit(self, val: usize) -> Self
 pub fn iceberg::arrow::ArrowReaderBuilder::with_metadata_size_hint(self, metadata_size_hint: usize) -> Self
@@ -84,6 +88,7 @@ pub fn iceberg::arrow::PartitionValueCalculator::calculate(&self, batch: &arrow_
 pub fn iceberg::arrow::PartitionValueCalculator::partition_arrow_type(&self) -> &arrow_schema::datatype::DataType
 pub fn iceberg::arrow::PartitionValueCalculator::partition_type(&self) -> &iceberg::spec::StructType
 pub fn iceberg::arrow::PartitionValueCalculator::try_new(partition_spec: &iceberg::spec::PartitionSpec, table_schema: &iceberg::spec::Schema) -> iceberg::Result<Self>
+pub fn iceberg::arrow::PartitionValueCalculator::try_new_with_match_mode(partition_spec: &iceberg::spec::PartitionSpec, table_schema: &iceberg::spec::Schema, match_mode: iceberg::arrow::FieldMatchMode) -> iceberg::Result<Self>
 impl core::fmt::Debug for iceberg::arrow::PartitionValueCalculator
 pub fn iceberg::arrow::PartitionValueCalculator::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct iceberg::arrow::RecordBatchPartitionSplitter
@@ -1274,6 +1279,12 @@ pub const iceberg::puffin::CREATED_BY_PROPERTY: &str
 pub const iceberg::puffin::DELETION_VECTOR_V1: &str
 pub mod iceberg::scan
 pub struct iceberg::scan::FileScanTask
+pub iceberg::scan::FileScanTask::column_sizes: core::option::Option<std::collections::hash::map::HashMap<i32, u64>>
+pub iceberg::scan::FileScanTask::lower_bounds: core::option::Option<std::collections::hash::map::HashMap<i32, iceberg::spec::Datum>>
+pub iceberg::scan::FileScanTask::null_value_counts: core::option::Option<std::collections::hash::map::HashMap<i32, u64>>
+pub iceberg::scan::FileScanTask::sort_order_id: core::option::Option<i32>
+pub iceberg::scan::FileScanTask::split_offsets: core::option::Option<alloc::vec::Vec<i64>>
+pub iceberg::scan::FileScanTask::upper_bounds: core::option::Option<std::collections::hash::map::HashMap<i32, iceberg::spec::Datum>>
 impl iceberg::scan::FileScanTask
 pub fn iceberg::scan::FileScanTask::case_sensitive(&self) -> bool
 pub fn iceberg::scan::FileScanTask::data_file_format(&self) -> iceberg::spec::DataFileFormat
@@ -1304,7 +1315,7 @@ impl core::fmt::Debug for iceberg::scan::FileScanTask
 pub fn iceberg::scan::FileScanTask::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for iceberg::scan::FileScanTask
 impl iceberg::scan::FileScanTask
-pub fn iceberg::scan::FileScanTask::builder() -> FileScanTaskBuilder<((), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), ())>
+pub fn iceberg::scan::FileScanTask::builder() -> FileScanTaskBuilder<((), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), ())>
 impl serde_core::ser::Serialize for iceberg::scan::FileScanTask
 pub fn iceberg::scan::FileScanTask::serialize<__S>(&self, __serializer: __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl<'de> serde_core::de::Deserialize<'de> for iceberg::scan::FileScanTask
@@ -1356,10 +1367,13 @@ pub fn iceberg::scan::TableScan::fmt(&self, f: &mut core::fmt::Formatter<'_>) ->
 pub struct iceberg::scan::TableScanBuilder<'a>
 impl<'a> iceberg::scan::TableScanBuilder<'a>
 pub fn iceberg::scan::TableScanBuilder<'a>::build(self) -> iceberg::Result<iceberg::scan::TableScan>
+pub fn iceberg::scan::TableScanBuilder<'a>::from_snapshot_id(self, snapshot_id: i64) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select(self, column_names: impl core::iter::traits::collect::IntoIterator<Item = impl alloc::string::ToString>) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select_all(self) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select_empty(self) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::snapshot_id(self, snapshot_id: i64) -> Self
+pub fn iceberg::scan::TableScanBuilder<'a>::to_snapshot_id(self, snapshot_id: i64) -> Self
+pub fn iceberg::scan::TableScanBuilder<'a>::with_arrow_schema(self, arrow_schema: arrow_schema::schema::SchemaRef) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::with_batch_size(self, batch_size: core::option::Option<usize>) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::with_case_sensitive(self, case_sensitive: bool) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::with_concurrency_limit(self, limit: usize) -> Self
@@ -2803,6 +2817,12 @@ impl core::fmt::Debug for iceberg::spec::TableMetadataBuilder
 pub fn iceberg::spec::TableMetadataBuilder::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct iceberg::spec::TableProperties<'properties>
 impl iceberg::spec::TableProperties<'_>
+pub const iceberg::spec::TableProperties<'_>::PROPERTY_COMMIT_MANIFEST_MERGE_ENABLED: &'static str
+pub const iceberg::spec::TableProperties<'_>::PROPERTY_COMMIT_MANIFEST_MERGE_ENABLED_DEFAULT: bool
+pub const iceberg::spec::TableProperties<'_>::PROPERTY_COMMIT_MANIFEST_MIN_MERGE_COUNT: &'static str
+pub const iceberg::spec::TableProperties<'_>::PROPERTY_COMMIT_MANIFEST_MIN_MERGE_COUNT_DEFAULT: u32
+pub const iceberg::spec::TableProperties<'_>::PROPERTY_COMMIT_MANIFEST_TARGET_SIZE_BYTES: &'static str
+pub const iceberg::spec::TableProperties<'_>::PROPERTY_COMMIT_MANIFEST_TARGET_SIZE_BYTES_DEFAULT: u64
 pub const iceberg::spec::TableProperties<'_>::PROPERTY_COMMIT_MAX_RETRY_WAIT_MS: &'static str
 pub const iceberg::spec::TableProperties<'_>::PROPERTY_COMMIT_MAX_RETRY_WAIT_MS_DEFAULT: u64
 pub const iceberg::spec::TableProperties<'_>::PROPERTY_COMMIT_MIN_RETRY_WAIT_MS: &'static str
@@ -2877,6 +2897,9 @@ pub fn iceberg::spec::TableProperties<'properties>::cdc_enabled(&self) -> iceber
 pub fn iceberg::spec::TableProperties<'properties>::cdc_max_chunk_size(&self) -> iceberg::Result<usize>
 pub fn iceberg::spec::TableProperties<'properties>::cdc_min_chunk_size(&self) -> iceberg::Result<usize>
 pub fn iceberg::spec::TableProperties<'properties>::cdc_norm_level(&self) -> iceberg::Result<i32>
+pub fn iceberg::spec::TableProperties<'properties>::commit_manifest_merge_enabled(&self) -> iceberg::Result<bool>
+pub fn iceberg::spec::TableProperties<'properties>::commit_manifest_min_merge_count(&self) -> iceberg::Result<u32>
+pub fn iceberg::spec::TableProperties<'properties>::commit_manifest_target_size_bytes(&self) -> iceberg::Result<u64>
 pub fn iceberg::spec::TableProperties<'properties>::commit_max_retry_wait_ms(&self) -> iceberg::Result<u64>
 pub fn iceberg::spec::TableProperties<'properties>::commit_min_retry_wait_ms(&self) -> iceberg::Result<u64>
 pub fn iceberg::spec::TableProperties<'properties>::commit_num_retries(&self) -> iceberg::Result<usize>
@@ -3235,6 +3258,14 @@ pub fn iceberg::transaction::AddColumn::optional(name: impl alloc::string::ToStr
 pub fn iceberg::transaction::AddColumn::required(name: impl alloc::string::ToString, field_type: iceberg::spec::Type, initial_default: iceberg::spec::Literal) -> Self
 impl iceberg::transaction::AddColumn
 pub fn iceberg::transaction::AddColumn::builder() -> AddColumnBuilder<((), (), (), (), (), (), ())>
+pub struct iceberg::transaction::DeleteFilesAction
+impl iceberg::transaction::DeleteFilesAction
+pub fn iceberg::transaction::DeleteFilesAction::delete_file(self, file: iceberg::spec::DataFile) -> Self
+pub fn iceberg::transaction::DeleteFilesAction::delete_files(self, files: impl core::iter::traits::collect::IntoIterator<Item = iceberg::spec::DataFile>) -> Self
+pub fn iceberg::transaction::DeleteFilesAction::set_snapshot_properties(self, props: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> Self
+pub fn iceberg::transaction::DeleteFilesAction::validate_files_exist(self) -> Self
+pub fn iceberg::transaction::DeleteFilesAction::with_manifest_read_concurrency(self, n: usize) -> Self
+pub fn iceberg::transaction::DeleteFilesAction::with_manifest_write_concurrency(self, n: usize) -> Self
 pub struct iceberg::transaction::ExpireSnapshotsAction
 impl iceberg::transaction::ExpireSnapshotsAction
 pub fn iceberg::transaction::ExpireSnapshotsAction::expire_older_than_ms(self, older_than_ms: i64) -> Self
@@ -3246,17 +3277,47 @@ pub fn iceberg::transaction::FastAppendAction::add_data_files(self, data_files: 
 pub fn iceberg::transaction::FastAppendAction::set_commit_uuid(self, commit_uuid: uuid::Uuid) -> Self
 pub fn iceberg::transaction::FastAppendAction::set_snapshot_properties(self, snapshot_properties: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> Self
 pub fn iceberg::transaction::FastAppendAction::with_check_duplicate(self, v: bool) -> Self
+pub struct iceberg::transaction::MergeAppendAction
+impl iceberg::transaction::MergeAppendAction
+pub fn iceberg::transaction::MergeAppendAction::add_data_files(self, files: impl core::iter::traits::collect::IntoIterator<Item = iceberg::spec::DataFile>) -> Self
+pub fn iceberg::transaction::MergeAppendAction::set_snapshot_properties(self, props: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> Self
+pub fn iceberg::transaction::MergeAppendAction::with_manifest_read_concurrency(self, n: usize) -> Self
+pub fn iceberg::transaction::MergeAppendAction::with_manifest_write_concurrency(self, n: usize) -> Self
 pub struct iceberg::transaction::ReplaceSortOrderAction
 impl iceberg::transaction::ReplaceSortOrderAction
 pub fn iceberg::transaction::ReplaceSortOrderAction::asc(self, name: &str, null_order: iceberg::spec::NullOrder) -> Self
 pub fn iceberg::transaction::ReplaceSortOrderAction::desc(self, name: &str, null_order: iceberg::spec::NullOrder) -> Self
+pub struct iceberg::transaction::RewriteFilesAction
+impl iceberg::transaction::RewriteFilesAction
+pub fn iceberg::transaction::RewriteFilesAction::add_files(self, files: impl core::iter::traits::collect::IntoIterator<Item = iceberg::spec::DataFile>) -> Self
+pub fn iceberg::transaction::RewriteFilesAction::data_sequence_number(self, seq_num: i64) -> Self
+pub fn iceberg::transaction::RewriteFilesAction::delete_files(self, files: impl core::iter::traits::collect::IntoIterator<Item = iceberg::spec::DataFile>) -> Self
+pub fn iceberg::transaction::RewriteFilesAction::set_snapshot_properties(self, props: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> Self
+pub fn iceberg::transaction::RewriteFilesAction::validate_from_snapshot(self, snapshot_id: i64) -> Self
+pub fn iceberg::transaction::RewriteFilesAction::with_manifest_read_concurrency(self, n: usize) -> Self
+pub fn iceberg::transaction::RewriteFilesAction::with_manifest_write_concurrency(self, n: usize) -> Self
+pub struct iceberg::transaction::RewriteManifestsAction
+impl iceberg::transaction::RewriteManifestsAction
+pub fn iceberg::transaction::RewriteManifestsAction::set_commit_uuid(self, commit_uuid: uuid::Uuid) -> Self
+pub fn iceberg::transaction::RewriteManifestsAction::set_snapshot_properties(self, snapshot_properties: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> Self
+pub struct iceberg::transaction::RowDeltaAction
+impl iceberg::transaction::RowDeltaAction
+pub fn iceberg::transaction::RowDeltaAction::add_delete_files(self, files: impl core::iter::traits::collect::IntoIterator<Item = iceberg::spec::DataFile>) -> Self
+pub fn iceberg::transaction::RowDeltaAction::set_snapshot_properties(self, props: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> Self
+pub fn iceberg::transaction::RowDeltaAction::with_manifest_read_concurrency(self, n: usize) -> Self
+pub fn iceberg::transaction::RowDeltaAction::with_manifest_write_concurrency(self, n: usize) -> Self
 pub struct iceberg::transaction::Transaction
 impl iceberg::transaction::Transaction
 pub async fn iceberg::transaction::Transaction::commit(self, catalog: &dyn iceberg::Catalog) -> iceberg::Result<iceberg::table::Table>
+pub fn iceberg::transaction::Transaction::delete_files(&self) -> iceberg::transaction::DeleteFilesAction
 pub fn iceberg::transaction::Transaction::expire_snapshots(&self) -> iceberg::transaction::ExpireSnapshotsAction
 pub fn iceberg::transaction::Transaction::fast_append(&self) -> iceberg::transaction::FastAppendAction
+pub fn iceberg::transaction::Transaction::merge_append(&self) -> iceberg::transaction::MergeAppendAction
 pub fn iceberg::transaction::Transaction::new(table: &iceberg::table::Table) -> Self
 pub fn iceberg::transaction::Transaction::replace_sort_order(&self) -> iceberg::transaction::ReplaceSortOrderAction
+pub fn iceberg::transaction::Transaction::rewrite_files(&self) -> iceberg::transaction::RewriteFilesAction
+pub fn iceberg::transaction::Transaction::rewrite_manifests(&self) -> iceberg::transaction::RewriteManifestsAction
+pub fn iceberg::transaction::Transaction::row_delta(&self) -> iceberg::transaction::RowDeltaAction
 pub fn iceberg::transaction::Transaction::update_location(&self) -> iceberg::transaction::UpdateLocationAction
 pub fn iceberg::transaction::Transaction::update_schema(&self) -> iceberg::transaction::UpdateSchemaAction
 pub fn iceberg::transaction::Transaction::update_statistics(&self) -> iceberg::transaction::UpdateStatisticsAction
@@ -3309,11 +3370,15 @@ pub fn iceberg::writer::base_writer::data_file_writer::DataFileWriter<B, L, F>::
 impl<B, L, F> iceberg::writer::IcebergWriter for iceberg::writer::base_writer::data_file_writer::DataFileWriter<B, L, F> where B: iceberg::writer::file_writer::FileWriterBuilder, L: iceberg::writer::file_writer::location_generator::LocationGenerator, F: iceberg::writer::file_writer::location_generator::FileNameGenerator
 pub fn iceberg::writer::base_writer::data_file_writer::DataFileWriter<B, L, F>::close<'life0, 'async_trait>(&'life0 mut self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = iceberg::Result<alloc::vec::Vec<iceberg::spec::DataFile>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn iceberg::writer::base_writer::data_file_writer::DataFileWriter<B, L, F>::write<'life0, 'async_trait>(&'life0 mut self, batch: arrow_array::record_batch::RecordBatch) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = iceberg::Result<()>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+impl<B, L, F> iceberg::writer::file_writer::RowGroupFlushable for iceberg::writer::base_writer::data_file_writer::DataFileWriter<B, L, F> where B: iceberg::writer::file_writer::FileWriterBuilder, <B as iceberg::writer::file_writer::FileWriterBuilder>::R: iceberg::writer::file_writer::RowGroupFlushable, L: iceberg::writer::file_writer::location_generator::LocationGenerator, F: iceberg::writer::file_writer::location_generator::FileNameGenerator
+pub async fn iceberg::writer::base_writer::data_file_writer::DataFileWriter<B, L, F>::flush_row_group(&mut self) -> iceberg::Result<()>
+pub fn iceberg::writer::base_writer::data_file_writer::DataFileWriter<B, L, F>::in_progress_row_group_bytes(&self) -> usize
 impl<B: core::fmt::Debug + iceberg::writer::file_writer::FileWriterBuilder, L: core::fmt::Debug + iceberg::writer::file_writer::location_generator::LocationGenerator, F: core::fmt::Debug + iceberg::writer::file_writer::location_generator::FileNameGenerator> core::fmt::Debug for iceberg::writer::base_writer::data_file_writer::DataFileWriter<B, L, F>
 pub fn iceberg::writer::base_writer::data_file_writer::DataFileWriter<B, L, F>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder<B: iceberg::writer::file_writer::FileWriterBuilder, L: iceberg::writer::file_writer::location_generator::LocationGenerator, F: iceberg::writer::file_writer::location_generator::FileNameGenerator>
 impl<B, L, F> iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder<B, L, F> where B: iceberg::writer::file_writer::FileWriterBuilder, L: iceberg::writer::file_writer::location_generator::LocationGenerator, F: iceberg::writer::file_writer::location_generator::FileNameGenerator
 pub fn iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder<B, L, F>::new(inner: iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder<B, L, F>) -> Self
+pub fn iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder<B, L, F>::with_sort_order_id(self, sort_order_id: i32) -> Self
 impl<B, L, F> iceberg::writer::IcebergWriterBuilder for iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder<B, L, F> where B: iceberg::writer::file_writer::FileWriterBuilder, L: iceberg::writer::file_writer::location_generator::LocationGenerator, F: iceberg::writer::file_writer::location_generator::FileNameGenerator
 pub type iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder<B, L, F>::R = iceberg::writer::base_writer::data_file_writer::DataFileWriter<B, L, F>
 pub fn iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder<B, L, F>::build<'life0, 'async_trait>(&'life0 self, partition_key: core::option::Option<iceberg::spec::PartitionKey>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = iceberg::Result<Self::R>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
@@ -3387,6 +3452,9 @@ pub async fn iceberg::writer::file_writer::rolling_writer::RollingFileWriter<B, 
 pub async fn iceberg::writer::file_writer::rolling_writer::RollingFileWriter<B, L, F>::write(&mut self, partition_key: &core::option::Option<iceberg::spec::PartitionKey>, input: &arrow_array::record_batch::RecordBatch) -> iceberg::Result<()>
 impl<B, L, F> core::fmt::Debug for iceberg::writer::file_writer::rolling_writer::RollingFileWriter<B, L, F> where B: iceberg::writer::file_writer::FileWriterBuilder, L: iceberg::writer::file_writer::location_generator::LocationGenerator, F: iceberg::writer::file_writer::location_generator::FileNameGenerator
 pub fn iceberg::writer::file_writer::rolling_writer::RollingFileWriter<B, L, F>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<B, L, F> iceberg::writer::file_writer::RowGroupFlushable for iceberg::writer::file_writer::rolling_writer::RollingFileWriter<B, L, F> where B: iceberg::writer::file_writer::FileWriterBuilder, <B as iceberg::writer::file_writer::FileWriterBuilder>::R: iceberg::writer::file_writer::RowGroupFlushable, L: iceberg::writer::file_writer::location_generator::LocationGenerator, F: iceberg::writer::file_writer::location_generator::FileNameGenerator
+pub async fn iceberg::writer::file_writer::rolling_writer::RollingFileWriter<B, L, F>::flush_row_group(&mut self) -> iceberg::Result<()>
+pub fn iceberg::writer::file_writer::rolling_writer::RollingFileWriter<B, L, F>::in_progress_row_group_bytes(&self) -> usize
 impl<B: iceberg::writer::file_writer::FileWriterBuilder, L: iceberg::writer::file_writer::location_generator::LocationGenerator, F: iceberg::writer::file_writer::location_generator::FileNameGenerator> iceberg::writer::CurrentFileStatus for iceberg::writer::file_writer::rolling_writer::RollingFileWriter<B, L, F>
 pub fn iceberg::writer::file_writer::rolling_writer::RollingFileWriter<B, L, F>::current_file_path(&self) -> alloc::string::String
 pub fn iceberg::writer::file_writer::rolling_writer::RollingFileWriter<B, L, F>::current_row_num(&self) -> usize
@@ -3408,11 +3476,15 @@ pub fn iceberg::writer::file_writer::ParquetWriter::current_written_size(&self) 
 impl iceberg::writer::file_writer::FileWriter for iceberg::writer::file_writer::ParquetWriter
 pub async fn iceberg::writer::file_writer::ParquetWriter::close(self) -> iceberg::Result<alloc::vec::Vec<iceberg::spec::DataFileBuilder>>
 pub async fn iceberg::writer::file_writer::ParquetWriter::write(&mut self, batch: &arrow_array::record_batch::RecordBatch) -> iceberg::Result<()>
+impl iceberg::writer::file_writer::RowGroupFlushable for iceberg::writer::file_writer::ParquetWriter
+pub async fn iceberg::writer::file_writer::ParquetWriter::flush_row_group(&mut self) -> iceberg::Result<()>
+pub fn iceberg::writer::file_writer::ParquetWriter::in_progress_row_group_bytes(&self) -> usize
 pub struct iceberg::writer::file_writer::ParquetWriterBuilder
 impl iceberg::writer::file_writer::ParquetWriterBuilder
 pub fn iceberg::writer::file_writer::ParquetWriterBuilder::from_table_properties(table_props: &iceberg::spec::TableProperties<'_>, schema: iceberg::spec::SchemaRef) -> iceberg::Result<Self>
 pub fn iceberg::writer::file_writer::ParquetWriterBuilder::new(props: parquet::file::properties::WriterProperties, schema: iceberg::spec::SchemaRef) -> Self
 pub fn iceberg::writer::file_writer::ParquetWriterBuilder::new_with_match_mode(props: parquet::file::properties::WriterProperties, schema: iceberg::spec::SchemaRef, match_mode: iceberg::arrow::FieldMatchMode) -> Self
+pub fn iceberg::writer::file_writer::ParquetWriterBuilder::with_arrow_schema(self, arrow_schema: arrow_schema::schema::SchemaRef) -> Self
 pub fn iceberg::writer::file_writer::ParquetWriterBuilder::with_encryption_manager(self, encryption_manager: alloc::sync::Arc<iceberg::encryption::EncryptionManager>) -> Self
 pub fn iceberg::writer::file_writer::ParquetWriterBuilder::with_match_mode(self, match_mode: iceberg::arrow::FieldMatchMode) -> Self
 impl core::clone::Clone for iceberg::writer::file_writer::ParquetWriterBuilder
@@ -3434,6 +3506,18 @@ pub fn iceberg::writer::file_writer::FileWriterBuilder::build(&self, output_file
 impl iceberg::writer::file_writer::FileWriterBuilder for iceberg::writer::file_writer::ParquetWriterBuilder
 pub type iceberg::writer::file_writer::ParquetWriterBuilder::R = iceberg::writer::file_writer::ParquetWriter
 pub async fn iceberg::writer::file_writer::ParquetWriterBuilder::build(&self, output_file: iceberg::io::OutputFile) -> iceberg::Result<Self::R>
+pub trait iceberg::writer::file_writer::RowGroupFlushable: core::marker::Send
+pub fn iceberg::writer::file_writer::RowGroupFlushable::flush_row_group(&mut self) -> impl core::future::future::Future<Output = iceberg::Result<()>> + core::marker::Send
+pub fn iceberg::writer::file_writer::RowGroupFlushable::in_progress_row_group_bytes(&self) -> usize
+impl iceberg::writer::file_writer::RowGroupFlushable for iceberg::writer::file_writer::ParquetWriter
+pub async fn iceberg::writer::file_writer::ParquetWriter::flush_row_group(&mut self) -> iceberg::Result<()>
+pub fn iceberg::writer::file_writer::ParquetWriter::in_progress_row_group_bytes(&self) -> usize
+impl<B, L, F> iceberg::writer::file_writer::RowGroupFlushable for iceberg::writer::base_writer::data_file_writer::DataFileWriter<B, L, F> where B: iceberg::writer::file_writer::FileWriterBuilder, <B as iceberg::writer::file_writer::FileWriterBuilder>::R: iceberg::writer::file_writer::RowGroupFlushable, L: iceberg::writer::file_writer::location_generator::LocationGenerator, F: iceberg::writer::file_writer::location_generator::FileNameGenerator
+pub async fn iceberg::writer::base_writer::data_file_writer::DataFileWriter<B, L, F>::flush_row_group(&mut self) -> iceberg::Result<()>
+pub fn iceberg::writer::base_writer::data_file_writer::DataFileWriter<B, L, F>::in_progress_row_group_bytes(&self) -> usize
+impl<B, L, F> iceberg::writer::file_writer::RowGroupFlushable for iceberg::writer::file_writer::rolling_writer::RollingFileWriter<B, L, F> where B: iceberg::writer::file_writer::FileWriterBuilder, <B as iceberg::writer::file_writer::FileWriterBuilder>::R: iceberg::writer::file_writer::RowGroupFlushable, L: iceberg::writer::file_writer::location_generator::LocationGenerator, F: iceberg::writer::file_writer::location_generator::FileNameGenerator
+pub async fn iceberg::writer::file_writer::rolling_writer::RollingFileWriter<B, L, F>::flush_row_group(&mut self) -> iceberg::Result<()>
+pub fn iceberg::writer::file_writer::rolling_writer::RollingFileWriter<B, L, F>::in_progress_row_group_bytes(&self) -> usize
 pub mod iceberg::writer::partitioning
 pub mod iceberg::writer::partitioning::clustered_writer
 pub struct iceberg::writer::partitioning::clustered_writer::ClusteredWriter<B, I, O> where B: iceberg::writer::IcebergWriterBuilder<I, O>, O: core::iter::traits::collect::IntoIterator + core::iter::traits::collect::FromIterator<<O as core::iter::traits::collect::IntoIterator>::Item>, <O as core::iter::traits::collect::IntoIterator>::Item: core::clone::Clone

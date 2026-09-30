@@ -23,24 +23,36 @@
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, StructArray};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Schema as ArrowSchema};
 
-use super::record_batch_projector::RecordBatchProjector;
-use super::type_to_arrow_type;
+use super::record_batch_projector::{RecordBatchProjector, parquet_field_id};
+use super::schema::schema_to_arrow_schema;
+use super::{FieldMatchMode, type_to_arrow_type};
 use crate::spec::{PartitionSpec, Schema, StructType, Type};
 use crate::transform::{BoxedTransformFunction, create_transform_function};
 use crate::{Error, ErrorKind, Result};
 
 /// Calculator for partition values in Iceberg tables.
 ///
-/// This struct handles the projection of source columns and application of
-/// partition transforms to compute partition values for a given record batch.
+/// In the default id matching mode, source columns are pulled by cached
+/// position when the runtime batch's shape matches the iceberg-derived arrow
+/// schema (modulo metadata), and by runtime `PARQUET:field_id` lookup
+/// otherwise. The fallback exists because optimizer passes like DataFusion's
+/// projection unification can reshape the input batch out from under cached
+/// positions.
+///
+/// Name matching mode resolves source columns from the runtime batch by the
+/// table schema source names instead.
 #[derive(Debug)]
 pub struct PartitionValueCalculator {
-    projector: RecordBatchProjector,
+    source_field_ids: Vec<i32>,
+    source_field_names: Vec<String>,
+    cached_projector: RecordBatchProjector,
+    expected_field_ids: Vec<i64>,
     transform_functions: Vec<BoxedTransformFunction>,
     partition_type: StructType,
     partition_arrow_type: DataType,
+    match_mode: FieldMatchMode,
 }
 
 impl PartitionValueCalculator {
@@ -60,8 +72,20 @@ impl PartitionValueCalculator {
     /// Returns an error if:
     /// - The partition spec is unpartitioned
     /// - Transform function creation fails
-    /// - Projector initialization fails
     pub fn try_new(partition_spec: &PartitionSpec, table_schema: &Schema) -> Result<Self> {
+        Self::try_new_with_match_mode(partition_spec, table_schema, FieldMatchMode::Id)
+    }
+
+    /// Create a new PartitionValueCalculator with a source-field matching mode.
+    ///
+    /// `FieldMatchMode::Id` preserves the existing behavior. `FieldMatchMode::Name`
+    /// resolves runtime source columns by the table schema field names for the
+    /// partition source ids.
+    pub fn try_new_with_match_mode(
+        partition_spec: &PartitionSpec,
+        table_schema: &Schema,
+        match_mode: FieldMatchMode,
+    ) -> Result<Self> {
         if partition_spec.is_unpartitioned() {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -83,21 +107,63 @@ impl PartitionValueCalculator {
             .map(|pf| pf.source_id)
             .collect();
 
-        // Create projector for extracting source columns
-        let projector = RecordBatchProjector::from_iceberg_schema(
-            Arc::new(table_schema.clone()),
+        let source_field_names: Vec<String> = partition_spec
+            .fields()
+            .iter()
+            .map(|pf| {
+                table_schema
+                    .name_by_field_id(pf.source_id)
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "Cannot find partition source field with id `{}` in schema",
+                                pf.source_id
+                            ),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let expected_arrow_schema = Arc::new(schema_to_arrow_schema(table_schema)?);
+        let cached_projector = RecordBatchProjector::new(
+            expected_arrow_schema.clone(),
             &source_field_ids,
+            parquet_field_id,
+            |_| true,
         )?;
 
-        // Get partition type information
+        // `schema_to_arrow_schema` always emits PARQUET:field_id on top-level
+        // fields; treat absence as a corruption rather than a soft mismatch.
+        let expected_field_ids: Vec<i64> = expected_arrow_schema
+            .fields()
+            .iter()
+            .map(|f| {
+                parquet_field_id(f)?.ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "iceberg-derived arrow field {} is missing PARQUET:field_id",
+                            f.name()
+                        ),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         let partition_type = partition_spec.partition_type(table_schema)?;
         let partition_arrow_type = type_to_arrow_type(&Type::Struct(partition_type.clone()))?;
 
         Ok(Self {
-            projector,
+            source_field_ids,
+            source_field_names,
+            cached_projector,
+            expected_field_ids,
             transform_functions,
             partition_type,
             partition_arrow_type,
+            match_mode,
         })
     }
 
@@ -133,8 +199,21 @@ impl PartitionValueCalculator {
     /// - Transform application fails
     /// - StructArray construction fails
     pub fn calculate(&self, batch: &RecordBatch) -> Result<ArrayRef> {
-        // Project source columns from the batch
-        let source_columns = self.projector.project_column(batch.columns())?;
+        let source_columns = match self.match_mode {
+            FieldMatchMode::Id => {
+                if positions_aligned(&self.expected_field_ids, batch.schema_ref()) {
+                    self.cached_projector.project_column(batch.columns())?
+                } else {
+                    RecordBatchProjector::project_columns_by_field_id(
+                        batch,
+                        &self.source_field_ids,
+                    )?
+                }
+            }
+            FieldMatchMode::Name => {
+                RecordBatchProjector::project_columns_by_name(batch, &self.source_field_names)?
+            }
+        };
 
         // Get expected struct fields for the result
         let expected_struct_fields = match &self.partition_arrow_type {
@@ -167,15 +246,43 @@ impl PartitionValueCalculator {
     }
 }
 
+/// Whether the cached positional projector is safe to use for `actual`.
+///
+/// For each actual column that carries a `PARQUET:field_id`, the id must
+/// equal the expected id at the same position; columns without an id defer
+/// to the producer's positional contract. Data types are deliberately not
+/// compared — the projector is purely positional.
+fn positions_aligned(expected_ids: &[i64], actual: &ArrowSchema) -> bool {
+    let af = actual.fields();
+    if expected_ids.len() != af.len() {
+        return false;
+    }
+    for (&expected_id, a_field) in expected_ids.iter().zip(af.iter()) {
+        let Ok(Some(actual_id)) = parquet_field_id(a_field) else {
+            continue;
+        };
+        if expected_id != actual_id {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use arrow_array::{Int32Array, RecordBatch, StringArray};
-    use arrow_schema::{Field, Schema as ArrowSchema};
+    use arrow_schema::Field;
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
     use super::*;
     use crate::spec::{NestedField, PartitionSpecBuilder, PrimitiveType, Transform};
+
+    fn field_id_meta(id: i32) -> HashMap<String, String> {
+        HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())])
+    }
 
     #[test]
     fn test_partition_calculator_identity_transform() {
@@ -200,7 +307,8 @@ mod tests {
         assert_eq!(calculator.partition_type().fields().len(), 1);
         assert_eq!(calculator.partition_type().fields()[0].name, "id_partition");
 
-        // Create test batch
+        // Hand-built batch without field-id metadata: shape matches the
+        // iceberg schema, so the cached-position fast path applies.
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, false),
@@ -226,6 +334,304 @@ mod tests {
         assert_eq!(id_partition.value(0), 10);
         assert_eq!(id_partition.value(1), 20);
         assert_eq!(id_partition.value(2), 30);
+    }
+
+    /// When shapes diverge, source columns must be resolved by field id, not
+    /// by cached position.
+    #[test]
+    fn test_partition_calculator_runtime_field_id_fallback() {
+        // Iceberg has 3 fields. Partition source is `value` (id=2).
+        let table_schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "value", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(3, "tag", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let partition_spec = PartitionSpecBuilder::new(Arc::new(table_schema.clone()))
+            .add_partition_field("value", "value_partition", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let calculator = PartitionValueCalculator::try_new(&partition_spec, &table_schema).unwrap();
+
+        // Shape-different runtime batch: 2 columns reordered so that
+        // positional lookup for source id 2 (iceberg position 1) would pick
+        // the wrong column.
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("tag", DataType::Utf8, false).with_metadata(field_id_meta(3)),
+            Field::new("value", DataType::Int32, false).with_metadata(field_id_meta(2)),
+        ]));
+
+        let batch = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            Arc::new(Int32Array::from(vec![100, 200, 300])),
+        ])
+        .unwrap();
+
+        let result = calculator.calculate(&batch).unwrap();
+        let struct_array = result.as_any().downcast_ref::<StructArray>().unwrap();
+        let value_partition = struct_array
+            .column_by_name("value_partition")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        assert_eq!(value_partition.value(0), 100);
+        assert_eq!(value_partition.value(1), 200);
+        assert_eq!(value_partition.value(2), 300);
+    }
+
+    /// Name mode supports write paths whose runtime columns have the right
+    /// names but no target `PARQUET:field_id` metadata.
+    #[test]
+    fn test_partition_calculator_name_mode_runtime_name_lookup() {
+        let table_schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "value", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(3, "tag", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let partition_spec = PartitionSpecBuilder::new(Arc::new(table_schema.clone()))
+            .add_partition_field("value", "value_partition", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // Shape-different runtime batch with correct source names but no
+        // field-id metadata. This is the shape Phantom DML can produce after
+        // computed/retargeted projections.
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("tag", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+
+        let batch = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            Arc::new(Int32Array::from(vec![100, 200, 300])),
+        ])
+        .unwrap();
+
+        let id_calculator =
+            PartitionValueCalculator::try_new(&partition_spec, &table_schema).unwrap();
+        assert!(
+            id_calculator.calculate(&batch).is_err(),
+            "default id mode should still require field-id metadata for reshaped batches"
+        );
+
+        let name_calculator = PartitionValueCalculator::try_new_with_match_mode(
+            &partition_spec,
+            &table_schema,
+            FieldMatchMode::Name,
+        )
+        .unwrap();
+        let result = name_calculator.calculate(&batch).unwrap();
+        let struct_array = result.as_any().downcast_ref::<StructArray>().unwrap();
+        let value_partition = struct_array
+            .column_by_name("value_partition")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        assert_eq!(value_partition.value(0), 100);
+        assert_eq!(value_partition.value(1), 200);
+        assert_eq!(value_partition.value(2), 300);
+    }
+
+    /// Hand-built batches without `PARQUET:field_id` metadata should still
+    /// take the cached-position fast path even when the iceberg schema
+    /// contains compound types whose inner fields carry metadata (List, Map,
+    /// FixedSizeList, etc.). The fast-path check must compare schemas with
+    /// metadata stripped recursively.
+    #[test]
+    fn test_partition_calculator_fast_path_with_list_field() {
+        use arrow_array::builder::{Int32Builder, ListBuilder};
+
+        let table_schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(
+                    2,
+                    "items",
+                    Type::List(crate::spec::ListType {
+                        element_field: Arc::new(NestedField::required(
+                            3,
+                            "element",
+                            Type::Primitive(PrimitiveType::Int),
+                        )),
+                    }),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap();
+
+        let partition_spec = PartitionSpecBuilder::new(Arc::new(table_schema.clone()))
+            .add_partition_field("id", "id_partition", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let calculator = PartitionValueCalculator::try_new(&partition_spec, &table_schema).unwrap();
+
+        // Hand-built batch: same shape as the iceberg schema, but no
+        // PARQUET:field_id metadata anywhere — including on the List's inner
+        // element field.
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "items",
+                DataType::List(Arc::new(Field::new("element", DataType::Int32, false))),
+                false,
+            ),
+        ]));
+
+        let mut list_builder = ListBuilder::new(Int32Builder::new())
+            .with_field(Arc::new(Field::new("element", DataType::Int32, false)));
+        list_builder.values().append_value(7);
+        list_builder.append(true);
+        list_builder.values().append_value(8);
+        list_builder.append(true);
+
+        let batch = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(list_builder.finish()),
+        ])
+        .unwrap();
+
+        // Without metadata-stripping applied to the List's inner Field, the
+        // fast-path check would fail and the runtime fallback would error
+        // because the batch has no PARQUET:field_id metadata.
+        let result = calculator.calculate(&batch).unwrap();
+        let struct_array = result.as_any().downcast_ref::<StructArray>().unwrap();
+        let id_partition = struct_array
+            .column_by_name("id_partition")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(id_partition.value(0), 1);
+        assert_eq!(id_partition.value(1), 2);
+    }
+
+    /// A same-typed reshuffle (here a swap of two `Int` columns with their
+    /// field-ids preserved) must be detected — otherwise a type-fingerprint
+    /// gate would silently accept it and the cached projector would grab
+    /// the wrong source column. The per-column field-id gate sees the ID
+    /// swap and routes to the field-id fallback, which resolves the correct
+    /// array.
+    #[test]
+    fn test_partition_calculator_detects_same_typed_field_id_swap() {
+        let table_schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "a", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "b", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let partition_spec = PartitionSpecBuilder::new(Arc::new(table_schema.clone()))
+            .add_partition_field("b", "b_partition", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let calculator = PartitionValueCalculator::try_new(&partition_spec, &table_schema).unwrap();
+
+        // Per-position types match iceberg (both Int) but the IDs are
+        // swapped: position 0 carries the column for `b` (id=2), position 1
+        // carries the column for `a` (id=1).
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("a", DataType::Int32, false).with_metadata(field_id_meta(2)),
+            Field::new("b", DataType::Int32, false).with_metadata(field_id_meta(1)),
+        ]));
+
+        let batch = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(Int32Array::from(vec![100, 200, 300])),
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+        ])
+        .unwrap();
+
+        let result = calculator.calculate(&batch).unwrap();
+        let struct_array = result.as_any().downcast_ref::<StructArray>().unwrap();
+        let b_partition = struct_array
+            .column_by_name("b_partition")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        // Field-id resolution picks the column carrying id=2, at position 0.
+        assert_eq!(b_partition.value(0), 100);
+        assert_eq!(b_partition.value(1), 200);
+        assert_eq!(b_partition.value(2), 300);
+    }
+
+    /// Mixed metadata: some columns carry field-ids, some don't, with one
+    /// of the no-ID columns also showing a type variant (`Utf8View` where
+    /// the iceberg schema declares `Utf8`). The per-column rule verifies
+    /// the ID-bearing columns positionally and trusts the contract for the
+    /// rest, so the cached path is reachable. Covers two regressions a
+    /// type-fingerprint gate would have produced: rejecting the type
+    /// variant, and ignoring the ID-bearing positional checks.
+    #[test]
+    fn test_partition_calculator_accepts_mixed_field_id_metadata() {
+        use arrow_array::StringViewArray;
+
+        let table_schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(3, "value", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let partition_spec = PartitionSpecBuilder::new(Arc::new(table_schema.clone()))
+            .add_partition_field("id", "id_partition", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let calculator = PartitionValueCalculator::try_new(&partition_spec, &table_schema).unwrap();
+
+        // id and value carry field-ids in correct positions; name is Utf8View
+        // with no field-id metadata (a synthesized/coerced column).
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(field_id_meta(1)),
+            Field::new("name", DataType::Utf8View, false),
+            Field::new("value", DataType::Int32, false).with_metadata(field_id_meta(3)),
+        ]));
+
+        let batch = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(Int32Array::from(vec![10, 20])),
+            Arc::new(StringViewArray::from(vec!["a", "b"])),
+            Arc::new(Int32Array::from(vec![1, 2])),
+        ])
+        .unwrap();
+
+        let result = calculator.calculate(&batch).unwrap();
+        let struct_array = result.as_any().downcast_ref::<StructArray>().unwrap();
+        let id_partition = struct_array
+            .column_by_name("id_partition")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(id_partition.value(0), 10);
+        assert_eq!(id_partition.value(1), 20);
     }
 
     #[test]

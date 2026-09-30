@@ -99,6 +99,7 @@ pub use runtime::{JoinHandle, Runtime, RuntimeHandle};
 pub mod arrow;
 pub(crate) mod delete_file_index;
 pub mod encryption;
+mod prptl_utils;
 pub mod test_utils;
 pub mod writer;
 

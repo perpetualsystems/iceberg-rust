@@ -33,7 +33,7 @@ use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::{CdcOptions, WriterProperties};
 use parquet::file::statistics::Statistics;
 
-use super::{FileWriter, FileWriterBuilder};
+use super::{FileWriter, FileWriterBuilder, RowGroupFlushable};
 use crate::arrow::{
     ArrowFileReader, DEFAULT_MAP_FIELD_NAME, FieldMatchMode, NanValueCountVisitor,
     get_parquet_stat_max_as_datum, get_parquet_stat_min_as_datum,
@@ -57,6 +57,14 @@ pub struct ParquetWriterBuilder {
     schema: SchemaRef,
     match_mode: FieldMatchMode,
     encryption_manager: Option<Arc<EncryptionManager>>,
+    /// Optional override for the Arrow schema the writer uses when initializing the
+    /// underlying `AsyncArrowWriter`. When `None`, derived from `schema`.
+    ///
+    /// Useful when the caller wants the writer to accept batches whose Arrow types
+    /// differ from the default `schema_to_arrow_schema` mapping — e.g. `Utf8View`
+    /// instead of `Utf8` — without a physical cast. The types must still share the
+    /// same Parquet physical encoding (e.g. both map to `BYTE_ARRAY`).
+    arrow_schema_override: Option<ArrowSchemaRef>,
 }
 
 impl ParquetWriterBuilder {
@@ -81,6 +89,7 @@ impl ParquetWriterBuilder {
             schema,
             match_mode,
             encryption_manager: None,
+            arrow_schema_override: None,
         }
     }
 
@@ -118,6 +127,17 @@ impl ParquetWriterBuilder {
     /// incoming Arrow schema does not carry Iceberg field-id metadata.
     pub fn with_match_mode(mut self, match_mode: FieldMatchMode) -> Self {
         self.match_mode = match_mode;
+        self
+    }
+
+    /// Override the Arrow schema used by the underlying `AsyncArrowWriter`.
+    ///
+    /// The override must be encoding-compatible with the Iceberg schema — same
+    /// field IDs, same Parquet physical types. The only permitted divergence is
+    /// Arrow-level layout variants like `Utf8View` vs `Utf8` or `BinaryView` vs
+    /// `Binary`, which share their Parquet physical encoding (`BYTE_ARRAY`).
+    pub fn with_arrow_schema(mut self, arrow_schema: ArrowSchemaRef) -> Self {
+        self.arrow_schema_override = Some(arrow_schema);
         self
     }
 
@@ -172,8 +192,13 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             .map(|em| em.generate_key_metadata());
         let writer_properties =
             resolve_writer_properties(self.props.clone(), key_metadata.as_ref())?;
+        let arrow_schema: ArrowSchemaRef = match &self.arrow_schema_override {
+            Some(override_schema) => override_schema.clone(),
+            None => Arc::new(self.schema.as_ref().try_into()?),
+        };
         Ok(ParquetWriter {
             schema: self.schema.clone(),
+            arrow_schema,
             inner_writer: None,
             writer_properties,
             current_row_num: 0,
@@ -312,6 +337,7 @@ impl SchemaVisitor for IndexByParquetPathName {
 /// `ParquetWriter`` is used to write arrow data into parquet file on storage.
 pub struct ParquetWriter {
     schema: SchemaRef,
+    arrow_schema: ArrowSchemaRef,
     output_file: OutputFile,
     inner_writer: Option<AsyncArrowWriter<AsyncFileWriter>>,
     writer_properties: WriterProperties,
@@ -633,12 +659,11 @@ impl FileWriter for ParquetWriter {
         let writer = if let Some(writer) = &mut self.inner_writer {
             writer
         } else {
-            let arrow_schema: ArrowSchemaRef = Arc::new(self.schema.as_ref().try_into()?);
             let inner_writer = self.output_file.writer().await?;
             let async_writer = AsyncFileWriter::new(inner_writer);
             let writer = AsyncArrowWriter::try_new(
                 async_writer,
-                arrow_schema.clone(),
+                self.arrow_schema.clone(),
                 Some(self.writer_properties.clone()),
             )
             .map_err(|err| {
@@ -714,6 +739,24 @@ impl CurrentFileStatus for ParquetWriter {
             // inner writer is not initialized yet
             0
         }
+    }
+}
+
+impl RowGroupFlushable for ParquetWriter {
+    fn in_progress_row_group_bytes(&self) -> usize {
+        self.inner_writer
+            .as_ref()
+            .map(|w| w.in_progress_size())
+            .unwrap_or(0)
+    }
+
+    async fn flush_row_group(&mut self) -> Result<()> {
+        if let Some(writer) = self.inner_writer.as_mut() {
+            writer.flush().await.map_err(|e| {
+                Error::new(ErrorKind::Unexpected, "Failed to flush row group.").with_source(e)
+            })?;
+        }
+        Ok(())
     }
 }
 

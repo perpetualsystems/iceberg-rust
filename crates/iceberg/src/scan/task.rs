@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::stream::BoxStream;
@@ -23,7 +24,7 @@ use typed_builder::TypedBuilder;
 
 use crate::expr::BoundPredicate;
 use crate::spec::{
-    DataContentType, DataFileFormat, ManifestEntryRef, NameMapping, PartitionSpec, Schema,
+    DataContentType, DataFileFormat, Datum, ManifestEntryRef, NameMapping, PartitionSpec, Schema,
     SchemaRef, Struct, StructType,
 };
 use crate::{Error, ErrorKind, Result};
@@ -152,6 +153,65 @@ pub struct FileScanTask {
     #[serde(deserialize_with = "deserialize_not_implemented")]
     #[builder(default)]
     unified_partition_type: Option<Arc<StructType>>,
+
+    /// Column sizes from the manifest entry (column_id -> size_bytes).
+    /// Used for scan size estimation without re-reading manifests.
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
+    #[builder(default)]
+    pub column_sizes: Option<HashMap<i32, u64>>,
+
+    /// Per-column null counts (field_id -> null_count) from the manifest
+    /// entry. `None` when the manifest records no null counts (never
+    /// `Some` of an empty map). Planning-only, like `column_sizes`.
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
+    #[builder(default)]
+    pub null_value_counts: Option<HashMap<i32, u64>>,
+
+    /// Row group split offsets from the manifest entry.
+    /// Used for sub-file parallelism without re-reading manifests.
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
+    #[builder(default)]
+    pub split_offsets: Option<Vec<i64>>,
+
+    /// Per-column lower bounds (field_id -> value) from the manifest
+    /// entry. `None` when the manifest records no bounds (never
+    /// `Some` of an empty map). Lets a planner reason about a file's
+    /// value ranges (e.g. newest-first ordering on a sort column)
+    /// without re-reading manifests. Planning-only, like `column_sizes`.
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
+    #[builder(default)]
+    pub lower_bounds: Option<HashMap<i32, Datum>>,
+
+    /// Per-column upper bounds (field_id -> value) from the manifest
+    /// entry. See [`Self::lower_bounds`].
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
+    #[builder(default)]
+    pub upper_bounds: Option<HashMap<i32, Datum>>,
+
+    /// The id of the sort order this file was written with, from the
+    /// manifest entry. Sort order id `0` is reserved for the unsorted
+    /// order, so a file's rows are physically sorted in the table's
+    /// current order only when this is `Some(id)` with
+    /// `id == default_sort_order_id` *and* `id != 0`; `Some(0)` or
+    /// `None` means unsorted (do not treat `default_sort_order_id == 0`
+    /// as a sorted match). Lets a planner advertise a scan's output
+    /// ordering (skipping a redundant sort) only for files actually
+    /// written sorted. Planning-only, like `column_sizes`.
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
+    #[builder(default)]
+    pub sort_order_id: Option<i32>,
 
     /// Whether this scan task should treat column names as case-sensitive when binding predicates.
     case_sensitive: bool,

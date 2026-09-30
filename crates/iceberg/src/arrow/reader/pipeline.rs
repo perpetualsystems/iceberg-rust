@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, SchemaRef as ArrowSchemaRef};
 use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::{
@@ -35,7 +35,7 @@ use parquet::encryption::decrypt::FileDecryptionProperties;
 use super::row_lineage::synthesize_row_id_column;
 use super::{
     ArrowFileReader, ArrowReader, ParquetReadOptions, add_fallback_field_ids_to_arrow_schema,
-    apply_name_mapping_to_arrow_schema, find_leaf_by_field_id,
+    apply_arrow_schema_override, apply_name_mapping_to_arrow_schema, find_leaf_by_field_id,
 };
 use crate::arrow::build_partition_constant;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
@@ -72,6 +72,7 @@ impl ArrowReader {
             row_selection_enabled: self.row_selection_enabled,
             parquet_read_options: self.parquet_read_options,
             scan_metrics: scan_metrics.clone(),
+            arrow_schema_override: self.arrow_schema_override,
         };
 
         // Fast-path for single concurrency to avoid overhead of try_flatten_unordered
@@ -125,6 +126,7 @@ struct FileScanTaskReader {
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     scan_metrics: ScanMetrics,
+    arrow_schema_override: Option<ArrowSchemaRef>,
 }
 
 impl FileScanTaskReader {
@@ -197,12 +199,27 @@ impl FileScanTaskReader {
                 add_fallback_field_ids_to_arrow_schema(arrow_metadata.schema())
             };
 
+            let arrow_schema =
+                apply_arrow_schema_override(&arrow_schema, self.arrow_schema_override.as_deref());
             let options = ArrowReaderOptions::new().with_schema(arrow_schema);
             ArrowReaderMetadata::try_new(Arc::clone(arrow_metadata.metadata()), options).map_err(
                 |e| {
                     Error::new(
                         ErrorKind::Unexpected,
                         "Failed to create ArrowReaderMetadata with field ID schema",
+                    )
+                    .with_source(e)
+                },
+            )?
+        } else if let Some(override_schema) = self.arrow_schema_override.as_deref() {
+            let remapped =
+                apply_arrow_schema_override(arrow_metadata.schema(), Some(override_schema));
+            let options = ArrowReaderOptions::new().with_schema(remapped);
+            ArrowReaderMetadata::try_new(Arc::clone(arrow_metadata.metadata()), options).map_err(
+                |e| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "Failed to apply Arrow schema override",
                     )
                     .with_source(e)
                 },
@@ -403,6 +420,11 @@ impl FileScanTaskReader {
         // column re-ordering, partition constants, and virtual field addition (like _file)
         let mut record_batch_transformer_builder =
             RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids());
+
+        if let Some(override_schema) = self.arrow_schema_override.as_ref() {
+            record_batch_transformer_builder =
+                record_batch_transformer_builder.with_arrow_schema(override_schema.clone());
+        }
 
         // Add the _file metadata column if it's in the projected fields
         if task.project_field_ids().contains(&RESERVED_FIELD_ID_FILE) {

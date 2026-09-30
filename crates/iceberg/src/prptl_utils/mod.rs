@@ -15,20 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod commit;
-pub(crate) mod expr_to_predicate;
-pub(crate) mod metadata_scan;
-pub(crate) mod project;
-pub(crate) mod repartition;
-pub(crate) mod scan;
-pub(crate) mod sort;
-pub(crate) mod write;
+// Fork-only utilities. Kept separate from upstream's `utils.rs` so merges
+// from apache/iceberg-rust don't pull in our additions there.
 
-pub(crate) const DATA_FILES_COL_NAME: &str = "data_files";
-
-pub use expr_to_predicate::convert_filters_to_predicate;
-pub use project::{PartitionExpr, project_with_partition, project_with_partition_with_match_mode};
-pub use repartition::repartition;
-pub use scan::IcebergTableScan;
-pub use sort::sort_by_partition;
-pub use write::IcebergWriteExec;
+pub(crate) mod bin_packing;

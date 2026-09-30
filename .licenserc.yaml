@@ -33,6 +33,8 @@ header:
     - "**/public-api.txt"
     # Generated content by trybuild
     - "**/*.stderr"
+    # Internal fork changelists
+    - "prptl-changelist/**"
     # Release distributions
     - "dist/*"
     - "target"

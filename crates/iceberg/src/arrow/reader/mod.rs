@@ -17,6 +17,8 @@
 
 //! Parquet file data reader
 
+use arrow_schema::SchemaRef as ArrowSchemaRef;
+
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::io::FileIO;
 use crate::runtime::Runtime;
@@ -46,8 +48,8 @@ pub use file_reader::ArrowFileReader;
 pub(crate) use options::ParquetReadOptions;
 use predicate_visitor::{CollectFieldIdVisitor, PredicateConverter};
 use projection::{
-    add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
-    find_leaf_by_field_id,
+    add_fallback_field_ids_to_arrow_schema, apply_arrow_schema_override,
+    apply_name_mapping_to_arrow_schema, find_leaf_by_field_id,
 };
 
 /// Builder to create ArrowReader
@@ -59,6 +61,7 @@ pub struct ArrowReaderBuilder {
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     runtime: Runtime,
+    arrow_schema_override: Option<ArrowSchemaRef>,
 }
 
 impl ArrowReaderBuilder {
@@ -74,7 +77,15 @@ impl ArrowReaderBuilder {
             row_selection_enabled: false,
             parquet_read_options: ParquetReadOptions::builder().build(),
             runtime,
+            arrow_schema_override: None,
         }
+    }
+
+    /// Override the Arrow schema used by the Parquet decoder where its physical
+    /// layout is compatible with the file schema.
+    pub fn with_arrow_schema(mut self, arrow_schema: ArrowSchemaRef) -> Self {
+        self.arrow_schema_override = Some(arrow_schema);
+        self
     }
 
     /// Sets the max number of in flight data files that are being fetched
@@ -142,6 +153,7 @@ impl ArrowReaderBuilder {
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
             parquet_read_options: self.parquet_read_options,
+            arrow_schema_override: self.arrow_schema_override,
         }
     }
 }
@@ -159,4 +171,5 @@ pub struct ArrowReader {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
+    pub(super) arrow_schema_override: Option<ArrowSchemaRef>,
 }

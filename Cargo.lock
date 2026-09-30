@@ -3951,6 +3951,7 @@ name = "iceberg-datafusion"
 version = "0.11.0"
 dependencies = [
  "anyhow",
+ "as-any",
  "async-trait",
  "dashmap",
  "datafusion",

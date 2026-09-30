@@ -141,6 +141,9 @@ pub struct TableScanBuilder<'a> {
     concurrency_limit_manifest_files: usize,
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    from_snapshot_id: Option<i64>,
+    to_snapshot_id: Option<i64>,
+    arrow_schema_override: Option<arrow_schema::SchemaRef>,
 }
 
 impl<'a> TableScanBuilder<'a> {
@@ -159,7 +162,16 @@ impl<'a> TableScanBuilder<'a> {
             concurrency_limit_manifest_files: num_cpus,
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
+            from_snapshot_id: None,
+            to_snapshot_id: None,
+            arrow_schema_override: None,
         }
+    }
+
+    /// Override the Arrow schema used by the file reader.
+    pub fn with_arrow_schema(mut self, arrow_schema: arrow_schema::SchemaRef) -> Self {
+        self.arrow_schema_override = Some(arrow_schema);
+        self
     }
 
     /// Sets the desired size of batches in the response
@@ -209,6 +221,18 @@ impl<'a> TableScanBuilder<'a> {
     /// Set the snapshot to scan. When not set, it uses current snapshot.
     pub fn snapshot_id(mut self, snapshot_id: i64) -> Self {
         self.snapshot_id = Some(snapshot_id);
+        self
+    }
+
+    /// Set the exclusive starting snapshot for an incremental scan.
+    pub fn from_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.from_snapshot_id = Some(snapshot_id);
+        self
+    }
+
+    /// Set the inclusive ending snapshot for an incremental scan.
+    pub fn to_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.to_snapshot_id = Some(snapshot_id);
         self
     }
 
@@ -267,9 +291,50 @@ impl<'a> TableScanBuilder<'a> {
 
     /// Build the table scan.
     pub fn build(self) -> Result<TableScan> {
-        let snapshot = match self.snapshot_id {
-            Some(snapshot_id) => self
-                .table
+        if self.from_snapshot_id.is_some() || self.to_snapshot_id.is_some() {
+            let Some(to_snapshot_id) = self.to_snapshot_id else {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "Incremental scan requires to_snapshot_id to be set",
+                ));
+            };
+            if self.snapshot_id.is_some() {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "snapshot_id cannot be combined with incremental scan bounds",
+                ));
+            }
+            let metadata = self.table.metadata();
+            if metadata.snapshot_by_id(to_snapshot_id).is_none() {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("to_snapshot_id {to_snapshot_id} not found in table metadata"),
+                ));
+            }
+            if let Some(from_snapshot_id) = self.from_snapshot_id {
+                let mut cursor = metadata.snapshot_by_id(to_snapshot_id).cloned();
+                let mut found = false;
+                while let Some(snapshot) = cursor {
+                    if snapshot.snapshot_id() == from_snapshot_id {
+                        found = true;
+                        break;
+                    }
+                    cursor = snapshot
+                        .parent_snapshot_id()
+                        .and_then(|id| metadata.snapshot_by_id(id).cloned());
+                }
+                if !found {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "from_snapshot_id {from_snapshot_id} is not an ancestor of to_snapshot_id {to_snapshot_id}"
+                        ),
+                    ));
+                }
+            }
+        }
+        let snapshot = if let Some(snapshot_id) = self.snapshot_id {
+            self.table
                 .metadata()
                 .snapshot_by_id(snapshot_id)
                 .ok_or_else(|| {
@@ -278,24 +343,39 @@ impl<'a> TableScanBuilder<'a> {
                         format!("Snapshot with id {snapshot_id} not found"),
                     )
                 })?
-                .clone(),
-            None => {
-                let Some(current_snapshot_id) = self.table.metadata().current_snapshot() else {
-                    return Ok(TableScan {
-                        batch_size: self.batch_size,
-                        column_names: self.column_names,
-                        file_io: self.table.file_io().clone(),
-                        plan_context: None,
-                        concurrency_limit_data_files: self.concurrency_limit_data_files,
-                        concurrency_limit_manifest_entries: self.concurrency_limit_manifest_entries,
-                        concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
-                        row_group_filtering_enabled: self.row_group_filtering_enabled,
-                        row_selection_enabled: self.row_selection_enabled,
-                        runtime: self.table.runtime().clone(),
-                    });
-                };
-                current_snapshot_id.clone()
-            }
+                .clone()
+        } else if let Some(to_snapshot_id) = self.to_snapshot_id {
+            // For an incremental scan, anchor projection, predicate binding, and
+            // schema resolution to the inclusive end snapshot (`to_snapshot_id`)
+            // rather than the table's current snapshot, which may be newer and
+            // carry an evolved schema. Existence was validated above.
+            self.table
+                .metadata()
+                .snapshot_by_id(to_snapshot_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("to_snapshot_id {to_snapshot_id} not found in table metadata"),
+                    )
+                })?
+                .clone()
+        } else {
+            let Some(current_snapshot_id) = self.table.metadata().current_snapshot() else {
+                return Ok(TableScan {
+                    batch_size: self.batch_size,
+                    column_names: self.column_names,
+                    file_io: self.table.file_io().clone(),
+                    plan_context: None,
+                    concurrency_limit_data_files: self.concurrency_limit_data_files,
+                    concurrency_limit_manifest_entries: self.concurrency_limit_manifest_entries,
+                    concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
+                    row_group_filtering_enabled: self.row_group_filtering_enabled,
+                    row_selection_enabled: self.row_selection_enabled,
+                    arrow_schema_override: self.arrow_schema_override,
+                    runtime: self.table.runtime().clone(),
+                });
+            };
+            current_snapshot_id.clone()
         };
 
         let schema = snapshot.schema(self.table.metadata())?;
@@ -325,6 +405,8 @@ impl<'a> TableScanBuilder<'a> {
             manifest_evaluator_cache: Arc::new(ManifestEvaluatorCache::new()),
             expression_evaluator_cache: Arc::new(ExpressionEvaluatorCache::new()),
             unified_partition_type,
+            from_snapshot_id: self.from_snapshot_id,
+            to_snapshot_id: self.to_snapshot_id,
         };
 
         Ok(TableScan {
@@ -337,6 +419,7 @@ impl<'a> TableScanBuilder<'a> {
             concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
+            arrow_schema_override: self.arrow_schema_override,
             runtime: self.table.runtime().clone(),
         })
     }
@@ -366,6 +449,7 @@ pub struct TableScan {
 
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    arrow_schema_override: Option<arrow_schema::SchemaRef>,
 
     runtime: Runtime,
 }
@@ -390,18 +474,26 @@ impl TableScan {
         let (file_scan_task_tx, file_scan_task_rx) = channel(concurrency_limit_manifest_entries);
 
         let (delete_file_idx, delete_file_tx) = DeleteFileIndex::new(self.runtime.clone());
-
-        let manifest_list = plan_context.get_manifest_list().await?;
-
-        // get the [`ManifestFile`]s from the [`ManifestList`], filtering out any
-        // whose partitions cannot match this
-        // scan's filter
-        let manifest_file_contexts = plan_context.build_manifest_file_contexts(
-            manifest_list,
-            manifest_entry_data_ctx_tx,
-            delete_file_idx.clone(),
-            manifest_entry_delete_ctx_tx,
-        )?;
+        let manifest_file_contexts = if let Some(to_snapshot_id) = plan_context.to_snapshot_id {
+            plan_context
+                .build_incremental_manifest_file_contexts(
+                    plan_context.from_snapshot_id,
+                    to_snapshot_id,
+                    manifest_entry_data_ctx_tx,
+                    delete_file_idx.clone(),
+                )
+                .await?
+        } else {
+            let manifest_list = plan_context.get_manifest_list().await?;
+            plan_context
+                .build_manifest_file_contexts(
+                    manifest_list,
+                    manifest_entry_data_ctx_tx,
+                    delete_file_idx.clone(),
+                    manifest_entry_delete_ctx_tx,
+                )?
+                .collect()
+        };
 
         let mut channel_for_manifest_error = file_scan_task_tx.clone();
         let mut channel_for_data_manifest_entry_error = file_scan_task_tx.clone();
@@ -502,6 +594,10 @@ impl TableScan {
 
         if let Some(batch_size) = self.batch_size {
             arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);
+        }
+
+        if let Some(arrow_schema) = &self.arrow_schema_override {
+            arrow_reader_builder = arrow_reader_builder.with_arrow_schema(arrow_schema.clone());
         }
 
         arrow_reader_builder
@@ -933,6 +1029,7 @@ pub mod tests {
                                 .file_format(DataFileFormat::Parquet)
                                 .file_size_in_bytes(parquet_file_size)
                                 .record_count(1)
+                                .null_value_counts(HashMap::from([(1, 0)]))
                                 .partition(Struct::from_iter([Some(Literal::long(100))]))
                                 .key_metadata(None)
                                 .build()
@@ -956,6 +1053,7 @@ pub mod tests {
                                 .file_format(DataFileFormat::Parquet)
                                 .file_size_in_bytes(parquet_file_size)
                                 .record_count(1)
+                                .null_value_counts(HashMap::from([(1, 0)]))
                                 .partition(Struct::from_iter([Some(Literal::long(200))]))
                                 .build()
                                 .unwrap(),
@@ -978,6 +1076,7 @@ pub mod tests {
                                 .file_format(DataFileFormat::Parquet)
                                 .file_size_in_bytes(parquet_file_size)
                                 .record_count(1)
+                                .null_value_counts(HashMap::from([(1, 1)]))
                                 .partition(Struct::from_iter([Some(Literal::long(300))]))
                                 .build()
                                 .unwrap(),
@@ -1755,6 +1854,31 @@ pub mod tests {
     }
 
     #[test]
+    fn test_incremental_scan_anchors_to_end_snapshot_not_current() {
+        // Regression: an incremental scan must resolve its snapshot (and thus its
+        // projection/predicate schema) from the inclusive `to_snapshot_id`, not
+        // from the table's current snapshot, which may be newer and carry an
+        // evolved schema. See example_table_metadata_v2.json for the ids below.
+        let table = TableTestFixture::new().table;
+
+        let to_snapshot_id = 3051729675574597004; // parent of the current snapshot
+        let current_snapshot_id = 3055729675574597004;
+        assert_eq!(
+            table.metadata().current_snapshot().unwrap().snapshot_id(),
+            current_snapshot_id,
+            "fixture precondition: current snapshot differs from to_snapshot_id"
+        );
+
+        let scan = table.scan().to_snapshot_id(to_snapshot_id).build().unwrap();
+
+        assert_eq!(
+            scan.snapshot().unwrap().snapshot_id(),
+            to_snapshot_id,
+            "incremental scan should anchor to to_snapshot_id, not the current snapshot"
+        );
+    }
+
+    #[test]
     fn test_select_no_exist_column() {
         let table = TableTestFixture::new().table;
 
@@ -2048,6 +2172,8 @@ pub mod tests {
             tasks[1].data_file_path(),
             format!("{}/3.parquet", &fixture.table_location)
         );
+        assert_eq!(tasks[0].null_value_counts, Some(HashMap::from([(1, 0)])));
+        assert_eq!(tasks[1].null_value_counts, Some(HashMap::from([(1, 1)])));
         assert_eq!(tasks[1].data_sequence_number(), Some(0));
 
         // first_row_id is a v3 concept; a v2 manifest carries none.

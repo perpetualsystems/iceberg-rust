@@ -121,6 +121,28 @@ properties_view! {
 /// Typed view over the properties of a table.
 #[derive(Debug)]
 pub struct TableProperties {
+    /// Target size for merged manifests.
+    #[property(
+        key = Self::PROPERTY_COMMIT_MANIFEST_TARGET_SIZE_BYTES,
+        default = Self::PROPERTY_COMMIT_MANIFEST_TARGET_SIZE_BYTES_DEFAULT,
+        getter
+    )]
+    commit_manifest_target_size_bytes: u64,
+    /// Minimum manifest count before merging.
+    #[property(
+        key = Self::PROPERTY_COMMIT_MANIFEST_MIN_MERGE_COUNT,
+        default = Self::PROPERTY_COMMIT_MANIFEST_MIN_MERGE_COUNT_DEFAULT,
+        getter
+    )]
+    commit_manifest_min_merge_count: u32,
+    /// Whether to merge manifests on commit.
+    #[property(
+        key = Self::PROPERTY_COMMIT_MANIFEST_MERGE_ENABLED,
+        default = Self::PROPERTY_COMMIT_MANIFEST_MERGE_ENABLED_DEFAULT,
+        getter
+    )]
+    commit_manifest_merge_enabled: bool,
+
     /// The number of times to retry a commit.
     #[property(
         key = Self::PROPERTY_COMMIT_NUM_RETRIES,
@@ -456,6 +478,24 @@ impl TableProperties<'_> {
         "write.datafusion.fanout.enabled";
     /// Default value for fanout writer enabled
     pub const PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED_DEFAULT: bool = true;
+
+    /// Target manifest size for the merge step's bin packer.
+    pub const PROPERTY_COMMIT_MANIFEST_TARGET_SIZE_BYTES: &'static str =
+        "commit.manifest.target-size-bytes";
+    /// Default target manifest size for the merge step.
+    pub const PROPERTY_COMMIT_MANIFEST_TARGET_SIZE_BYTES_DEFAULT: u64 = 8 * 1024 * 1024;
+
+    /// Minimum number of manifests required before merging.
+    pub const PROPERTY_COMMIT_MANIFEST_MIN_MERGE_COUNT: &'static str =
+        "commit.manifest.min-count-to-merge";
+    /// Default minimum manifest count required before merging.
+    pub const PROPERTY_COMMIT_MANIFEST_MIN_MERGE_COUNT_DEFAULT: u32 = 100;
+
+    /// Whether the manifest merge step is enabled.
+    pub const PROPERTY_COMMIT_MANIFEST_MERGE_ENABLED: &'static str =
+        "commit.manifest-merge.enabled";
+    /// Default manifest merge setting.
+    pub const PROPERTY_COMMIT_MANIFEST_MERGE_ENABLED_DEFAULT: bool = true;
 
     /// Property key for enabling garbage collection on drop.
     /// When set to `false`, data files will not be deleted when a table is dropped.
