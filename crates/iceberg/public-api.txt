@@ -7,8 +7,10 @@ pub mod iceberg::arrow::partition_value_calculator
 pub struct iceberg::arrow::partition_value_calculator::PartitionValueCalculator
 impl iceberg::arrow::PartitionValueCalculator
 pub fn iceberg::arrow::PartitionValueCalculator::calculate(&self, batch: &arrow_array::record_batch::RecordBatch) -> iceberg::Result<arrow_array::array::ArrayRef>
+pub fn iceberg::arrow::PartitionValueCalculator::calculate_from_columns(&self, source_columns: &[arrow_array::array::ArrayRef]) -> iceberg::Result<arrow_array::array::ArrayRef>
 pub fn iceberg::arrow::PartitionValueCalculator::partition_arrow_type(&self) -> &arrow_schema::datatype::DataType
 pub fn iceberg::arrow::PartitionValueCalculator::partition_type(&self) -> &iceberg::spec::StructType
+pub fn iceberg::arrow::PartitionValueCalculator::source_field_paths(&self, input_schema: alloc::sync::Arc<arrow_schema::schema::Schema>) -> iceberg::Result<alloc::vec::Vec<alloc::vec::Vec<usize>>>
 pub fn iceberg::arrow::PartitionValueCalculator::try_new(partition_spec: &iceberg::spec::PartitionSpec, table_schema: &iceberg::spec::Schema) -> iceberg::Result<Self>
 pub fn iceberg::arrow::PartitionValueCalculator::try_new_with_match_mode(partition_spec: &iceberg::spec::PartitionSpec, table_schema: &iceberg::spec::Schema, match_mode: iceberg::arrow::FieldMatchMode) -> iceberg::Result<Self>
 impl core::fmt::Debug for iceberg::arrow::PartitionValueCalculator
@@ -85,8 +87,10 @@ pub fn iceberg::arrow::ArrowReaderBuilder::with_row_selection_enabled(self, row_
 pub struct iceberg::arrow::PartitionValueCalculator
 impl iceberg::arrow::PartitionValueCalculator
 pub fn iceberg::arrow::PartitionValueCalculator::calculate(&self, batch: &arrow_array::record_batch::RecordBatch) -> iceberg::Result<arrow_array::array::ArrayRef>
+pub fn iceberg::arrow::PartitionValueCalculator::calculate_from_columns(&self, source_columns: &[arrow_array::array::ArrayRef]) -> iceberg::Result<arrow_array::array::ArrayRef>
 pub fn iceberg::arrow::PartitionValueCalculator::partition_arrow_type(&self) -> &arrow_schema::datatype::DataType
 pub fn iceberg::arrow::PartitionValueCalculator::partition_type(&self) -> &iceberg::spec::StructType
+pub fn iceberg::arrow::PartitionValueCalculator::source_field_paths(&self, input_schema: alloc::sync::Arc<arrow_schema::schema::Schema>) -> iceberg::Result<alloc::vec::Vec<alloc::vec::Vec<usize>>>
 pub fn iceberg::arrow::PartitionValueCalculator::try_new(partition_spec: &iceberg::spec::PartitionSpec, table_schema: &iceberg::spec::Schema) -> iceberg::Result<Self>
 pub fn iceberg::arrow::PartitionValueCalculator::try_new_with_match_mode(partition_spec: &iceberg::spec::PartitionSpec, table_schema: &iceberg::spec::Schema, match_mode: iceberg::arrow::FieldMatchMode) -> iceberg::Result<Self>
 impl core::fmt::Debug for iceberg::arrow::PartitionValueCalculator

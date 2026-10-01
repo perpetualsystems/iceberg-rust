@@ -20,6 +20,7 @@
 //! This module provides utilities for calculating partition values from record batches
 //! based on a partition specification.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, StructArray};
@@ -199,21 +200,63 @@ impl PartitionValueCalculator {
     /// - Transform application fails
     /// - StructArray construction fails
     pub fn calculate(&self, batch: &RecordBatch) -> Result<ArrayRef> {
-        let source_columns = match self.match_mode {
-            FieldMatchMode::Id => {
-                if positions_aligned(&self.expected_field_ids, batch.schema_ref()) {
-                    self.cached_projector.project_column(batch.columns())?
-                } else {
-                    RecordBatchProjector::project_columns_by_field_id(
-                        batch,
-                        &self.source_field_ids,
-                    )?
-                }
+        let source_columns = self
+            .source_projector(batch.schema())?
+            .project_column(batch.columns())?;
+        self.calculate_from_columns(&source_columns)
+    }
+
+    fn source_projector(
+        &self,
+        input_schema: Arc<ArrowSchema>,
+    ) -> Result<Cow<'_, RecordBatchProjector>> {
+        match self.match_mode {
+            FieldMatchMode::Id if positions_aligned(&self.expected_field_ids, &input_schema) => {
+                Ok(Cow::Borrowed(&self.cached_projector))
             }
+            FieldMatchMode::Id => RecordBatchProjector::new(
+                input_schema,
+                &self.source_field_ids,
+                parquet_field_id,
+                |_| true,
+            )
+            .map(Cow::Owned),
             FieldMatchMode::Name => {
-                RecordBatchProjector::project_columns_by_name(batch, &self.source_field_names)?
+                RecordBatchProjector::new_by_names(input_schema, &self.source_field_names)
+                    .map(Cow::Owned)
             }
-        };
+        }
+    }
+
+    /// Resolve partition source paths against an input schema using this calculator's
+    /// matching mode. Each path lists indices from the top-level column to the leaf.
+    /// Paths are returned in partition-spec order, including repeated sources.
+    ///
+    /// # Errors
+    /// Returns an error if a source cannot be resolved using the matching mode.
+    pub fn source_field_paths(&self, input_schema: Arc<ArrowSchema>) -> Result<Vec<Vec<usize>>> {
+        Ok(self
+            .source_projector(input_schema)?
+            .field_indices()
+            .iter()
+            .map(|path| path.iter().rev().copied().collect())
+            .collect())
+    }
+
+    /// Apply Iceberg transforms to already evaluated source columns in partition-spec
+    /// order. Callers must supply one array per partition field, including repeated
+    /// sources, with the same number of rows in each array.
+    ///
+    /// # Errors
+    /// Returns an error for an incorrect number of source columns, unsupported
+    /// transform input types, or inconsistent transformed array lengths.
+    pub fn calculate_from_columns(&self, source_columns: &[ArrayRef]) -> Result<ArrayRef> {
+        if source_columns.len() != self.transform_functions.len() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Expected one source column per partition field",
+            ));
+        }
 
         // Get expected struct fields for the result
         let expected_struct_fields = match &self.partition_arrow_type {
@@ -632,6 +675,52 @@ mod tests {
             .unwrap();
         assert_eq!(id_partition.value(0), 10);
         assert_eq!(id_partition.value(1), 20);
+    }
+
+    #[test]
+    fn test_calculate_from_columns_validates_sources() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "other", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let spec = PartitionSpecBuilder::new(schema.clone())
+            .add_partition_field("id", "id", Transform::Identity)
+            .unwrap()
+            .add_partition_field("other", "other_truncated", Transform::Truncate(10))
+            .unwrap()
+            .build()
+            .unwrap();
+        let calculator = PartitionValueCalculator::try_new(&spec, &schema).unwrap();
+        let column: ArrayRef = Arc::new(Int32Array::from(vec![Some(19), None]));
+        assert!(calculator.calculate_from_columns(&[]).is_err());
+        assert!(
+            calculator
+                .calculate_from_columns(std::slice::from_ref(&column))
+                .is_err()
+        );
+        assert!(
+            calculator
+                .calculate_from_columns(&[column.clone(), column.clone(), column.clone()])
+                .is_err()
+        );
+        assert!(
+            calculator
+                .calculate_from_columns(&[column, Arc::new(Int32Array::from(vec![1]))])
+                .is_err()
+        );
+        let empty: ArrayRef = Arc::new(Int32Array::from(Vec::<i32>::new()));
+        assert_eq!(
+            calculator
+                .calculate_from_columns(&[empty.clone(), empty])
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     #[test]

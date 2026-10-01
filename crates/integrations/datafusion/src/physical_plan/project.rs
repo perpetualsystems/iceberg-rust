@@ -19,7 +19,8 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::array::{Array, RecordBatch, StructArray, make_array};
+use datafusion::arrow::buffer::NullBuffer;
 use datafusion::arrow::datatypes::{DataType, Schema as ArrowSchema};
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::physical_expr::PhysicalExpr;
@@ -104,7 +105,11 @@ pub fn project_with_partition_with_match_mode(
         projection_exprs.push((column_expr, field.name().clone()));
     }
 
-    let partition_expr = Arc::new(PartitionExpr::new(calculator, partition_spec.clone()));
+    let partition_expr = Arc::new(PartitionExpr::try_new(
+        calculator,
+        partition_spec.clone(),
+        input_schema.clone(),
+    )?);
     projection_exprs.push((partition_expr, PROJECTED_PARTITION_VALUE_COLUMN.to_string()));
 
     let projection = ProjectionExec::try_new(projection_exprs, input)?;
@@ -116,23 +121,71 @@ pub fn project_with_partition_with_match_mode(
 pub struct PartitionExpr {
     calculator: Arc<PartitionValueCalculator>,
     partition_spec: Arc<PartitionSpec>,
+    inputs: Vec<Arc<dyn PhysicalExpr>>,
+    // Maps each partition field to its source expression; transforms may share a source.
+    source_indices: Vec<usize>,
 }
 
 impl PartitionExpr {
-    pub fn new(calculator: PartitionValueCalculator, partition_spec: Arc<PartitionSpec>) -> Self {
-        Self {
+    /// Bind partition sources to the input schema before DataFusion rewrites projections.
+    /// Only partition sources become children, including field access for nested sources.
+    /// Matching follows the calculator's name or field-ID policy at binding time.
+    ///
+    /// # Errors
+    /// Returns an error if a partition source cannot be resolved in the input schema.
+    pub fn try_new(
+        calculator: PartitionValueCalculator,
+        partition_spec: Arc<PartitionSpec>,
+        input_schema: Arc<ArrowSchema>,
+    ) -> DFResult<Self> {
+        let paths = calculator
+            .source_field_paths(input_schema.clone())
+            .map_err(to_datafusion_error)?;
+        let mut inputs: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
+        let mut source_indices = Vec::with_capacity(paths.len());
+        let mut unique_paths = Vec::new();
+        for path in paths {
+            if let Some(index) = unique_paths.iter().position(|existing| existing == &path) {
+                source_indices.push(index);
+                continue;
+            }
+            let (&root, nested) = path
+                .split_first()
+                .ok_or_else(|| DataFusionError::Plan("Empty partition source path".to_string()))?;
+            let field = input_schema.fields().get(root).ok_or_else(|| {
+                DataFusionError::Plan(
+                    "Partition source index is outside the input schema".to_string(),
+                )
+            })?;
+            let mut input: Arc<dyn PhysicalExpr> = Arc::new(Column::new(field.name(), root));
+            if !nested.is_empty() {
+                input = Arc::new(PartitionFieldExpr {
+                    input,
+                    path: nested.to_vec(),
+                });
+                // Validate the nested path while the binding schema is available.
+                input.data_type(&input_schema)?;
+            }
+            source_indices.push(inputs.len());
+            inputs.push(input);
+            unique_paths.push(path);
+        }
+        Ok(Self {
             calculator: Arc::new(calculator),
             partition_spec,
-        }
+            inputs,
+            source_indices,
+        })
     }
 }
 
-// Manual PartialEq/Eq implementations for pointer-based equality
-// (two PartitionExpr are equal if they share the same calculator and partition_spec instances)
+// Rewrites share the calculator and spec, but may compute different source values.
 impl PartialEq for PartitionExpr {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.calculator, &other.calculator)
             && Arc::ptr_eq(&self.partition_spec, &other.partition_spec)
+            && self.inputs == other.inputs
+            && self.source_indices == other.source_indices
     }
 }
 
@@ -148,22 +201,42 @@ impl PhysicalExpr for PartitionExpr {
     }
 
     fn evaluate(&self, batch: &RecordBatch) -> DFResult<ColumnarValue> {
+        let inputs = self
+            .inputs
+            .iter()
+            .map(|input| input.evaluate(batch)?.into_array(batch.num_rows()))
+            .collect::<DFResult<Vec<_>>>()?;
+        let source_columns = self
+            .source_indices
+            .iter()
+            .map(|&index| inputs[index].clone())
+            .collect::<Vec<_>>();
         let array = self
             .calculator
-            .calculate(batch)
+            .calculate_from_columns(&source_columns)
             .map_err(to_datafusion_error)?;
         Ok(ColumnarValue::Array(array))
     }
 
     fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
-        vec![]
+        self.inputs.iter().collect()
     }
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn PhysicalExpr>>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> DFResult<Arc<dyn PhysicalExpr>> {
-        Ok(self)
+        if children.len() != self.inputs.len() {
+            return Err(DataFusionError::Plan(format!(
+                "PartitionExpr expected {} children, got {}",
+                self.inputs.len(),
+                children.len()
+            )));
+        }
+        Ok(Arc::new(Self {
+            inputs: children,
+            ..self.as_ref().clone()
+        }))
     }
 
     fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -191,17 +264,128 @@ impl std::fmt::Display for PartitionExpr {
 
 impl std::hash::Hash for PartitionExpr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // Two PartitionExpr are equal if they share the same calculator and partition_spec Arcs
+        // Include rewritten inputs as well as the shared calculator and spec.
         Arc::as_ptr(&self.calculator).hash(state);
         Arc::as_ptr(&self.partition_spec).hash(state);
+        self.inputs.hash(state);
+        self.source_indices.hash(state);
+    }
+}
+
+/// Extract a nested partition source while preserving nulls from every parent
+/// struct, as Iceberg's RecordBatchProjector does. DataFusion's get_field only
+/// returns the child array and does not propagate those parent nulls.
+#[derive(Debug, Clone, Eq)]
+struct PartitionFieldExpr {
+    input: Arc<dyn PhysicalExpr>,
+    path: Vec<usize>,
+}
+
+impl PartialEq for PartitionFieldExpr {
+    fn eq(&self, other: &Self) -> bool {
+        self.input.eq(&other.input) && self.path == other.path
+    }
+}
+
+impl std::hash::Hash for PartitionFieldExpr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.input.hash(state);
+        self.path.hash(state);
+    }
+}
+
+impl PhysicalExpr for PartitionFieldExpr {
+    fn data_type(&self, input_schema: &ArrowSchema) -> DFResult<DataType> {
+        let mut data_type = self.input.data_type(input_schema)?;
+        for &index in &self.path {
+            let DataType::Struct(fields) = data_type else {
+                return Err(DataFusionError::Plan(
+                    "Partition source path requires a struct".to_string(),
+                ));
+            };
+            data_type = fields
+                .get(index)
+                .ok_or_else(|| {
+                    DataFusionError::Plan(
+                        "Partition source index is outside the struct".to_string(),
+                    )
+                })?
+                .data_type()
+                .clone();
+        }
+        Ok(data_type)
+    }
+
+    fn nullable(&self, _input_schema: &ArrowSchema) -> DFResult<bool> {
+        Ok(true)
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> DFResult<ColumnarValue> {
+        let mut array = self.input.evaluate(batch)?.into_array(batch.num_rows())?;
+        let mut nulls = array.logical_nulls();
+        for &index in &self.path {
+            let nested = array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "Partition source path requires a struct".to_string(),
+                    )
+                })?;
+            array = nested
+                .columns()
+                .get(index)
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "Partition source index is outside the struct".to_string(),
+                    )
+                })?
+                .clone();
+            nulls = NullBuffer::union(nulls.as_ref(), array.logical_nulls().as_ref());
+        }
+        Ok(ColumnarValue::Array(make_array(
+            array.to_data().into_builder().nulls(nulls).build()?,
+        )))
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> DFResult<Arc<dyn PhysicalExpr>> {
+        let [input]: [Arc<dyn PhysicalExpr>; 1] = children.try_into().map_err(|_| {
+            DataFusionError::Plan("PartitionFieldExpr expected one child".to_string())
+        })?;
+        Ok(Arc::new(Self {
+            input,
+            path: self.path.clone(),
+        }))
+    }
+
+    fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl std::fmt::Display for PartitionFieldExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "iceberg_partition_field({}, {:?})",
+            self.input, self.path
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use as_any::AsAny;
     use datafusion::arrow::array::{Array, ArrayRef, Int32Array, StructArray};
     use datafusion::arrow::datatypes::{DataType, Field, Fields};
+    use datafusion::common::ScalarValue;
+    use datafusion::physical_expr::expressions::Literal;
     use datafusion::physical_plan::empty::EmptyExec;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, StructType, Transform, Type};
     use iceberg::test_utils::test_runtime;
@@ -267,7 +451,9 @@ mod tests {
             projection_exprs.push((column_expr, field.name().clone()));
         }
 
-        let partition_expr = Arc::new(PartitionExpr::new(calculator, partition_spec));
+        let partition_expr = Arc::new(
+            PartitionExpr::try_new(calculator, partition_spec, arrow_schema.clone()).unwrap(),
+        );
         projection_exprs.push((partition_expr, PROJECTED_PARTITION_VALUE_COLUMN.to_string()));
 
         let projection = ProjectionExec::try_new(projection_exprs, input).unwrap();
@@ -312,7 +498,8 @@ mod tests {
         let partition_spec = Arc::new(partition_spec);
         let calculator = PartitionValueCalculator::try_new(&partition_spec, &table_schema).unwrap();
         let partition_type = calculator.partition_arrow_type().clone();
-        let expr = PartitionExpr::new(calculator, partition_spec);
+        let expr =
+            PartitionExpr::try_new(calculator, partition_spec, arrow_schema.clone()).unwrap();
 
         assert_eq!(expr.data_type(&arrow_schema).unwrap(), partition_type);
         assert!(!expr.nullable(&arrow_schema).unwrap());
@@ -608,11 +795,8 @@ mod tests {
         );
     }
 
-    /// Regression: PartitionExpr declares no children, so ProjectionPushdown
-    /// can fuse a NULL-filling alignment ProjectionExec into the partition
-    /// projection and leave PartitionExpr evaluating against an un-aligned
-    /// input. The partition-source lookup must resolve by iceberg field id at
-    /// runtime — cached positions become wrong after the rewrite.
+    /// ProjectionPushdown must rewrite partition sources when fusing a NULL-filling
+    /// alignment projection into the partition projection.
     #[tokio::test]
     async fn test_partition_expr_survives_projection_unification() {
         use std::collections::HashMap;
@@ -742,7 +926,7 @@ mod tests {
         // Precondition: the two ProjectionExecs must actually have fused;
         // otherwise this regression test is vacuous.
         assert!(
-            !optimized_plan.children()[0].as_any().is::<ProjectionExec>(),
+            !optimized_plan.children()[0].is::<ProjectionExec>(),
             "ProjectionPushdown did not fuse the two ProjectionExecs",
         );
 
@@ -751,14 +935,12 @@ mod tests {
             .unwrap();
         let partitions = extract_c_day_partitions(&results);
 
-        // Without runtime field-id lookup, the cached positions select
-        // column `d` (Day=[100, 200]) instead of `c` (Day=[0, 1]).
+        // The rewritten source must select c, not the old positional column d.
         assert_eq!(partitions, vec![0, 1]);
     }
 
-    /// Name mode covers DML-like plans whose runtime batches keep source
-    /// column names but do not carry target `PARQUET:field_id` metadata after
-    /// projection rewrites.
+    /// Name mode must follow event_time AS c when projection fusion removes
+    /// the alias, even without target PARQUET:field_id metadata.
     #[tokio::test]
     async fn test_partition_expr_name_mode_survives_projection_unification_without_field_ids() {
         use std::collections::HashMap;
@@ -822,7 +1004,7 @@ mod tests {
         let source_arrow_schema = Arc::new(ArrowSchema::new(vec![
             Field::new("a", DataType::Int32, false),
             Field::new(
-                "c",
+                "event_time",
                 DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
                 false,
             ),
@@ -854,7 +1036,7 @@ mod tests {
         let aligned_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = vec![
             (Arc::new(Column::new("a", 0)), "a".to_string()),
             (null_b, "b".to_string()),
-            (Arc::new(Column::new("c", 1)), "c".to_string()),
+            (Arc::new(Column::new("event_time", 1)), "c".to_string()),
             (Arc::new(Column::new("d", 2)), "d".to_string()),
         ];
         let aligned_plan: Arc<dyn ExecutionPlan> =
@@ -868,7 +1050,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            !optimized_plan.children()[0].as_any().is::<ProjectionExec>(),
+            !optimized_plan.children()[0].is::<ProjectionExec>(),
             "ProjectionPushdown did not fuse the two ProjectionExecs",
         );
 
@@ -878,6 +1060,332 @@ mod tests {
         let partitions = extract_c_day_partitions(&results);
 
         assert_eq!(partitions, vec![0, 1]);
+    }
+
+    /// Exercise the actual optimizer, with a partition-only output so unrelated
+    /// dependencies cannot hide behind the table's passthrough columns.
+    async fn optimize_partition_projection(
+        batch: RecordBatch,
+        projection: Vec<(Arc<dyn PhysicalExpr>, String)>,
+        table_schema: &Schema,
+        spec: Arc<PartitionSpec>,
+        mode: FieldMatchMode,
+    ) -> Vec<RecordBatch> {
+        use datafusion::config::ConfigOptions;
+        use datafusion::datasource::{MemTable, TableProvider};
+        use datafusion::physical_expr::utils::collect_columns;
+        use datafusion::physical_optimizer::PhysicalOptimizerRule;
+        use datafusion::physical_optimizer::projection_pushdown::ProjectionPushdown;
+        use datafusion::prelude::SessionContext;
+
+        let ctx = SessionContext::new();
+        let source = MemTable::try_new(batch.schema(), vec![vec![batch]])
+            .unwrap()
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .unwrap();
+        let aligned: Arc<dyn ExecutionPlan> =
+            Arc::new(ProjectionExec::try_new(projection, source).unwrap());
+        let calculator =
+            PartitionValueCalculator::try_new_with_match_mode(&spec, table_schema, mode).unwrap();
+        let expr: Arc<dyn PhysicalExpr> =
+            Arc::new(PartitionExpr::try_new(calculator, spec, aligned.schema()).unwrap());
+        // All cases below partition on one source, sometimes with multiple transforms.
+        assert_eq!(expr.children().len(), 1);
+        assert_eq!(collect_columns(&expr).len(), 1);
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            ProjectionExec::try_new(
+                vec![(expr, PROJECTED_PARTITION_VALUE_COLUMN.to_string())],
+                aligned,
+            )
+            .unwrap(),
+        );
+        let expected = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx())
+            .await
+            .unwrap();
+        let optimized = ProjectionPushdown::new()
+            .optimize(plan, &ConfigOptions::default())
+            .unwrap();
+        assert!(optimized.as_ref().is::<ProjectionExec>());
+        assert!(
+            !optimized.children()[0].is::<ProjectionExec>(),
+            "projections must fuse"
+        );
+        let partition = &optimized.downcast_ref::<ProjectionExec>().unwrap().expr()[0].expr;
+        assert!(
+            collect_columns(partition)
+                .iter()
+                .all(|column| column.name() != "unrelated"),
+            "unrelated input must not be a dependency"
+        );
+        let actual = datafusion::physical_plan::collect(optimized, ctx.task_ctx())
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+        actual
+    }
+
+    #[tokio::test]
+    async fn test_partition_sources_rewritten_by_projection_optimizer() {
+        use datafusion::arrow::array::{Date32Array, Int64Array, TimestampMicrosecondArray};
+        use datafusion::arrow::datatypes::TimeUnit;
+        use datafusion::physical_expr::expressions::CastExpr;
+
+        const DAY: i64 = 86_400_000_000;
+        let timestamp_type = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let table_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "timestamp", Type::Primitive(PrimitiveType::Timestamp))
+                    .into(),
+                NestedField::required(2, "unrelated", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap();
+        let spec = Arc::new(
+            PartitionSpec::builder(Arc::new(table_schema.clone()))
+                .add_partition_field("timestamp", "c_day", Transform::Day)
+                .unwrap()
+                .add_partition_field("timestamp", "original", Transform::Identity)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        // The source is reordered, and has no column named `timestamp`.
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("unrelated", DataType::Int32, false),
+                Field::new("event_time", timestamp_type.clone(), true),
+                Field::new("micros", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![99; 4])),
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    Some(-1),
+                    Some(0),
+                    Some(DAY),
+                    None,
+                ])),
+                Arc::new(Int64Array::from(vec![
+                    Some(2 * DAY),
+                    Some(3 * DAY),
+                    Some(4 * DAY),
+                    None,
+                ])),
+            ],
+        )
+        .unwrap();
+        let cases = [
+            (
+                Arc::new(Column::new("event_time", 1)) as Arc<dyn PhysicalExpr>,
+                vec![Some(-1), Some(0), Some(1), None],
+            ),
+            (
+                Arc::new(CastExpr::new(
+                    Arc::new(Column::new("micros", 2)),
+                    timestamp_type,
+                    None,
+                )),
+                vec![Some(2), Some(3), Some(4), None],
+            ),
+            (
+                Arc::new(Literal::new(ScalarValue::TimestampMicrosecond(
+                    Some(5 * DAY),
+                    None,
+                ))),
+                vec![Some(5); 4],
+            ),
+        ];
+        for mode in [FieldMatchMode::Name, FieldMatchMode::Id] {
+            for (source, expected) in &cases {
+                let result = optimize_partition_projection(
+                    batch.clone(),
+                    vec![
+                        (source.clone(), "timestamp".to_string()),
+                        (
+                            Arc::new(Column::new("unrelated", 0)),
+                            "unrelated".to_string(),
+                        ),
+                    ],
+                    &table_schema,
+                    spec.clone(),
+                    mode,
+                )
+                .await;
+                let partitions = Array::as_any(result[0].column(0).as_ref())
+                    .downcast_ref::<StructArray>()
+                    .unwrap();
+                let days = Array::as_any(partitions.column(0).as_ref())
+                    .downcast_ref::<Date32Array>()
+                    .unwrap();
+                assert_eq!(days.iter().collect::<Vec<_>>(), *expected);
+                let original = Array::as_any(partitions.column(1).as_ref())
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap();
+                assert_eq!(
+                    original
+                        .iter()
+                        .map(|v| v.map(|v| v.div_euclid(DAY) as i32))
+                        .collect::<Vec<_>>(),
+                    *expected
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_nested_partition_sources_rewritten_by_projection_optimizer() {
+        use std::collections::HashMap;
+
+        use datafusion::arrow::buffer::NullBuffer;
+
+        let table_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(
+                    1,
+                    "payload",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::optional(
+                            2,
+                            "inner",
+                            Type::Struct(StructType::new(vec![
+                                NestedField::optional(
+                                    3,
+                                    "value",
+                                    Type::Primitive(PrimitiveType::Int),
+                                )
+                                .into(),
+                            ])),
+                        )
+                        .into(),
+                    ])),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap();
+        let spec = Arc::new(
+            PartitionSpec::builder(Arc::new(table_schema.clone()))
+                .add_partition_field("payload.inner.value", "value", Transform::Truncate(10))
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        let metadata = |id: i32| {
+            HashMap::from([(
+                parquet::arrow::PARQUET_FIELD_ID_META_KEY.to_string(),
+                id.to_string(),
+            )])
+        };
+        for mode in [FieldMatchMode::Name, FieldMatchMode::Id] {
+            // ID matching resolves renamed nested fields and a reordered leaf.
+            let (inner_name, value_name) = match mode {
+                FieldMatchMode::Name => ("inner", "value"),
+                FieldMatchMode::Id => ("renamed_inner", "renamed_value"),
+            };
+            let leaf_fields = Fields::from(vec![
+                Field::new("sibling", DataType::Int32, true).with_metadata(metadata(4)),
+                Field::new(value_name, DataType::Int32, true).with_metadata(metadata(3)),
+            ]);
+            let inner = StructArray::new(
+                leaf_fields.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![999; 4])),
+                    Arc::new(Int32Array::from(vec![Some(19), Some(29), Some(39), None])),
+                ],
+                Some(NullBuffer::from(vec![true, false, true, true])),
+            );
+            let outer_fields = Fields::from(vec![
+                Field::new(inner_name, DataType::Struct(leaf_fields), true)
+                    .with_metadata(metadata(2)),
+            ]);
+            let outer = StructArray::new(
+                outer_fields.clone(),
+                vec![Arc::new(inner)],
+                Some(NullBuffer::from(vec![true, true, false, true])),
+            );
+            let batch = RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![
+                    Field::new("unrelated", DataType::Int32, false).with_metadata(metadata(5)),
+                    Field::new("event", DataType::Struct(outer_fields), true)
+                        .with_metadata(metadata(1)),
+                ])),
+                vec![Arc::new(Int32Array::from(vec![99; 4])), Arc::new(outer)],
+            )
+            .unwrap();
+            let result = optimize_partition_projection(
+                batch,
+                vec![
+                    (
+                        Arc::new(Column::new("unrelated", 0)),
+                        "unrelated".to_string(),
+                    ),
+                    (Arc::new(Column::new("event", 1)), "payload".to_string()),
+                ],
+                &table_schema,
+                spec.clone(),
+                mode,
+            )
+            .await;
+            let partitions = Array::as_any(result[0].column(0).as_ref())
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            let values = Array::as_any(partitions.column(0).as_ref())
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            assert_eq!(values.iter().collect::<Vec<_>>(), vec![
+                Some(10),
+                None,
+                None,
+                None
+            ]);
+        }
+    }
+
+    #[test]
+    fn test_partition_expr_replacement_identity() {
+        use std::collections::HashSet;
+
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap();
+        let spec = Arc::new(
+            PartitionSpec::builder(Arc::new(schema.clone()))
+                .add_partition_field("id", "id", Transform::Identity)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        let calculator = PartitionValueCalculator::try_new(&spec, &schema).unwrap();
+        let expr = Arc::new(
+            PartitionExpr::try_new(
+                calculator,
+                spec,
+                Arc::new(schema_to_arrow_schema(&schema).unwrap()),
+            )
+            .unwrap(),
+        );
+        assert!(expr.clone().with_new_children(vec![]).is_err());
+        assert!(
+            expr.clone()
+                .with_new_children(vec![expr.inputs[0].clone(); 2])
+                .is_err()
+        );
+        let unchanged = expr.clone().with_new_children(expr.inputs.clone()).unwrap();
+        let rewritten = expr
+            .clone()
+            .with_new_children(vec![Arc::new(Literal::new(ScalarValue::Int32(Some(42))))])
+            .unwrap();
+        let original: Arc<dyn PhysicalExpr> = expr;
+        assert!(original.eq(&unchanged));
+        assert!(!original.eq(&rewritten));
+        let mut expressions = HashSet::new();
+        expressions.insert(original);
+        expressions.insert(unchanged);
+        expressions.insert(rewritten);
+        assert_eq!(expressions.len(), 2);
     }
 
     fn extract_c_day_partitions(batches: &[RecordBatch]) -> Vec<i32> {

@@ -229,6 +229,11 @@ impl RecordBatchProjector {
         Ok(None)
     }
 
+    /// Index paths in leaf-to-root order for each projected field.
+    pub(crate) fn field_indices(&self) -> &[Vec<usize>] {
+        &self.field_indices
+    }
+
     /// Return the reference of projected schema
     pub(crate) fn projected_schema_ref(&self) -> &SchemaRef {
         &self.projected_schema
