@@ -57,7 +57,7 @@ use crate::{Error, ErrorKind};
 pub struct RowDeltaAction {
     added_delete_files: Vec<DataFile>,
     ids: CommitIds,
-    key_metadata: Option<Vec<u8>>,
+
     snapshot_properties: HashMap<String, String>,
     manifest_read_concurrency: usize,
     manifest_write_concurrency: usize,
@@ -70,7 +70,7 @@ impl RowDeltaAction {
         Self {
             added_delete_files: vec![],
             ids: CommitIds::new(),
-            key_metadata: None,
+
             snapshot_properties: HashMap::default(),
             manifest_read_concurrency: num_cpus,
             manifest_write_concurrency: std::cmp::max(1, num_cpus / 4),
@@ -81,12 +81,6 @@ impl RowDeltaAction {
     /// Add equality-delete or position-delete files to this snapshot.
     pub fn add_delete_files(mut self, files: impl IntoIterator<Item = DataFile>) -> Self {
         self.added_delete_files.extend(files);
-        self
-    }
-
-    /// Set key metadata for manifest files.
-    pub fn set_key_metadata(mut self, key_metadata: Vec<u8>) -> Self {
-        self.key_metadata = Some(key_metadata);
         self
     }
 
@@ -167,7 +161,6 @@ impl TransactionAction for RowDeltaAction {
             table,
             self.ids.snapshot_id(table),
             self.ids.commit_uuid(),
-            self.key_metadata.clone(),
             self.snapshot_properties.clone(),
             vec![],
         );
@@ -278,8 +271,9 @@ mod tests {
 
         assert_eq!(deletes_manifests.len(), 1, "expected one deletes manifest");
 
-        let manifest = deletes_manifests[0]
-            .load_manifest(table.file_io())
+        let manifest = table
+            .manifest_reader()
+            .read(deletes_manifests[0])
             .await
             .unwrap();
         assert_eq!(manifest.entries().len(), 1);

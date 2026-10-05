@@ -55,7 +55,7 @@ pub struct DeleteFilesAction {
     deleted_data_files: Vec<DataFile>,
     validate_files_exist: bool,
     ids: CommitIds,
-    key_metadata: Option<Vec<u8>>,
+
     snapshot_properties: HashMap<String, String>,
     manifest_read_concurrency: usize,
     manifest_write_concurrency: usize,
@@ -69,7 +69,7 @@ impl DeleteFilesAction {
             deleted_data_files: vec![],
             validate_files_exist: false,
             ids: CommitIds::new(),
-            key_metadata: None,
+
             snapshot_properties: HashMap::default(),
             manifest_read_concurrency: num_cpus,
             manifest_write_concurrency: std::cmp::max(1, num_cpus / 4),
@@ -95,12 +95,6 @@ impl DeleteFilesAction {
     /// Default: off (absent paths are silently ignored — Java `StreamingDelete` default).
     pub fn validate_files_exist(mut self) -> Self {
         self.validate_files_exist = true;
-        self
-    }
-
-    /// Set key metadata for manifest files.
-    pub fn set_key_metadata(mut self, key_metadata: Vec<u8>) -> Self {
-        self.key_metadata = Some(key_metadata);
         self
     }
 
@@ -201,7 +195,6 @@ impl TransactionAction for DeleteFilesAction {
             table,
             self.ids.snapshot_id(table),
             self.ids.commit_uuid(),
-            self.key_metadata.clone(),
             self.snapshot_properties.clone(),
             vec![],
         );

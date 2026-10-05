@@ -54,7 +54,7 @@ use crate::{Error, ErrorKind};
 /// `MergingSnapshotProducer`.
 pub struct RewriteFilesAction {
     ids: CommitIds,
-    key_metadata: Option<Vec<u8>>,
+
     snapshot_properties: HashMap<String, String>,
     files_to_delete: Vec<DataFile>,
     files_to_add: Vec<DataFile>,
@@ -77,7 +77,7 @@ impl RewriteFilesAction {
         let num_cpus = available_parallelism().get();
         Self {
             ids: CommitIds::new(),
-            key_metadata: None,
+
             snapshot_properties: HashMap::default(),
             files_to_delete: vec![],
             files_to_add: vec![],
@@ -123,12 +123,6 @@ impl RewriteFilesAction {
     /// Add files to add (new files replacing old ones).
     pub fn add_files(mut self, files: impl IntoIterator<Item = DataFile>) -> Self {
         self.files_to_add.extend(files);
-        self
-    }
-
-    /// Set key metadata for manifest files.
-    pub fn set_key_metadata(mut self, key_metadata: Vec<u8>) -> Self {
-        self.key_metadata = Some(key_metadata);
         self
     }
 
@@ -186,7 +180,6 @@ impl TransactionAction for RewriteFilesAction {
             table,
             self.ids.snapshot_id(table),
             self.ids.commit_uuid(),
-            self.key_metadata.clone(),
             self.snapshot_properties.clone(),
             self.files_to_add.clone(),
         )
@@ -445,8 +438,9 @@ mod tests {
         let mut added_files: Vec<String> = Vec::new();
         let mut deleted_files: Vec<String> = Vec::new();
         for entry in manifest_list.entries() {
-            let manifest = entry
-                .load_manifest(table_with_files.file_io())
+            let manifest = table_with_files
+                .manifest_reader()
+                .read(entry)
                 .await
                 .unwrap();
             for me in manifest.entries() {
@@ -633,7 +627,7 @@ mod tests {
             .unwrap();
         let mut existing_entries: Vec<(String, Option<i64>)> = Vec::new();
         for mf in manifest_list.entries() {
-            let manifest = mf.load_manifest(table_with_files.file_io()).await.unwrap();
+            let manifest = table_with_files.manifest_reader().read(mf).await.unwrap();
             for me in manifest.entries() {
                 if me.is_alive() && me.status() == ManifestStatus::Existing {
                     existing_entries.push((me.file_path().to_string(), me.sequence_number()));
@@ -855,7 +849,7 @@ mod tests {
 
         let mut found = false;
         for entry in manifest_list.entries() {
-            let manifest = entry.load_manifest(table1.file_io()).await.unwrap();
+            let manifest = table1.manifest_reader().read(entry).await.unwrap();
             for me in manifest.entries() {
                 if matches!(me.status(), ManifestStatus::Added) {
                     assert_eq!(me.sequence_number(), Some(custom_seq));
@@ -1134,7 +1128,7 @@ mod tests {
         let manifest_list = table.manifest_list_reader(snap).load().await.unwrap();
         let mut found = None;
         for ml in manifest_list.entries() {
-            let manifest = ml.load_manifest(table.file_io()).await.unwrap();
+            let manifest = table.manifest_reader().read(ml).await.unwrap();
             for entry in manifest.entries() {
                 if entry.file_path() == stays_alive.file_path && entry.is_alive() {
                     found = entry.sequence_number();

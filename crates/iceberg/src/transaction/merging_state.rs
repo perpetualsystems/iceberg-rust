@@ -29,12 +29,12 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::spec::{DataFile, ManifestFile, TableProperties, parse_property};
+use crate::Result;
+use crate::spec::{DataFile, ManifestFile};
 use crate::table::Table;
 use crate::transaction::manifest_filter::ManifestFilterManager;
 use crate::transaction::manifest_merge::ManifestMergeManager;
 use crate::transaction::snapshot::{ManifestProcess, SnapshotProducer};
-use crate::{Error, ErrorKind, Result};
 
 pub(crate) struct MergingState {
     data_filter: ManifestFilterManager,
@@ -50,31 +50,10 @@ impl MergingState {
         manifest_read_concurrency: usize,
         manifest_write_concurrency: usize,
     ) -> Result<Self> {
-        let props = table.metadata().properties();
-        let target_size_bytes = parse_property(
-            props,
-            TableProperties::PROPERTY_COMMIT_MANIFEST_TARGET_SIZE_BYTES,
-            TableProperties::PROPERTY_COMMIT_MANIFEST_TARGET_SIZE_BYTES_DEFAULT,
-        )
-        .map_err(|e| {
-            Error::new(ErrorKind::DataInvalid, "Invalid manifest merge property").with_source(e)
-        })?;
-        let min_count_to_merge = parse_property(
-            props,
-            TableProperties::PROPERTY_COMMIT_MANIFEST_MIN_MERGE_COUNT,
-            TableProperties::PROPERTY_COMMIT_MANIFEST_MIN_MERGE_COUNT_DEFAULT,
-        )
-        .map_err(|e| {
-            Error::new(ErrorKind::DataInvalid, "Invalid manifest merge property").with_source(e)
-        })?;
-        let merge_enabled = parse_property(
-            props,
-            TableProperties::PROPERTY_COMMIT_MANIFEST_MERGE_ENABLED,
-            TableProperties::PROPERTY_COMMIT_MANIFEST_MERGE_ENABLED_DEFAULT,
-        )
-        .map_err(|e| {
-            Error::new(ErrorKind::DataInvalid, "Invalid manifest merge property").with_source(e)
-        })?;
+        let props = table.metadata().table_properties();
+        let target_size_bytes = props.commit_manifest_target_size_bytes()?;
+        let min_count_to_merge = props.commit_manifest_min_merge_count()?;
+        let merge_enabled = props.commit_manifest_merge_enabled()?;
 
         Ok(Self {
             data_filter: ManifestFilterManager::new(manifest_read_concurrency),

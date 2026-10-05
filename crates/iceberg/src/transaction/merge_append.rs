@@ -46,7 +46,7 @@ use crate::{Error, ErrorKind};
 pub struct MergeAppendAction {
     added_data_files: Vec<DataFile>,
     ids: CommitIds,
-    key_metadata: Option<Vec<u8>>,
+
     snapshot_properties: HashMap<String, String>,
     manifest_read_concurrency: usize,
     manifest_write_concurrency: usize,
@@ -60,7 +60,7 @@ impl MergeAppendAction {
         Self {
             added_data_files: vec![],
             ids: CommitIds::new(),
-            key_metadata: None,
+
             snapshot_properties: HashMap::default(),
             manifest_read_concurrency: num_cpus,
             manifest_write_concurrency: std::cmp::max(1, num_cpus / 4),
@@ -83,12 +83,6 @@ impl MergeAppendAction {
     /// Override the number of manifest bins written concurrently during the merge pass.
     pub fn with_manifest_write_concurrency(mut self, n: usize) -> Self {
         self.manifest_write_concurrency = std::cmp::max(1, n);
-        self
-    }
-
-    /// Set key metadata for manifest files.
-    pub fn set_key_metadata(mut self, key_metadata: Vec<u8>) -> Self {
-        self.key_metadata = Some(key_metadata);
         self
     }
 
@@ -124,7 +118,6 @@ impl TransactionAction for MergeAppendAction {
             table,
             self.ids.snapshot_id(table),
             self.ids.commit_uuid(),
-            self.key_metadata.clone(),
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
         );
@@ -313,8 +306,9 @@ mod tests {
 
         let snap = table.metadata().current_snapshot().unwrap();
         let ml = table.manifest_list_reader(snap).load().await.unwrap();
-        let manifest = ml.entries()[0]
-            .load_manifest(table.file_io())
+        let manifest = table
+            .manifest_reader()
+            .read(&ml.entries()[0])
             .await
             .unwrap();
         let paths: Vec<&str> = manifest.entries().iter().map(|e| e.file_path()).collect();
@@ -748,7 +742,7 @@ mod tests {
         let ml = table.manifest_list_reader(snap).load().await.unwrap();
         let mut prior_tombstones = 0u64;
         for entry in ml.entries() {
-            let manifest = entry.load_manifest(table.file_io()).await.unwrap();
+            let manifest = table.manifest_reader().read(entry).await.unwrap();
             for me in manifest.entries() {
                 if me.status() == ManifestStatus::Deleted
                     && me.snapshot_id() != Some(current_snap_id)
@@ -774,8 +768,9 @@ mod tests {
         let snap = table.metadata().current_snapshot().unwrap();
         let expected_seq = snap.sequence_number();
         let ml = table.manifest_list_reader(snap).load().await.unwrap();
-        let manifest = ml.entries()[0]
-            .load_manifest(table.file_io())
+        let manifest = table
+            .manifest_reader()
+            .read(&ml.entries()[0])
             .await
             .unwrap();
         let entry = &manifest.entries()[0];

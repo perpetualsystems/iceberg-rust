@@ -19,6 +19,8 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::RangeFrom;
 
+use futures::TryStreamExt;
+use futures::stream::FuturesUnordered;
 use uuid::Uuid;
 
 use crate::error::Result;
@@ -26,14 +28,13 @@ use crate::spec::snapshot_summary::{MANIFESTS_CREATED, MANIFESTS_KEPT, MANIFESTS
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType,
     ManifestEntry, ManifestFile, ManifestListWriter, ManifestWriter, ManifestWriterBuilder,
-    Operation, Snapshot, SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Struct,
-    StructType, Summary, TableProperties, update_snapshot_summaries,
+    Operation, PartitionSpec, Snapshot, SnapshotReference, SnapshotRetention,
+    SnapshotSummaryCollector, Struct, StructType, Summary, TableProperties,
+    update_snapshot_summaries,
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
-
-pub(crate) const META_ROOT_PATH: &str = "metadata";
 
 pub(crate) struct CommitResult {
     pub commit: ActionCommit,
@@ -180,7 +181,6 @@ pub(crate) struct SnapshotProducer<'a> {
     pub(crate) table: &'a Table,
     snapshot_id: i64,
     commit_uuid: Uuid,
-    key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
     removed_data_files: Vec<DataFile>,
@@ -200,7 +200,6 @@ impl<'a> SnapshotProducer<'a> {
         table: &'a Table,
         snapshot_id: i64,
         commit_uuid: Uuid,
-        key_metadata: Option<Vec<u8>>,
         snapshot_properties: HashMap<String, String>,
         added_data_files: Vec<DataFile>,
     ) -> Self {
@@ -208,7 +207,6 @@ impl<'a> SnapshotProducer<'a> {
             table,
             snapshot_id,
             commit_uuid,
-            key_metadata,
             snapshot_properties,
             added_data_files,
             removed_data_files: vec![],
@@ -237,7 +235,7 @@ impl<'a> SnapshotProducer<'a> {
 
     pub(crate) fn validate_added_data_files(&self) -> Result<()> {
         for data_file in &self.added_data_files {
-            if data_file.content_type() != crate::spec::DataContentType::Data {
+            if data_file.content_type() != DataContentType::Data {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     "Only data content type is allowed for fast append",
@@ -382,33 +380,43 @@ impl<'a> SnapshotProducer<'a> {
     }
 
     pub(crate) async fn validate_duplicate_files(&self) -> Result<()> {
+        let Some(current_snapshot) = self.table.metadata().current_snapshot() else {
+            return Ok(());
+        };
+
         let new_files: HashSet<&str> = self
             .added_data_files
             .iter()
             .map(|df| df.file_path.as_str())
             .collect();
 
-        let mut referenced_files = Vec::new();
-        if let Some(current_snapshot) = self.table.metadata().current_snapshot() {
-            let manifest_list = self
-                .table
-                .manifest_list_reader(current_snapshot)
-                .load()
-                .await?;
-            for manifest_list_entry in manifest_list.entries() {
-                let manifest = self
-                    .table
-                    .object_cache()
-                    .get_manifest(manifest_list_entry)
-                    .await?;
-                for entry in manifest.entries() {
-                    let file_path = entry.file_path();
-                    if new_files.contains(file_path) && entry.is_alive() {
-                        referenced_files.push(file_path.to_string());
-                    }
-                }
-            }
-        }
+        let runtime = self.table.runtime();
+        let manifest_list = self
+            .table
+            .manifest_list_reader(current_snapshot)
+            .load()
+            .await?;
+
+        let new_files_ref = &new_files;
+        let referenced_files: Vec<String> = manifest_list
+            .consume_entries()
+            .into_iter()
+            .map(|entry| {
+                let reader = self.table.manifest_reader();
+                runtime.io().spawn(async move { reader.read(&entry).await })
+            })
+            .collect::<FuturesUnordered<_>>()
+            .try_fold(Vec::new(), |mut acc, manifest| async move {
+                acc.extend(
+                    manifest?
+                        .entries()
+                        .iter()
+                        .filter(|e| new_files_ref.contains(e.file_path()) && e.is_alive())
+                        .map(|e| e.file_path().to_string()),
+                );
+                Ok(acc)
+            })
+            .await?;
 
         if !referenced_files.is_empty() {
             return Err(Error::new(
@@ -499,24 +507,20 @@ impl<'a> SnapshotProducer<'a> {
 
     fn new_manifest_writer(&mut self, content: ManifestContentType) -> Result<ManifestWriter> {
         let new_manifest_path = format!(
-            "{}/{}/{}-m{}.{}",
-            self.table.metadata().location(),
-            META_ROOT_PATH,
+            "{}/{}-m{}.{}",
+            self.table.metadata().metadata_location()?,
             self.commit_uuid,
             self.manifest_counter.next().unwrap(),
             DataFileFormat::Avro
         );
-        let output_file = self.table.file_io().new_output(new_manifest_path)?;
-        let builder = ManifestWriterBuilder::new(
-            output_file,
-            Some(self.snapshot_id),
-            self.table.metadata().current_schema().clone(),
-            self.table
-                .metadata()
-                .default_partition_spec()
-                .as_ref()
-                .clone(),
-        );
+        let partition_spec = self
+            .table
+            .metadata()
+            .default_partition_spec()
+            .as_ref()
+            .clone();
+        let builder = self.manifest_writer_builder(&new_manifest_path, partition_spec)?;
+
         match self.table.metadata().format_version() {
             FormatVersion::V1 => Ok(builder.build_v1()),
             FormatVersion::V2 => match content {
@@ -527,6 +531,30 @@ impl<'a> SnapshotProducer<'a> {
                 ManifestContentType::Data => Ok(builder.build_v3_data()),
                 ManifestContentType::Deletes => Ok(builder.build_v3_deletes()),
             },
+        }
+    }
+
+    /// Build a manifest writer using the table's encryption configuration.
+    pub(crate) fn manifest_writer_builder(
+        &self,
+        path: &str,
+        partition_spec: PartitionSpec,
+    ) -> Result<ManifestWriterBuilder> {
+        let output_file = self.table.file_io().new_output(path)?;
+        let schema = self.table.metadata().current_schema().clone();
+        match self.table.encryption_manager() {
+            Some(em) => ManifestWriterBuilder::new_from_encrypted(
+                em.encrypt(output_file),
+                Some(self.snapshot_id),
+                schema,
+                partition_spec,
+            ),
+            None => Ok(ManifestWriterBuilder::new(
+                output_file,
+                Some(self.snapshot_id),
+                schema,
+                partition_spec,
+            )),
         }
     }
 
@@ -731,16 +759,15 @@ impl<'a> SnapshotProducer<'a> {
         )
     }
 
-    fn generate_manifest_list_file_path(&self, attempt: i64) -> String {
-        format!(
-            "{}/{}/snap-{}-{}-{}.{}",
-            self.table.metadata().location(),
-            META_ROOT_PATH,
+    fn generate_manifest_list_file_path(&self, attempt: i64) -> Result<String> {
+        Ok(format!(
+            "{}/snap-{}-{}-{}.{}",
+            self.table.metadata().metadata_location()?,
             self.snapshot_id,
             attempt,
             self.commit_uuid,
             DataFileFormat::Avro
-        )
+        ))
     }
 
     /// Finished building the action and return the [`ActionCommit`] to the transaction
@@ -750,43 +777,38 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_produce_operation: OP,
         process: MP,
     ) -> Result<CommitResult> {
-        if self.key_metadata.is_some() {
-            return Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                "Writing encrypted manifests is not yet supported",
-            ));
-        }
-        let manifest_list_path = self.generate_manifest_list_file_path(0);
+        let manifest_list_path = self.generate_manifest_list_file_path(0)?;
         let next_seq_num = self.table.metadata().next_sequence_number();
         let first_row_id = self.table.metadata().next_row_id();
+
+        let raw_output = self
+            .table
+            .file_io()
+            .new_output(manifest_list_path.clone())?;
+
+        let (writer, encryption_key_id) = match self.table.encryption_manager() {
+            Some(em) => {
+                let encrypted_output = em.encrypt(raw_output);
+                let key_id = em
+                    .encrypt_manifest_list_key_metadata(encrypted_output.key_metadata())
+                    .await?;
+                (encrypted_output.writer().await?, Some(key_id))
+            }
+            None => (raw_output.writer().await?, None),
+        };
+
+        let parent_snapshot_id = self.table.metadata().current_snapshot_id();
         let mut manifest_list_writer = match self.table.metadata().format_version() {
-            FormatVersion::V1 => ManifestListWriter::v1(
-                self.table
-                    .file_io()
-                    .new_output(manifest_list_path.clone())?
-                    .writer()
-                    .await?,
-                self.snapshot_id,
-                self.table.metadata().current_snapshot_id(),
-            ),
-            FormatVersion::V2 => ManifestListWriter::v2(
-                self.table
-                    .file_io()
-                    .new_output(manifest_list_path.clone())?
-                    .writer()
-                    .await?,
-                self.snapshot_id,
-                self.table.metadata().current_snapshot_id(),
-                next_seq_num,
-            ),
+            FormatVersion::V1 => {
+                ManifestListWriter::v1(writer, self.snapshot_id, parent_snapshot_id)
+            }
+            FormatVersion::V2 => {
+                ManifestListWriter::v2(writer, self.snapshot_id, parent_snapshot_id, next_seq_num)
+            }
             FormatVersion::V3 => ManifestListWriter::v3(
-                self.table
-                    .file_io()
-                    .new_output(manifest_list_path.clone())?
-                    .writer()
-                    .await?,
+                writer,
                 self.snapshot_id,
-                self.table.metadata().current_snapshot_id(),
+                parent_snapshot_id,
                 next_seq_num,
                 Some(first_row_id),
             ),
@@ -827,6 +849,7 @@ impl<'a> SnapshotProducer<'a> {
             .with_sequence_number(next_seq_num)
             .with_summary(summary)
             .with_schema_id(self.table.metadata().current_schema_id())
+            .with_encryption_key_id(encryption_key_id)
             .with_timestamp_ms(commit_ts);
 
         let new_snapshot = if let Some(writer_next_row_id) = writer_next_row_id {
@@ -838,7 +861,22 @@ impl<'a> SnapshotProducer<'a> {
             new_snapshot.build()
         };
 
-        let updates = vec![
+        let encryption_key_updates: Vec<TableUpdate> = self
+            .table
+            .encryption_manager()
+            .map(|em| {
+                em.with_encryption_keys(|keys| {
+                    keys.values()
+                        .filter(|k| self.table.metadata().encryption_key(k.key_id()).is_none())
+                        .map(|k| TableUpdate::AddEncryptionKey {
+                            encryption_key: k.clone(),
+                        })
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+
+        let updates = [encryption_key_updates, vec![
             TableUpdate::AddSnapshot {
                 snapshot: new_snapshot,
             },
@@ -849,7 +887,8 @@ impl<'a> SnapshotProducer<'a> {
                     SnapshotRetention::branch(None, None, None),
                 ),
             },
-        ];
+        ]]
+        .concat();
 
         let requirements = vec![
             TableRequirement::UuidMatch {
@@ -897,7 +936,6 @@ mod tests {
             &table,
             SnapshotProducer::generate_unique_snapshot_id(&table),
             Uuid::now_v7(),
-            None,
             HashMap::new(),
             vec![data_file(&table, "data/x.parquet")],
         );
@@ -917,7 +955,6 @@ mod tests {
             &table,
             SnapshotProducer::generate_unique_snapshot_id(&table),
             Uuid::now_v7(),
-            None,
             HashMap::new(),
             vec![data_file(&table, "data/x.parquet")],
         );
@@ -947,7 +984,6 @@ mod tests {
             &table,
             SnapshotProducer::generate_unique_snapshot_id(&table),
             Uuid::now_v7(),
-            None,
             HashMap::new(),
             vec![data_file(&table, "data/y.parquet")],
         );
@@ -979,7 +1015,6 @@ mod tests {
             &table,
             SnapshotProducer::generate_unique_snapshot_id(&table),
             Uuid::now_v7(),
-            None,
             HashMap::new(),
             vec![data_file(&table, "data/compacted.parquet")],
         )
@@ -1025,7 +1060,6 @@ mod tests {
             &table,
             SnapshotProducer::generate_unique_snapshot_id(&table),
             Uuid::now_v7(),
-            None,
             HashMap::new(),
             vec![data_file(&table, "data/compacted.parquet")],
         )
@@ -1094,7 +1128,6 @@ mod tests {
             &table,
             SnapshotProducer::generate_unique_snapshot_id(&table),
             Uuid::now_v7(),
-            None,
             HashMap::new(),
             vec![data_file(&table, "data/compacted.parquet")],
         )
@@ -1160,7 +1193,6 @@ mod tests {
             &table,
             SnapshotProducer::generate_unique_snapshot_id(&table),
             Uuid::now_v7(),
-            None,
             HashMap::new(),
             vec![data_file(&table, "data/compacted.parquet")],
         )
@@ -1228,7 +1260,6 @@ mod tests {
             &table,
             SnapshotProducer::generate_unique_snapshot_id(&table),
             Uuid::now_v7(),
-            None,
             HashMap::new(),
             vec![data_file(&table, "data/compacted.parquet")],
         )
@@ -1286,7 +1317,6 @@ mod tests {
             &table,
             SnapshotProducer::generate_unique_snapshot_id(&table),
             Uuid::now_v7(),
-            None,
             HashMap::new(),
             vec![data_file(&table, "data/compacted.parquet")],
         )
@@ -1305,5 +1335,91 @@ mod tests {
         // (This shouldn't happen via RewriteFilesAction, but we test the validator's internal logic)
         // Currently SnapshotProducer doesn't expose a way to set ignore_equality_deletes directly,
         // but it's derived from data_sequence_number.is_some().
+    }
+
+    #[tokio::test]
+    async fn encrypted_rewrite_preserves_survivors_with_and_without_manifest_merging() {
+        for merge_enabled in [false, true] {
+            let table = crate::test_utils::make_encrypted_table().await;
+            let tx = Transaction::new(&table);
+            let updates = Arc::new(
+                tx.update_table_properties()
+                    .set(
+                        TableProperties::PROPERTY_COMMIT_MANIFEST_MERGE_ENABLED.to_string(),
+                        merge_enabled.to_string(),
+                    )
+                    .set(
+                        TableProperties::PROPERTY_COMMIT_MANIFEST_MIN_MERGE_COUNT.to_string(),
+                        "1".to_string(),
+                    ),
+            )
+            .commit(&table)
+            .await
+            .unwrap()
+            .take_updates();
+            let table = apply_updates_to_table(&table, &updates);
+            let file = |name: &str| {
+                DataFileBuilder::default()
+                    .content(DataContentType::Data)
+                    .file_path(format!("memory:///table/data/{name}.parquet"))
+                    .file_format(DataFileFormat::Parquet)
+                    .partition(Struct::empty())
+                    .record_count(100)
+                    .file_size_in_bytes(4096)
+                    .partition_spec_id(table.metadata().default_partition_spec_id())
+                    .build()
+                    .unwrap()
+            };
+            let replaced = file("old");
+            let survivor = file("keep");
+            let replacement = file("new");
+            let tx = Transaction::new(&table);
+            let updates = Arc::new(
+                tx.merge_append()
+                    .add_data_files([replaced.clone(), survivor.clone()]),
+            )
+            .commit(&table)
+            .await
+            .unwrap()
+            .take_updates();
+            let table = apply_updates_to_table(&table, &updates);
+            let tx = Transaction::new(&table);
+            let updates = Arc::new(
+                tx.rewrite_files()
+                    .delete_files([replaced])
+                    .add_files([replacement.clone()]),
+            )
+            .commit(&table)
+            .await
+            .unwrap()
+            .take_updates();
+            let table = apply_updates_to_table(&table, &updates);
+            let snapshot = table.metadata().current_snapshot().unwrap();
+            assert!(snapshot.encryption_key_id().is_some());
+            let manifests = table.manifest_list_reader(snapshot).load().await.unwrap();
+            assert_eq!(manifests.entries().len(), if merge_enabled { 1 } else { 2 });
+            let mut paths = Vec::new();
+            for manifest in manifests.entries() {
+                assert!(
+                    manifest.key_metadata.is_some(),
+                    "maintenance must preserve encryption"
+                );
+                let decoded = table.manifest_reader().read(manifest).await.unwrap();
+                paths.extend(
+                    decoded
+                        .entries()
+                        .iter()
+                        .filter(|entry| entry.is_alive())
+                        .map(|entry| entry.file_path().to_string()),
+                );
+            }
+            paths.sort();
+            let mut expected = vec![
+                survivor.file_path().to_string(),
+                replacement.file_path().to_string(),
+            ];
+            expected.sort();
+            assert_eq!(paths, expected);
+        }
     }
 }

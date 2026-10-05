@@ -34,9 +34,8 @@ use tracing::warn;
 use crate::Result;
 use crate::spec::{
     DataFileFormat, FormatVersion, Manifest, ManifestContentType, ManifestEntry, ManifestFile,
-    ManifestWriterBuilder,
 };
-use crate::transaction::snapshot::{META_ROOT_PATH, SnapshotProducer};
+use crate::transaction::snapshot::SnapshotProducer;
 
 pub(crate) struct ManifestFilterManager {
     deleted_paths: Mutex<HashSet<String>>,
@@ -211,9 +210,7 @@ async fn write_residual(
     source: &ManifestFile,
     survivors: &[&ManifestEntry],
 ) -> Result<ManifestFile> {
-    let file_io = producer.table.file_io();
     let metadata = producer.table.metadata();
-    let schema = metadata.current_schema().clone();
     let spec = metadata
         .partition_spec_by_id(source.partition_spec_id)
         .ok_or_else(|| {
@@ -232,17 +229,14 @@ async fn write_residual(
     // Stable per-source suffix so retries reproduce the same path and the cache
     // can short-circuit. `commit_uuid` keeps paths from colliding across actions.
     let path = format!(
-        "{location}/{root}/{uuid}-residual-{suffix}.{ext}",
-        location = metadata.location(),
-        root = META_ROOT_PATH,
+        "{location}/{uuid}-residual-{suffix}.{ext}",
+        location = metadata.metadata_location()?,
         uuid = producer.commit_uuid(),
         suffix = residual_suffix(&source.manifest_path),
         ext = DataFileFormat::Avro,
     );
 
-    let output_file = file_io.new_output(path)?;
-    let builder =
-        ManifestWriterBuilder::new(output_file, Some(producer.snapshot_id()), schema, spec);
+    let builder = producer.manifest_writer_builder(&path, spec)?;
     let mut writer = match (fmt, source.content) {
         (FormatVersion::V1, _) => builder.build_v1(),
         (FormatVersion::V2, ManifestContentType::Data) => builder.build_v2_data(),

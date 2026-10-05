@@ -29,11 +29,11 @@ use crate::spec::snapshot_summary::{
 };
 use crate::spec::{
     DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestEntry, ManifestFile,
-    ManifestWriterBuilder, Operation, Struct,
+    Operation, Struct,
 };
 use crate::table::Table;
 use crate::transaction::snapshot::{
-    DefaultManifestProcess, META_ROOT_PATH, SnapshotProduceOperation, SnapshotProducer,
+    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
 
@@ -43,7 +43,7 @@ use crate::transaction::{ActionCommit, TransactionAction};
 /// Returns an empty `ActionCommit` when there are no cross-partition manifests to rewrite.
 pub struct RewriteManifestsAction {
     commit_uuid: Option<Uuid>,
-    key_metadata: Option<Vec<u8>>,
+
     snapshot_properties: HashMap<String, String>,
 }
 
@@ -51,7 +51,7 @@ impl RewriteManifestsAction {
     pub(crate) fn new() -> Self {
         Self {
             commit_uuid: None,
-            key_metadata: None,
+
             snapshot_properties: HashMap::default(),
         }
     }
@@ -59,12 +59,6 @@ impl RewriteManifestsAction {
     /// Set commit UUID for the snapshot.
     pub fn set_commit_uuid(mut self, commit_uuid: Uuid) -> Self {
         self.commit_uuid = Some(commit_uuid);
-        self
-    }
-
-    /// Set key metadata for manifest files.
-    pub fn set_key_metadata(mut self, key_metadata: Vec<u8>) -> Self {
-        self.key_metadata = Some(key_metadata);
         self
     }
 
@@ -116,8 +110,12 @@ impl TransactionAction for RewriteManifestsAction {
         kept_manifests.extend(delete_mfs.into_iter().cloned());
 
         // Load all DATA manifests in parallel.
-        let loaded_manifests =
-            try_join_all(data_mfs.iter().map(|mf| mf.load_manifest(table.file_io()))).await?;
+        let loaded_manifests = try_join_all(
+            data_mfs
+                .iter()
+                .map(|mf| async move { table.manifest_reader().read(mf).await }),
+        )
+        .await?;
 
         for (manifest_file, manifest) in data_mfs.iter().zip(loaded_manifests.iter()) {
             // Collect alive entries with inherited fields resolved.
@@ -186,25 +184,20 @@ impl TransactionAction for RewriteManifestsAction {
         snapshot_properties.insert(MANIFESTS_KEPT.to_string(), manifests_kept.to_string());
         snapshot_properties.insert(ENTRIES_PROCESSED.to_string(), entries_processed.to_string());
 
-        // Construct SnapshotProducer first so we can read the generated snapshot_id.
-        // The snapshot_id is needed as added_snapshot_id in the new manifest files so
-        // that ManifestListWriter::assign_sequence_numbers passes for V2/V3.
+        // Share the snapshot ID with manifest writers so V2/V3 sequence-number
+        // inheritance recognizes the manifests as part of this commit.
         let snapshot_producer = SnapshotProducer::new(
             table,
             SnapshotProducer::generate_unique_snapshot_id(table),
             commit_uuid,
-            self.key_metadata.clone(),
             snapshot_properties,
             vec![], // no new data files — metadata-only operation
         );
-        let new_snapshot_id = snapshot_producer.snapshot_id();
 
         // Write one new manifest per partition group, all in parallel.
-        let file_io = table.file_io().clone();
-        let schema = table.metadata().current_schema().clone();
         let partition_spec = table.metadata().default_partition_spec().as_ref().clone();
         let format_version = table.metadata().format_version();
-        let location = table.metadata().location().to_string();
+        let location = table.metadata().metadata_location()?;
 
         // Sort partition groups by the lexicographically smallest file path they contain.
         // This makes the counter → manifest path mapping deterministic across repeated runs
@@ -231,24 +224,16 @@ impl TransactionAction for RewriteManifestsAction {
                 .enumerate()
                 .map(|(i, (_, entries))| {
                     let path = format!(
-                        "{}/{}/{}-rewrite-m{}.{}",
+                        "{}/{}-rewrite-m{}.{}",
                         location,
-                        META_ROOT_PATH,
                         commit_uuid,
                         i,
                         DataFileFormat::Avro,
                     );
-                    let file_io = file_io.clone();
-                    let schema = schema.clone();
+                    let producer = &snapshot_producer;
                     let partition_spec = partition_spec.clone();
                     async move {
-                        let output_file = file_io.new_output(path)?;
-                        let builder = ManifestWriterBuilder::new(
-                            output_file,
-                            Some(new_snapshot_id),
-                            schema,
-                            partition_spec,
-                        );
+                        let builder = producer.manifest_writer_builder(&path, partition_spec)?;
                         let mut writer = match format_version {
                             FormatVersion::V1 => builder.build_v1(),
                             FormatVersion::V2 => builder.build_v2_data(),
@@ -439,7 +424,7 @@ mod tests {
         // Count alive entries in the new manifests and compare with original.
         let mut total_alive = 0usize;
         for mf in manifest_list.entries() {
-            let manifest = mf.load_manifest(table.file_io()).await.unwrap();
+            let manifest = table.manifest_reader().read(mf).await.unwrap();
             for entry in manifest.entries() {
                 if entry.is_alive() {
                     total_alive += 1;
@@ -481,7 +466,7 @@ mod tests {
             .unwrap();
 
         for mf in manifest_list.entries() {
-            let manifest = mf.load_manifest(table.file_io()).await.unwrap();
+            let manifest = table.manifest_reader().read(mf).await.unwrap();
             for entry in manifest.entries() {
                 assert_eq!(
                     entry.status,
@@ -514,7 +499,7 @@ mod tests {
 
         let mut orig_entries: Vec<ManifestEntry> = Vec::new();
         for mf in orig_manifest_list.entries() {
-            let manifest = mf.load_manifest(table.file_io()).await.unwrap();
+            let manifest = table.manifest_reader().read(mf).await.unwrap();
             for entry in manifest.entries() {
                 let mut e = (**entry).clone();
                 e.inherit_data(mf);
@@ -542,7 +527,7 @@ mod tests {
 
         let mut new_entries: Vec<ManifestEntry> = Vec::new();
         for mf in new_manifest_list.entries() {
-            let manifest = mf.load_manifest(table.file_io()).await.unwrap();
+            let manifest = table.manifest_reader().read(mf).await.unwrap();
             for entry in manifest.entries() {
                 new_entries.push((**entry).clone());
             }
@@ -678,7 +663,7 @@ mod tests {
             .unwrap();
 
         for mf in manifest_list.entries() {
-            let manifest = mf.load_manifest(table.file_io()).await.unwrap();
+            let manifest = table.manifest_reader().read(mf).await.unwrap();
             for entry in manifest.entries() {
                 assert_ne!(
                     entry.status,

@@ -37,9 +37,8 @@ use crate::Result;
 use crate::prptl_utils::bin_packing::ListPacker;
 use crate::spec::{
     DataFileFormat, FormatVersion, ManifestContentType, ManifestFile, ManifestStatus,
-    ManifestWriterBuilder,
 };
-use crate::transaction::snapshot::{META_ROOT_PATH, SnapshotProducer};
+use crate::transaction::snapshot::SnapshotProducer;
 
 pub(crate) struct ManifestMergeManager {
     target_size_bytes: u64,
@@ -167,7 +166,6 @@ impl ManifestMergeManager {
 
         let snap_id = producer.snapshot_id();
         let metadata = producer.table.metadata();
-        let file_io = producer.table.file_io();
         let object_cache = producer.table.object_cache();
 
         let spec = metadata
@@ -180,20 +178,17 @@ impl ManifestMergeManager {
             })?
             .as_ref()
             .clone();
-        let schema = metadata.current_schema().clone();
         let fmt = metadata.format_version();
 
         let path = format!(
-            "{location}/{root}/{uuid}-merge-{suffix}.{ext}",
-            location = metadata.location(),
-            root = META_ROOT_PATH,
+            "{location}/{uuid}-merge-{suffix}.{ext}",
+            location = metadata.metadata_location()?,
             uuid = producer.commit_uuid(),
             suffix = merge_suffix(&cache_key),
             ext = DataFileFormat::Avro,
         );
 
-        let output_file = file_io.new_output(&path)?;
-        let builder = ManifestWriterBuilder::new(output_file, Some(snap_id), schema, spec);
+        let builder = producer.manifest_writer_builder(&path, spec)?;
         // The merge never crosses content boundaries: data and delete manifests
         // get separate managers in Java, and only the data path is built here.
         let content = bin[0].content;
@@ -265,7 +260,7 @@ impl ManifestMergeManager {
     pub(crate) async fn clean_uncommitted(
         &self,
         file_io: &crate::io::FileIO,
-        committed_paths: &std::collections::HashSet<String>,
+        committed_paths: &HashSet<String>,
     ) {
         let entries: Vec<(Vec<String>, ManifestFile, u64)> = {
             let guard = self.cache.lock().expect("merge cache mutex");
