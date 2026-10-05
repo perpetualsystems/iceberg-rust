@@ -22,9 +22,10 @@ use datafusion::arrow::array::{Array, ArrayRef, RecordBatch, StringArray, UInt64
 use datafusion::arrow::datatypes::{
     DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
@@ -124,6 +125,13 @@ impl DisplayAs for IcebergCommitExec {
 }
 
 impl ExecutionPlan for IcebergCommitExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn name(&self) -> &str {
         "IcebergCommitExec"
     }
@@ -270,9 +278,10 @@ mod tests {
 
     use datafusion::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray, UInt64Array};
     use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use datafusion::common::tree_node::TreeNodeRecursion;
     use datafusion::datasource::MemTable;
     use datafusion::execution::context::TaskContext;
-    use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+    use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
     use datafusion::physical_plan::common::collect;
     use datafusion::physical_plan::execution_plan::Boundedness;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -322,6 +331,13 @@ mod tests {
     }
 
     impl ExecutionPlan for MockWriteExec {
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+        ) -> DFResult<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+
         fn name(&self) -> &str {
             "MockWriteExec"
         }
