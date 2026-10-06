@@ -81,8 +81,8 @@ impl ArrowReader {
                 Self::include_leaf_field_id(&map_type.key_field, field_ids);
                 Self::include_leaf_field_id(&map_type.value_field, field_ids);
             }
-            // Variant projection is rejected earlier (in `get_arrow_projection_mask`); this
-            // arm only keeps the match exhaustive. Treat it as a leaf, like a primitive.
+            // A Variant has no Iceberg field IDs on its Parquet storage leaves.
+            // Resolve its enclosing group's ID to all descendant leaves below.
             Type::Variant(_) => {
                 field_ids.push(field.id);
             }
@@ -122,19 +122,6 @@ impl ArrowReader {
 
         if field_ids.is_empty() {
             return Ok(ProjectionMask::all());
-        }
-
-        // Reading variant columns is not supported yet (see #2188 follow-ups): reject any
-        // projection that touches a variant, rather than returning a partial/incorrect batch.
-        for field_id in field_ids {
-            if let Some(field) = iceberg_schema_of_task.field_by_id(*field_id)
-                && type_contains_variant(&field.field_type)
-            {
-                return Err(Error::new(
-                    ErrorKind::FeatureUnsupported,
-                    "Reading variant columns is not supported yet",
-                ));
-            }
         }
 
         if use_fallback {
@@ -223,7 +210,12 @@ impl ArrowReader {
         // We only project existing columns; RecordBatchTransformer adds default/NULL values.
         let mut indices = vec![];
         for field_id in leaf_field_ids {
-            if let Some(col_idx) = column_map.get(field_id) {
+            if iceberg_schema_of_task
+                .field_by_id(*field_id)
+                .is_some_and(|field| field.field_type.is_variant())
+            {
+                indices.extend(variant_leaf_indices(parquet_schema, *field_id));
+            } else if let Some(col_idx) = column_map.get(field_id) {
                 indices.push(*col_idx);
             }
         }
@@ -265,21 +257,35 @@ impl ArrowReader {
     }
 }
 
-/// Whether `field_type` is, or transitively contains, a variant type.
-fn type_contains_variant(field_type: &Type) -> bool {
-    match field_type {
-        Type::Variant(_) => true,
-        Type::Struct(s) => s
-            .fields()
-            .iter()
-            .any(|f| type_contains_variant(&f.field_type)),
-        Type::List(l) => type_contains_variant(&l.element_field.field_type),
-        Type::Map(m) => {
-            type_contains_variant(&m.key_field.field_type)
-                || type_contains_variant(&m.value_field.field_type)
+/// Resolve an Iceberg Variant field ID on a Parquet group to all of its
+/// physical leaves. The metadata/value leaves intentionally have no IDs.
+fn variant_leaf_indices(parquet_schema: &SchemaDescriptor, field_id: i32) -> Vec<usize> {
+    fn collect(
+        field: &ParquetType,
+        field_id: i32,
+        next_leaf: &mut usize,
+        indices: &mut Vec<usize>,
+    ) {
+        let first_leaf = *next_leaf;
+        if field.is_primitive() {
+            *next_leaf += 1;
+        } else {
+            for child in field.get_fields() {
+                collect(child, field_id, next_leaf, indices);
+            }
+            let info = field.get_basic_info();
+            if info.has_id() && info.id() == field_id {
+                indices.extend(first_leaf..*next_leaf);
+            }
         }
-        Type::Primitive(_) => false,
     }
+
+    let mut next_leaf = 0;
+    let mut indices = Vec::new();
+    for field in parquet_schema.root_schema().get_fields() {
+        collect(field, field_id, &mut next_leaf, &mut indices);
+    }
+    indices
 }
 
 /// Build the map of parquet field id to Parquet column index in the schema.
@@ -687,9 +693,7 @@ message schema {
     }
 
     #[test]
-    fn test_arrow_projection_mask_variant_is_unsupported() {
-        // Reading variant columns is not supported yet: projecting one (top-level or
-        // nested) must fail loudly rather than return a partial/incorrect batch.
+    fn test_arrow_projection_mask_includes_variant_storage_leaves() {
         let schema = Arc::new(
             Schema::builder()
                 .with_schema_id(1)
@@ -704,40 +708,30 @@ message schema {
                         ])),
                     )
                     .into(),
-                    NestedField::required(
-                        5,
-                        "m",
-                        Type::Map(crate::spec::MapType::required(
-                            6,
-                            Type::Primitive(PrimitiveType::String),
-                            7,
-                            Type::Variant(VariantType),
-                        )),
-                    )
-                    .into(),
                 ])
                 .build()
                 .unwrap(),
         );
-        // The parquet/arrow schemas are irrelevant: the variant is rejected before they
-        // are consulted, so an empty descriptor is enough to drive the code path.
-        let parquet_schema = SchemaDescriptor::new(Arc::new(
-            parse_message_type("message schema { optional int32 id = 1; }").unwrap(),
-        ));
-        let arrow_schema = Arc::new(ArrowSchema::empty());
+        let arrow_schema = Arc::new(crate::arrow::schema_to_arrow_schema(&schema).unwrap());
+        let parquet_schema = parquet::arrow::ArrowSchemaConverter::new()
+            .convert(&arrow_schema)
+            .unwrap();
 
-        // 2 = top-level variant, 3 = struct containing a variant, 4 = the nested variant,
-        // 5 = map<string, variant>, plus a mix with a non-variant sibling.
-        for projected in [vec![2], vec![3], vec![4], vec![5], vec![1, 2]] {
-            let err = ArrowReader::get_arrow_projection_mask(
+        for (projected, leaves) in [
+            (vec![2], vec![1, 2]),
+            (vec![3], vec![3, 4]),
+            (vec![4], vec![3, 4]),
+            (vec![1, 2], vec![0, 1, 2]),
+        ] {
+            let mask = ArrowReader::get_arrow_projection_mask(
                 &projected,
                 &schema,
                 &parquet_schema,
                 &arrow_schema,
                 false,
             )
-            .expect_err("variant projection must be rejected");
-            assert_eq!(err.kind(), ErrorKind::FeatureUnsupported, "{err}");
+            .unwrap();
+            assert_eq!(mask, ProjectionMask::leaves(&parquet_schema, leaves));
         }
     }
 
