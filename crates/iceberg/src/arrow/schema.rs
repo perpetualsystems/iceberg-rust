@@ -769,12 +769,13 @@ impl SchemaVisitor for ToArrowSchemaConverter {
 
     fn variant(&mut self, _v: &VariantType) -> Result<ArrowSchemaOrFieldOrType> {
         // Variant is stored as a struct of two binary sub-fields (no field IDs on sub-fields).
-        // Uses Binary (not LargeBinary) matching the Parquet BINARY primitive directly.
+        // BinaryView matches Hamelin's Variant Arrow representation and still
+        // maps to Parquet BINARY.
         // `metadata` is always present; `value` is nullable, since in a shredded variant the
         // value may be absent. The enclosing field carries the `arrow.parquet.variant` extension type
         // (attached in `field`).
-        let metadata_field = Field::new("metadata", DataType::Binary, false);
-        let value_field = Field::new("value", DataType::Binary, true);
+        let metadata_field = Field::new("metadata", DataType::BinaryView, false);
+        let value_field = Field::new("value", DataType::BinaryView, true);
         Ok(ArrowSchemaOrFieldOrType::Type(DataType::Struct(
             vec![metadata_field, value_field].into(),
         )))
@@ -1828,8 +1829,8 @@ mod tests {
             Field::new(
                 "v",
                 DataType::Struct(Fields::from(vec![
-                    Field::new("metadata", DataType::Binary, false),
-                    Field::new("value", DataType::Binary, true),
+                    Field::new("metadata", DataType::BinaryView, false),
+                    Field::new("value", DataType::BinaryView, true),
                 ])),
                 true,
             )
@@ -2049,13 +2050,13 @@ mod tests {
     #[test]
     fn test_variant_type_to_arrow_type() {
         // Variant maps to a struct with a required `metadata` and a nullable `value` binary
-        // field, with no field ids on the sub-fields, matching the Parquet BINARY layout.
+        // field, with no field ids on the sub-fields. BinaryView maps to Parquet BINARY.
         let arrow_type = type_to_arrow_type(&Type::Variant(VariantType)).unwrap();
         assert_eq!(
             arrow_type,
             DataType::Struct(Fields::from(vec![
-                Field::new("metadata", DataType::Binary, false),
-                Field::new("value", DataType::Binary, true),
+                Field::new("metadata", DataType::BinaryView, false),
+                Field::new("value", DataType::BinaryView, true),
             ]))
         );
     }
@@ -2083,8 +2084,8 @@ mod tests {
         assert_eq!(
             field.data_type(),
             &DataType::Struct(Fields::from(vec![
-                Field::new("metadata", DataType::Binary, false),
-                Field::new("value", DataType::Binary, true),
+                Field::new("metadata", DataType::BinaryView, false),
+                Field::new("value", DataType::BinaryView, true),
             ]))
         );
     }

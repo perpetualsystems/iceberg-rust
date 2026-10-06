@@ -327,10 +327,9 @@ impl SchemaVisitor for IndexByParquetPathName {
     }
 
     fn variant(&mut self, _v: &VariantType) -> Result<Self::T> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Writing variant columns to Parquet is not supported yet",
-        ))
+        // A Variant is a Parquet group whose physical metadata/value leaves have
+        // no Iceberg field IDs. There are no primitive min/max metrics to collect.
+        Ok(())
     }
 }
 
@@ -811,9 +810,13 @@ mod tests {
     use futures::TryStreamExt;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
+    use parquet::basic::{BrotliLevel, Compression, GzipLevel, LogicalType, ZstdLevel};
     use parquet::file::statistics::ValueStatistics;
     use parquet::schema::types::ColumnPath;
+    use parquet_variant_compute::{
+        VariantArray, VariantArrayBuilder, VariantType as ArrowVariantType,
+    };
+    use parquet_variant_json::{JsonToVariant, VariantToJson};
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -983,9 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn test_index_by_parquet_path_variant_is_unsupported() {
-        // Writing variant columns to Parquet is not supported yet; indexing a schema that
-        // contains one must error rather than silently miss-map columns.
+    fn test_index_by_parquet_path_skips_variant_storage_leaves() {
         let schema = Schema::builder()
             .with_fields(vec![
                 NestedField::optional(1, "v", Type::Variant(VariantType)).into(),
@@ -993,8 +994,123 @@ mod tests {
             .build()
             .unwrap();
         let mut visitor = IndexByParquetPathName::new();
-        let err = visit_schema(&schema, &mut visitor).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported, "{err}");
+        visit_schema(&schema, &mut visitor).unwrap();
+        assert!(visitor.name_to_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_parquet_writer_variant_round_trip() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let file_io = FileIO::new_with_fs();
+        let file_path = temp_dir.path().join("variant.parquet");
+        let output = file_io.new_output(file_path.to_str().unwrap())?;
+        let iceberg_schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "payload", Type::Variant(VariantType)).into(),
+                ])
+                .build()?,
+        );
+
+        let mut values = VariantArrayBuilder::new(3);
+        values.append_json(r#"{"nested":[1,true,null]}"#)?;
+        values.append_null();
+        values.append_json("null")?;
+        let storage: StructArray = values.build().into();
+        // Hamelin makes the value child nullable even for unshredded input.
+        let storage = StructArray::new(
+            Fields::from(vec![
+                Field::new("metadata", DataType::BinaryView, false),
+                Field::new("value", DataType::BinaryView, true),
+            ]),
+            storage.columns().to_vec(),
+            storage.nulls().cloned(),
+        );
+        let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("payload", storage.data_type().clone(), true)
+                .with_metadata(HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "2".to_string(),
+                )]))
+                .with_extension_type(ArrowVariantType),
+        ]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(storage),
+        ])?;
+        let mut writer =
+            ParquetWriterBuilder::new(WriterProperties::default(), iceberg_schema.clone())
+                .build(output)
+                .await?;
+        writer.write(&batch).await?;
+        let files = writer.close().await?;
+        assert_eq!(files.len(), 1);
+
+        let raw = file_io
+            .new_input(file_path.to_str().unwrap())?
+            .read()
+            .await?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(raw)?;
+        let parquet_field = &reader.parquet_schema().root_schema().get_fields()[1];
+        assert!(matches!(
+            parquet_field.get_basic_info().logical_type_ref(),
+            Some(LogicalType::Variant { .. })
+        ));
+        assert_eq!(parquet_field.get_basic_info().id(), 2);
+        assert!(
+            parquet_field
+                .get_fields()
+                .iter()
+                .all(|child| !child.get_basic_info().has_id())
+        );
+
+        let batches: Vec<_> = reader.build()?.collect::<std::result::Result<_, _>>()?;
+        let read = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let read = VariantArray::try_new(read)?;
+        assert_eq!(
+            read.value(0).to_json_string()?,
+            r#"{"nested":[1,true,null]}"#
+        );
+        assert!(read.is_null(1));
+        assert_eq!(read.value(2).to_json_string()?, "null");
+
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(std::fs::metadata(&file_path)?.len())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(file_path.to_str().unwrap().to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(iceberg_schema)
+            .with_project_field_ids(vec![2])
+            .with_case_sensitive(false)
+            .build()?;
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let scan = ArrowReaderBuilder::new(file_io, Runtime::current()).build();
+        let projected: Vec<RecordBatch> = scan.read(tasks)?.stream().try_collect().await?;
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].num_columns(), 1);
+        let payload = projected[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let payload = VariantArray::try_new(payload)?;
+        assert_eq!(
+            payload.value(0).to_json_string()?,
+            r#"{"nested":[1,true,null]}"#
+        );
+        assert!(payload.is_null(1));
+        assert_eq!(payload.value(2).to_json_string()?, "null");
+        Ok(())
     }
 
     #[tokio::test]
