@@ -19,7 +19,7 @@
 
 pub(crate) mod _serde {
     use serde::de::Visitor;
-    use serde::ser::{SerializeMap, SerializeSeq, SerializeStruct};
+    use serde::ser::{SerializeMap, SerializeSeq};
     use serde::{Deserialize, Serialize};
     use serde_bytes::ByteBuf;
     use serde_derive::{Deserialize as DeserializeDerive, Serialize as SerializeDerive};
@@ -71,12 +71,16 @@ pub(crate) mod _serde {
         fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
         where S: serde::Serializer {
             let len = self.required.len() + self.optional.len();
-            let mut record = serializer.serialize_struct("", len)?;
+            // Struct field names must be static. These names come from the
+            // schema, so serialize borrowed map keys instead of leaking a new
+            // allocation for every field in every manifest entry. Avro schema
+            // resolution converts the map back into a record before writing.
+            let mut record = serializer.serialize_map(Some(len))?;
             for (k, v) in &self.required {
-                record.serialize_field(Box::leak(k.clone().into_boxed_str()), &v)?;
+                record.serialize_entry(k, v)?;
             }
             for (k, v) in &self.optional {
-                record.serialize_field(Box::leak(k.clone().into_boxed_str()), &v)?;
+                record.serialize_entry(k, v)?;
             }
             record.end()
         }
