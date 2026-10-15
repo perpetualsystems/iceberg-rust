@@ -22,6 +22,7 @@
 //! [`StorageFactory`] traits from the `iceberg` crate
 //! using [OpenDAL](https://opendal.apache.org/) as the backend.
 
+mod client;
 mod utils;
 
 use std::collections::HashMap;
@@ -31,6 +32,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use cfg_if::cfg_if;
+pub use client::ClientOptions;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use iceberg::io::{
@@ -115,6 +117,8 @@ pub use resolving::{OpenDalResolvingStorage, OpenDalResolvingStorageFactory};
 /// another process. Construct the factory without a custom loader before serializing it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum OpenDalStorageFactory {
+    /// A factory with HTTP client options, created by [`Self::with_client_options`].
+    WithClientOptions(Box<OpenDalStorageFactory>, ClientOptions),
     /// Memory storage factory.
     #[cfg(feature = "opendal-memory")]
     Memory,
@@ -161,9 +165,27 @@ where
 
 #[typetag::serde(name = "OpenDalStorageFactory")]
 impl StorageFactory for OpenDalStorageFactory {
-    #[allow(unused_variables)]
     fn build(&self, config: &StorageConfig) -> Result<Arc<dyn Storage>> {
+        Ok(self.build_storage(config)?)
+    }
+}
+
+impl OpenDalStorageFactory {
+    /// Configure a shared HTTP client. Factory clones reuse the same pool.
+    pub fn with_client_options(self, options: ClientOptions) -> Self {
         match self {
+            Self::WithClientOptions(factory, _) => Self::WithClientOptions(factory, options),
+            factory => Self::WithClientOptions(Box::new(factory), options),
+        }
+    }
+
+    // With no backend features, only the recursive options variant remains.
+    #[allow(unused_variables, unconditional_recursion, unreachable_patterns)]
+    fn build_storage(&self, config: &StorageConfig) -> Result<Arc<OpenDalStorage>> {
+        match self {
+            Self::WithClientOptions(factory, options) => Ok(Arc::new(
+                OpenDalStorage::WithClientOptions(factory.build_storage(config)?, options.clone()),
+            )),
             #[cfg(feature = "opendal-memory")]
             OpenDalStorageFactory::Memory => {
                 Ok(Arc::new(OpenDalStorage::Memory(memory_config_build()?)))
@@ -219,6 +241,8 @@ fn default_memory_operator() -> Operator {
 /// OpenDAL-based storage implementation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum OpenDalStorage {
+    /// Storage using the HTTP client options supplied by its factory.
+    WithClientOptions(Arc<OpenDalStorage>, ClientOptions),
     /// Memory storage variant.
     #[cfg(feature = "opendal-memory")]
     Memory(#[serde(skip, default = "self::default_memory_operator")] Operator),
@@ -272,6 +296,8 @@ pub enum OpenDalStorage {
     },
 }
 
+// With no backend features, only the recursive options variant remains.
+#[allow(unconditional_recursion, unreachable_patterns)]
 impl OpenDalStorage {
     /// Creates operator from path.
     ///
@@ -288,10 +314,14 @@ impl OpenDalStorage {
     #[allow(unreachable_code, unused_variables)]
     pub(crate) fn create_operator<'a>(
         &self,
-        path: &'a impl AsRef<str>,
+        path: &'a (impl AsRef<str> + ?Sized),
     ) -> Result<(Operator, &'a str)> {
         let path = path.as_ref();
         let (operator, relative_path): (Operator, &str) = match self {
+            Self::WithClientOptions(storage, options) => {
+                let (operator, relative_path) = storage.create_operator(path)?;
+                return Ok((options.apply(operator)?, relative_path));
+            }
             #[cfg(feature = "opendal-memory")]
             OpenDalStorage::Memory(op) => {
                 if let Some(stripped) = path.strip_prefix("memory:/") {
@@ -401,6 +431,7 @@ impl OpenDalStorage {
     /// encodes the repo type, not the repo identity, so a more specific key is used.
     fn batch_key_for_path(&self, path: &str) -> String {
         match self {
+            Self::WithClientOptions(storage, _) => storage.batch_key_for_path(path),
             #[cfg(feature = "opendal-hf")]
             OpenDalStorage::Hf { .. } => hf_batch_key(path),
             _ => url::Url::parse(path)
@@ -418,6 +449,7 @@ impl OpenDalStorage {
     #[allow(unreachable_code, unused_variables)]
     pub(crate) fn relativize_path<'a>(&self, path: &'a str) -> Result<&'a str> {
         match self {
+            Self::WithClientOptions(storage, _) => storage.relativize_path(path),
             #[cfg(feature = "opendal-memory")]
             OpenDalStorage::Memory(_) => Ok(path.strip_prefix("memory:/").unwrap_or(&path[1..])),
             #[cfg(feature = "opendal-fs")]
@@ -658,6 +690,33 @@ mod tests {
     use super::*;
 
     #[cfg(feature = "opendal-s3")]
+    #[test]
+    fn test_client_options_serialization_roundtrip() {
+        use iceberg::io::{FileIO, FileIOBuilder};
+
+        let options = ClientOptions::default().with_pool_max_idle_per_host(32);
+        let factories: [Arc<dyn StorageFactory>; 2] = [
+            Arc::new(
+                OpenDalStorageFactory::S3 {
+                    customized_credential_load: None,
+                }
+                .with_client_options(options.clone()),
+            ),
+            Arc::new(OpenDalResolvingStorageFactory::new().with_client_options(options)),
+        ];
+        for factory in factories {
+            let serialized = FileIOBuilder::new(factory).build().serialize_all().unwrap();
+            assert!(
+                std::str::from_utf8(&serialized)
+                    .unwrap()
+                    .contains("\"pool_max_idle_per_host\":32")
+            );
+            let restored = FileIO::deserialize_all(&serialized).unwrap();
+            assert_eq!(restored.serialize_all().unwrap(), serialized);
+        }
+    }
+
+    #[cfg(feature = "opendal-s3")]
     #[derive(Debug)]
     struct EmptyCredentialLoader;
 
@@ -676,16 +735,20 @@ mod tests {
     #[cfg(feature = "opendal-s3")]
     #[test]
     fn test_s3_factory_custom_credential_loader_serialization_fails() {
-        let file_io = iceberg::io::FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
+        let factory = OpenDalStorageFactory::S3 {
             customized_credential_load: Some(CustomAwsCredentialLoader::new(EmptyCredentialLoader)),
-        }))
-        .build();
-
-        let err = file_io.serialize_all().unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("custom AWS credential loaders cannot be serialized")
-        );
+        };
+        for factory in [
+            factory.clone(),
+            factory.with_client_options(ClientOptions::default()),
+        ] {
+            let file_io = iceberg::io::FileIOBuilder::new(Arc::new(factory)).build();
+            let err = file_io.serialize_all().unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("custom AWS credential loaders cannot be serialized")
+            );
+        }
     }
 
     #[cfg(feature = "opendal-memory")]
