@@ -54,9 +54,13 @@ bytes = { workspace = true }
 cfg-if = { workspace = true }
 futures = { workspace = true }
 iceberg = { workspace = true }
+once_cell = { workspace = true }
 opendal = { workspace = true }
+opendal-http-transport-reqwest = { version = "0.58", default-features = false }
 reqsign-aws-v4 = { version = "3.0.0", optional = true }
 reqsign-core = { version = "3.0.0", optional = true }
+# Match OpenDAL's HTTP client version without changing the workspace's catalog clients.
+reqwest = { version = "0.13", default-features = false }
 serde = { workspace = true }
 typetag = { workspace = true }
 url = { workspace = true }
@@ -64,7 +68,7 @@ url = { workspace = true }
 [dev-dependencies]
 async-trait = { workspace = true }
 iceberg_test_utils = { path = "../../test_utils", features = ["tests"] }
-reqwest = { workspace = true }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros"] }
 

@@ -33,9 +33,9 @@ use iceberg::{Error, ErrorKind, Result};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::OpenDalStorage;
 #[cfg(feature = "opendal-s3")]
 use crate::s3::CustomAwsCredentialLoader;
+use crate::{ClientOptions, OpenDalStorage};
 
 /// Schemes supported by OpenDalResolvingStorage
 pub const SCHEME_MEMORY: &str = "memory";
@@ -160,6 +160,8 @@ fn build_storage_for_scheme(
 /// ```
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OpenDalResolvingStorageFactory {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_options: Option<ClientOptions>,
     /// Custom AWS credential loader for S3 storage.
     #[cfg(feature = "opendal-s3")]
     #[serde(
@@ -180,9 +182,16 @@ impl OpenDalResolvingStorageFactory {
     /// Create a new resolving storage factory.
     pub fn new() -> Self {
         Self {
+            client_options: None,
             #[cfg(feature = "opendal-s3")]
             customized_credential_load: None,
         }
+    }
+
+    /// Configure a shared HTTP client for all resolved backends.
+    pub fn with_client_options(mut self, options: ClientOptions) -> Self {
+        self.client_options = Some(options);
+        self
     }
 
     /// Set a custom AWS credential loader for S3 storage.
@@ -198,6 +207,7 @@ impl StorageFactory for OpenDalResolvingStorageFactory {
     fn build(&self, config: &StorageConfig) -> Result<Arc<dyn Storage>> {
         Ok(Arc::new(OpenDalResolvingStorage {
             props: config.props().clone(),
+            client_options: self.client_options.clone(),
             storages: RwLock::new(HashMap::new()),
             #[cfg(feature = "opendal-s3")]
             customized_credential_load: self.customized_credential_load.clone(),
@@ -213,6 +223,8 @@ impl StorageFactory for OpenDalResolvingStorageFactory {
 /// the same canonical scheme, so they share a storage instance.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OpenDalResolvingStorage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_options: Option<ClientOptions>,
     /// Configuration properties shared across all backends.
     props: HashMap<String, String>,
     /// Cache of canonical scheme to storage mappings.
@@ -259,6 +271,10 @@ impl OpenDalResolvingStorage {
             &self.customized_credential_load,
         )?;
         let storage = Arc::new(storage);
+        let storage = match &self.client_options {
+            Some(options) => Arc::new(OpenDalStorage::WithClientOptions(storage, options.clone())),
+            None => storage,
+        };
         cache.insert(scheme, storage.clone());
         Ok(storage)
     }
@@ -371,6 +387,7 @@ mod tests {
     fn empty_resolving_storage() -> OpenDalResolvingStorage {
         OpenDalResolvingStorage {
             props: HashMap::new(),
+            client_options: None,
             storages: RwLock::new(HashMap::new()),
             #[cfg(feature = "opendal-s3")]
             customized_credential_load: None,

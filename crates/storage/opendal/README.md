@@ -82,3 +82,20 @@ async fn main() -> iceberg::Result<()> {
     Ok(())
 }
 ```
+
+## HTTP connection pooling
+
+Configure the factory without changing its constructor:
+
+```rust
+use iceberg_storage_opendal::{ClientOptions, OpenDalStorageFactory};
+
+let factory = OpenDalStorageFactory::S3 {
+    customized_credential_load: None,
+}.with_client_options(ClientOptions::default().with_pool_max_idle_per_host(32));
+```
+
+Factory clones share one lazy HTTP client across `FileIO`s. The limit applies to
+idle connections per host; active requests remain unrestricted. Default options
+keep OpenDAL's existing transport. Serialization retains the settings and recreates
+the runtime client lazily. `OpenDalResolvingStorageFactory` supports the same method.
