@@ -21,7 +21,7 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 
 use crate::error::Result;
-use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
+use crate::spec::{DataFile, MAIN_BRANCH, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::commit_ids::CommitIds;
 use crate::transaction::merging_state::MergingState;
@@ -48,6 +48,7 @@ pub struct MergeAppendAction {
     ids: CommitIds,
 
     snapshot_properties: HashMap<String, String>,
+    target_branch: String,
     manifest_read_concurrency: usize,
     manifest_write_concurrency: usize,
     /// Initialized on first commit, shared across catalog retries for idempotency.
@@ -62,6 +63,7 @@ impl MergeAppendAction {
             ids: CommitIds::new(),
 
             snapshot_properties: HashMap::default(),
+            target_branch: MAIN_BRANCH.to_string(),
             manifest_read_concurrency: num_cpus,
             manifest_write_concurrency: std::cmp::max(1, num_cpus / 4),
             merging_state: OnceLock::new(),
@@ -83,6 +85,13 @@ impl MergeAppendAction {
     /// Override the number of manifest bins written concurrently during the merge pass.
     pub fn with_manifest_write_concurrency(mut self, n: usize) -> Self {
         self.manifest_write_concurrency = std::cmp::max(1, n);
+        self
+    }
+
+    /// Commit the new snapshot to `name` instead of `main`. A branch that does
+    /// not exist yet is created with no parent.
+    pub fn to_branch(mut self, name: impl Into<String>) -> Self {
+        self.target_branch = name.into();
         self
     }
 
@@ -120,7 +129,8 @@ impl TransactionAction for MergeAppendAction {
             self.ids.commit_uuid(),
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
-        );
+        )
+        .with_target_branch(self.target_branch.clone());
 
         snapshot_producer.validate_added_data_files()?;
 
@@ -164,7 +174,7 @@ impl SnapshotProduceOperation for MergeAppendOperation {
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        let Some(snapshot) = snapshot_produce.table.metadata().current_snapshot() else {
+        let Some(snapshot) = snapshot_produce.base_snapshot() else {
             return Ok(vec![]);
         };
 

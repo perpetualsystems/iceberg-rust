@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
+use crate::spec::{DataFile, MAIN_BRANCH, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
     DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
@@ -35,6 +35,7 @@ pub struct FastAppendAction {
     // below are properties used to create SnapshotProducer when commit
     commit_uuid: Option<Uuid>,
     snapshot_properties: HashMap<String, String>,
+    target_branch: String,
     added_data_files: Vec<DataFile>,
 }
 
@@ -44,6 +45,7 @@ impl FastAppendAction {
             check_duplicate: true,
             commit_uuid: None,
             snapshot_properties: HashMap::default(),
+            target_branch: MAIN_BRANCH.to_string(),
             added_data_files: vec![],
         }
     }
@@ -63,6 +65,13 @@ impl FastAppendAction {
     /// Set commit UUID for the snapshot.
     pub fn set_commit_uuid(mut self, commit_uuid: Uuid) -> Self {
         self.commit_uuid = Some(commit_uuid);
+        self
+    }
+
+    /// Commit the new snapshot to `name` instead of `main`. A branch that does
+    /// not exist yet is created with no parent.
+    pub fn to_branch(mut self, name: impl Into<String>) -> Self {
+        self.target_branch = name.into();
         self
     }
 
@@ -94,7 +103,8 @@ impl TransactionAction for FastAppendAction {
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),
             self.snapshot_properties.clone(),
             self.dedupe_added_files(),
-        );
+        )
+        .with_target_branch(self.target_branch.clone());
 
         // validate added files
         snapshot_producer.validate_added_data_files()?;
@@ -129,7 +139,7 @@ impl SnapshotProduceOperation for FastAppendOperation {
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        let Some(snapshot) = snapshot_produce.table.metadata().current_snapshot() else {
+        let Some(snapshot) = snapshot_produce.base_snapshot() else {
             return Ok(vec![]);
         };
 

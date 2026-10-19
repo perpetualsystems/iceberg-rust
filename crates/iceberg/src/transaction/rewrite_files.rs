@@ -21,7 +21,7 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 
 use crate::error::Result;
-use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
+use crate::spec::{DataFile, MAIN_BRANCH, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::commit_ids::CommitIds;
 use crate::transaction::merging_state::MergingState;
@@ -56,6 +56,7 @@ pub struct RewriteFilesAction {
     ids: CommitIds,
 
     snapshot_properties: HashMap<String, String>,
+    target_branch: String,
     files_to_delete: Vec<DataFile>,
     files_to_add: Vec<DataFile>,
     /// Validate against this historical snapshot rather than the current one.
@@ -79,6 +80,7 @@ impl RewriteFilesAction {
             ids: CommitIds::new(),
 
             snapshot_properties: HashMap::default(),
+            target_branch: MAIN_BRANCH.to_string(),
             files_to_delete: vec![],
             files_to_add: vec![],
             validate_from_snapshot_id: None,
@@ -123,6 +125,13 @@ impl RewriteFilesAction {
     /// Add files to add (new files replacing old ones).
     pub fn add_files(mut self, files: impl IntoIterator<Item = DataFile>) -> Self {
         self.files_to_add.extend(files);
+        self
+    }
+
+    /// Commit the new snapshot to `name` instead of `main`. A branch that does
+    /// not exist yet is created with no parent.
+    pub fn to_branch(mut self, name: impl Into<String>) -> Self {
+        self.target_branch = name.into();
         self
     }
 
@@ -183,6 +192,7 @@ impl TransactionAction for RewriteFilesAction {
             self.snapshot_properties.clone(),
             self.files_to_add.clone(),
         )
+        .with_target_branch(self.target_branch.clone())
         .with_removed_data_files(self.files_to_delete.clone());
 
         if let Some(seq_num) = self.data_sequence_number {
@@ -257,7 +267,7 @@ impl SnapshotProduceOperation for RewriteOperation {
         // Carry-forward always reads from current_snapshot, even when
         // delete_entries() validated against a historical planning snapshot —
         // the new manifest list must reflect the table as committed.
-        let Some(snapshot) = snapshot_produce.table.metadata().current_snapshot() else {
+        let Some(snapshot) = snapshot_produce.base_snapshot() else {
             return Ok(vec![]);
         };
 
