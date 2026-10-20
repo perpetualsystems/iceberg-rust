@@ -224,10 +224,6 @@ impl<'a> SnapshotProducer<'a> {
         self
     }
 
-    pub(crate) fn target_branch(&self) -> &str {
-        &self.target_branch
-    }
-
     /// Head snapshot of the target branch. `None` when the branch does not
     /// exist yet, which means the new snapshot has no parent.
     pub(crate) fn base_snapshot(&self) -> Option<&SnapshotRef> {
