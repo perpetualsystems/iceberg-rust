@@ -96,7 +96,7 @@ fn inject_manifest_summary_keys(
 ///    This metadata helps track what kind of change was made to the table.
 ///
 /// 2. **Manifest File Selection**: The `existing_manifest()` method determines which existing
-///    manifest files from the current snapshot should be carried forward to the new snapshot.
+///    manifest files from the target branch head should be carried forward to the new snapshot.
 ///    For example:
 ///    - An `Append` operation typically includes all existing manifests plus new ones
 ///    - An `Overwrite` operation might exclude manifests for partitions being overwritten
@@ -119,7 +119,7 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
 
     /// Returns existing manifest files that should be included in the new snapshot.
     ///
-    /// This method determines which manifest files from the current snapshot should be
+    /// This method determines which manifest files from the target branch head should be
     /// carried forward to the new snapshot. The selection depends on the operation type:
     ///
     /// - **Append operations**: Typically include all existing manifests
@@ -497,7 +497,8 @@ impl<'a> SnapshotProducer<'a> {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
-                    "Cannot commit, files being replaced are no longer alive in the current snapshot: {}",
+                    "Cannot commit, files being replaced are no longer alive in the head of branch '{}': {}",
+                    self.target_branch,
                     missing.join(", ")
                 ),
             ));
@@ -759,7 +760,7 @@ impl<'a> SnapshotProducer<'a> {
             );
         }
 
-        // The current snapshot becomes the parent of the new one being created.
+        // The target branch head becomes the parent of the new one being created.
         let previous_snapshot = self.base_snapshot();
 
         // Computed metrics must win over user-supplied snapshot properties.

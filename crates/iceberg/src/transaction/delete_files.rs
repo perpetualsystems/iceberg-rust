@@ -92,7 +92,7 @@ impl DeleteFilesAction {
     }
 
     /// Opt into strict file-existence validation. When set, the commit fails with
-    /// `DataInvalid` if any registered path is not alive in the current snapshot.
+    /// `DataInvalid` if any registered path is not alive in the target branch head.
     ///
     /// Default: off (absent paths are silently ignored — Java `StreamingDelete` default).
     pub fn validate_files_exist(mut self) -> Self {
@@ -101,7 +101,8 @@ impl DeleteFilesAction {
     }
 
     /// Commit the new snapshot to `name` instead of `main`. A branch that does
-    /// not exist yet is created with no parent.
+    /// not exist yet is created with no parent. The commit fails if `name` is a
+    /// tag.
     pub fn to_branch(mut self, name: impl Into<String>) -> Self {
         self.target_branch = name.into();
         self
@@ -219,7 +220,7 @@ impl TransactionAction for DeleteFilesAction {
                 .await?;
         }
 
-        // Only count files that are actually alive in the current snapshot toward
+        // Only count files that are actually alive in the target branch head toward
         // summary stats. Ghost files (absent from all manifests) are silently no-oped
         // and must not be subtracted from totals — they were never counted as added.
         let alive_paths = collect_alive_paths(table, &self.target_branch, &seen_paths).await?;

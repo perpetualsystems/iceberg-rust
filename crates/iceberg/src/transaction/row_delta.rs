@@ -87,7 +87,8 @@ impl RowDeltaAction {
     }
 
     /// Commit the new snapshot to `name` instead of `main`. A branch that does
-    /// not exist yet is created with no parent.
+    /// not exist yet is created with no parent. The commit fails if `name` is a
+    /// tag.
     pub fn to_branch(mut self, name: impl Into<String>) -> Self {
         self.target_branch = name.into();
         self

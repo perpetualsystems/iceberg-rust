@@ -35,7 +35,7 @@ use crate::{Error, ErrorKind};
 /// On every commit, the action runs Java's `MergingSnapshotProducer` filter+merge
 /// pipeline:
 ///
-///   1. **Filter pass.** Each manifest in the current snapshot's manifest list is
+///   1. **Filter pass.** Each manifest in the target branch head's manifest list is
 ///      inspected. Manifests with no replaced entries pass through unchanged;
 ///      manifests whose alive entries are all replaced are dropped; manifests
 ///      with both replaced and surviving entries are rewritten as residuals
@@ -129,7 +129,8 @@ impl RewriteFilesAction {
     }
 
     /// Commit the new snapshot to `name` instead of `main`. A branch that does
-    /// not exist yet is created with no parent.
+    /// not exist yet is created with no parent. The commit fails if `name` is a
+    /// tag.
     pub fn to_branch(mut self, name: impl Into<String>) -> Self {
         self.target_branch = name.into();
         self
@@ -264,7 +265,7 @@ impl SnapshotProduceOperation for RewriteOperation {
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        // Carry-forward always reads from current_snapshot, even when
+        // Carry-forward always reads from the target branch head, even when
         // delete_entries() validated against a historical planning snapshot —
         // the new manifest list must reflect the table as committed.
         let Some(snapshot) = snapshot_produce.base_snapshot() else {
