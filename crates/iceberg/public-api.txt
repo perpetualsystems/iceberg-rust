@@ -2738,6 +2738,7 @@ pub fn iceberg::spec::TableMetadata::partition_statistics_for_snapshot(&self, sn
 pub fn iceberg::spec::TableMetadata::partition_statistics_iter(&self) -> impl core::iter::traits::exact_size::ExactSizeIterator<Item = &iceberg::spec::PartitionStatisticsFile>
 pub fn iceberg::spec::TableMetadata::properties(&self) -> &std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>
 pub async fn iceberg::spec::TableMetadata::read_from(file_io: &iceberg::io::FileIO, metadata_location: impl core::convert::AsRef<str>) -> iceberg::Result<iceberg::spec::TableMetadata>
+pub fn iceberg::spec::TableMetadata::refs(&self) -> &std::collections::hash::map::HashMap<alloc::string::String, iceberg::spec::SnapshotReference>
 pub fn iceberg::spec::TableMetadata::schema_by_id(&self, schema_id: iceberg::spec::SchemaId) -> core::option::Option<&iceberg::spec::SchemaRef>
 pub fn iceberg::spec::TableMetadata::schemas_iter(&self) -> impl core::iter::traits::exact_size::ExactSizeIterator<Item = &iceberg::spec::SchemaRef>
 pub fn iceberg::spec::TableMetadata::snapshot_by_id(&self, snapshot_id: i64) -> core::option::Option<&iceberg::spec::SnapshotRef>
@@ -3263,6 +3264,7 @@ impl iceberg::transaction::DeleteFilesAction
 pub fn iceberg::transaction::DeleteFilesAction::delete_file(self, file: iceberg::spec::DataFile) -> Self
 pub fn iceberg::transaction::DeleteFilesAction::delete_files(self, files: impl core::iter::traits::collect::IntoIterator<Item = iceberg::spec::DataFile>) -> Self
 pub fn iceberg::transaction::DeleteFilesAction::set_snapshot_properties(self, props: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> Self
+pub fn iceberg::transaction::DeleteFilesAction::to_branch(self, name: impl core::convert::Into<alloc::string::String>) -> Self
 pub fn iceberg::transaction::DeleteFilesAction::validate_files_exist(self) -> Self
 pub fn iceberg::transaction::DeleteFilesAction::with_manifest_read_concurrency(self, n: usize) -> Self
 pub fn iceberg::transaction::DeleteFilesAction::with_manifest_write_concurrency(self, n: usize) -> Self
@@ -3276,11 +3278,13 @@ impl iceberg::transaction::FastAppendAction
 pub fn iceberg::transaction::FastAppendAction::add_data_files(self, data_files: impl core::iter::traits::collect::IntoIterator<Item = iceberg::spec::DataFile>) -> Self
 pub fn iceberg::transaction::FastAppendAction::set_commit_uuid(self, commit_uuid: uuid::Uuid) -> Self
 pub fn iceberg::transaction::FastAppendAction::set_snapshot_properties(self, snapshot_properties: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> Self
+pub fn iceberg::transaction::FastAppendAction::to_branch(self, name: impl core::convert::Into<alloc::string::String>) -> Self
 pub fn iceberg::transaction::FastAppendAction::with_check_duplicate(self, v: bool) -> Self
 pub struct iceberg::transaction::MergeAppendAction
 impl iceberg::transaction::MergeAppendAction
 pub fn iceberg::transaction::MergeAppendAction::add_data_files(self, files: impl core::iter::traits::collect::IntoIterator<Item = iceberg::spec::DataFile>) -> Self
 pub fn iceberg::transaction::MergeAppendAction::set_snapshot_properties(self, props: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> Self
+pub fn iceberg::transaction::MergeAppendAction::to_branch(self, name: impl core::convert::Into<alloc::string::String>) -> Self
 pub fn iceberg::transaction::MergeAppendAction::with_manifest_read_concurrency(self, n: usize) -> Self
 pub fn iceberg::transaction::MergeAppendAction::with_manifest_write_concurrency(self, n: usize) -> Self
 pub struct iceberg::transaction::ReplaceSortOrderAction
@@ -3293,6 +3297,7 @@ pub fn iceberg::transaction::RewriteFilesAction::add_files(self, files: impl cor
 pub fn iceberg::transaction::RewriteFilesAction::data_sequence_number(self, seq_num: i64) -> Self
 pub fn iceberg::transaction::RewriteFilesAction::delete_files(self, files: impl core::iter::traits::collect::IntoIterator<Item = iceberg::spec::DataFile>) -> Self
 pub fn iceberg::transaction::RewriteFilesAction::set_snapshot_properties(self, props: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> Self
+pub fn iceberg::transaction::RewriteFilesAction::to_branch(self, name: impl core::convert::Into<alloc::string::String>) -> Self
 pub fn iceberg::transaction::RewriteFilesAction::validate_from_snapshot(self, snapshot_id: i64) -> Self
 pub fn iceberg::transaction::RewriteFilesAction::with_manifest_read_concurrency(self, n: usize) -> Self
 pub fn iceberg::transaction::RewriteFilesAction::with_manifest_write_concurrency(self, n: usize) -> Self
@@ -3304,6 +3309,7 @@ pub struct iceberg::transaction::RowDeltaAction
 impl iceberg::transaction::RowDeltaAction
 pub fn iceberg::transaction::RowDeltaAction::add_delete_files(self, files: impl core::iter::traits::collect::IntoIterator<Item = iceberg::spec::DataFile>) -> Self
 pub fn iceberg::transaction::RowDeltaAction::set_snapshot_properties(self, props: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> Self
+pub fn iceberg::transaction::RowDeltaAction::to_branch(self, name: impl core::convert::Into<alloc::string::String>) -> Self
 pub fn iceberg::transaction::RowDeltaAction::with_manifest_read_concurrency(self, n: usize) -> Self
 pub fn iceberg::transaction::RowDeltaAction::with_manifest_write_concurrency(self, n: usize) -> Self
 pub struct iceberg::transaction::Transaction
