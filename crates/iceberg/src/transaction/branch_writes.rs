@@ -65,11 +65,24 @@ fn ref_requirement(updates_requirements: &[TableRequirement], name: &str) -> Opt
     })
 }
 
-#[test]
-fn test_refs_is_public_and_lists_main() {
+#[tokio::test]
+async fn test_refs_is_public_and_lists_main() {
     let table = make_v2_minimal_table();
     // The minimal table has no snapshots, so there are no refs.
     assert!(table.metadata().refs().is_empty());
+
+    let table = append_files(table.clone(), vec![make_data_file(
+        &table,
+        "data/main.parquet",
+        1,
+    )])
+    .await;
+    let refs = table.metadata().refs();
+    assert_eq!(refs.len(), 1);
+    assert_eq!(
+        refs[MAIN_BRANCH].snapshot_id,
+        table.metadata().current_snapshot_id().unwrap()
+    );
 }
 
 #[tokio::test]
