@@ -796,6 +796,18 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_produce_operation: OP,
         process: MP,
     ) -> Result<CommitResult> {
+        if let Some(existing) = self.table.metadata().refs().get(&self.target_branch)
+            && !existing.is_branch()
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot commit a snapshot to '{}': it is a tag, not a branch",
+                    self.target_branch
+                ),
+            ));
+        }
+
         let manifest_list_path = self.generate_manifest_list_file_path(0)?;
         let next_seq_num = self.table.metadata().next_sequence_number();
         let first_row_id = self.table.metadata().next_row_id();

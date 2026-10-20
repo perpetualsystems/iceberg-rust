@@ -19,14 +19,14 @@
 
 use std::sync::Arc;
 
-use crate::spec::{DataFile, MAIN_BRANCH, Snapshot};
+use crate::spec::{DataFile, MAIN_BRANCH, Snapshot, SnapshotReference, SnapshotRetention};
 use crate::table::Table;
 use crate::transaction::tests::{
     append_files, apply_updates_to_table, collect_alive_files, make_data_file,
     make_v2_minimal_table,
 };
 use crate::transaction::{Transaction, TransactionAction};
-use crate::{TableRequirement, TableUpdate};
+use crate::{ErrorKind, TableRequirement, TableUpdate};
 
 const STAGING: &str = "staging";
 
@@ -83,6 +83,32 @@ async fn test_refs_is_public_and_lists_main() {
         refs[MAIN_BRANCH].snapshot_id,
         table.metadata().current_snapshot_id().unwrap()
     );
+}
+
+#[tokio::test]
+async fn test_commit_to_tag_is_rejected() {
+    let table = make_v2_minimal_table();
+    let table = append_files(table.clone(), vec![make_data_file(
+        &table,
+        "data/main.parquet",
+        1,
+    )])
+    .await;
+    let tagged_id = table.metadata().current_snapshot_id().unwrap();
+    let table = apply_updates_to_table(&table, &[TableUpdate::SetSnapshotRef {
+        ref_name: "v1".to_string(),
+        reference: SnapshotReference::new(tagged_id, SnapshotRetention::Tag {
+            max_ref_age_ms: None,
+        }),
+    }]);
+
+    let action = Transaction::new(&table)
+        .fast_append()
+        .add_data_files(vec![make_data_file(&table, "data/f1.parquet", 2)])
+        .to_branch("v1");
+    let err = Arc::new(action).commit(&table).await.err().unwrap();
+    assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    assert!(err.message().contains("is a tag"), "{err}");
 }
 
 #[tokio::test]
