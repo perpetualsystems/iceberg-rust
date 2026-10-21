@@ -3415,7 +3415,9 @@ mod tests {
         // The point of enumerating: `snapshot_for_ref` can only answer for a
         // name the caller already knows.
         assert_eq!(
-            metadata.snapshot_for_ref(MAIN_BRANCH).map(|s| s.snapshot_id()),
+            metadata
+                .snapshot_for_ref(MAIN_BRANCH)
+                .map(|s| s.snapshot_id()),
             Some(main.snapshot_id)
         );
     }
