@@ -346,6 +346,17 @@ impl TableMetadata {
         })
     }
 
+    /// Return all named snapshot references, with their names.
+    ///
+    /// `snapshot_for_ref` resolves one reference by name, which requires
+    /// knowing the name. Callers that must respect every reference -- snapshot
+    /// expiry, for one, which may not drop a snapshot a tag or branch still
+    /// points at -- need to enumerate them instead.
+    #[inline]
+    pub fn refs_iter(&self) -> impl ExactSizeIterator<Item = (&String, &SnapshotReference)> {
+        self.refs.iter()
+    }
+
     /// Return all sort orders.
     #[inline]
     pub fn sort_orders_iter(&self) -> impl ExactSizeIterator<Item = &SortOrderRef> {
@@ -1642,7 +1653,7 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    use super::{FormatVersion, MetadataLog, SnapshotLog, TableMetadataBuilder};
+    use super::{FormatVersion, MAIN_BRANCH, MetadataLog, SnapshotLog, TableMetadataBuilder};
     use crate::catalog::MetadataLocation;
     use crate::compression::CompressionCodec;
     use crate::io::FileIO;
@@ -3378,6 +3389,39 @@ mod tests {
         );
         assert_eq!(desered_type.last_updated_ms(), 1727773114005);
         assert_eq!(desered_type.current_schema_id(), 0);
+    }
+
+    #[test]
+    fn test_refs_iter_enumerates_every_reference() {
+        let metadata =
+            fs::read_to_string("testdata/table_metadata/TableMetadataV1Compat.json").unwrap();
+        let metadata: TableMetadata = serde_json::from_str(&metadata)
+            .expect("Failed to deserialize TableMetadataV1Compat.json");
+
+        let refs: HashMap<&String, &SnapshotReference> = metadata.refs_iter().collect();
+
+        assert_eq!(refs.len(), 1);
+        let main = refs
+            .get(&MAIN_BRANCH.to_string())
+            .expect("the fixture carries a main branch ref");
+        assert_eq!(main.snapshot_id, 917896971991367610);
+
+        // The point of enumerating: `snapshot_for_ref` can only answer for a
+        // name the caller already knows.
+        assert_eq!(
+            metadata.snapshot_for_ref(MAIN_BRANCH).map(|s| s.snapshot_id()),
+            Some(main.snapshot_id)
+        );
+    }
+
+    #[test]
+    fn test_refs_iter_is_empty_without_references() {
+        let metadata =
+            fs::read_to_string("testdata/table_metadata/TableMetadataV2ValidMinimal.json").unwrap();
+        let metadata: TableMetadata =
+            serde_json::from_str(&metadata).expect("minimal v2 metadata deserializes");
+
+        assert_eq!(metadata.refs_iter().len(), 0);
     }
 
     #[test]
