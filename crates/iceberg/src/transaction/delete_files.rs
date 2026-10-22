@@ -22,7 +22,7 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 use crate::spec::{
-    DataContentType, DataFile, FormatVersion, ManifestEntry, ManifestFile, Operation,
+    DataContentType, DataFile, FormatVersion, MAIN_BRANCH, ManifestEntry, ManifestFile, Operation,
 };
 use crate::table::Table;
 use crate::transaction::commit_ids::CommitIds;
@@ -57,6 +57,7 @@ pub struct DeleteFilesAction {
     ids: CommitIds,
 
     snapshot_properties: HashMap<String, String>,
+    target_branch: String,
     manifest_read_concurrency: usize,
     manifest_write_concurrency: usize,
     merging_state: OnceLock<Arc<MergingState>>,
@@ -71,6 +72,7 @@ impl DeleteFilesAction {
             ids: CommitIds::new(),
 
             snapshot_properties: HashMap::default(),
+            target_branch: MAIN_BRANCH.to_string(),
             manifest_read_concurrency: num_cpus,
             manifest_write_concurrency: std::cmp::max(1, num_cpus / 4),
             merging_state: OnceLock::new(),
@@ -90,11 +92,19 @@ impl DeleteFilesAction {
     }
 
     /// Opt into strict file-existence validation. When set, the commit fails with
-    /// `DataInvalid` if any registered path is not alive in the current snapshot.
+    /// `DataInvalid` if any registered path is not alive in the target branch head.
     ///
     /// Default: off (absent paths are silently ignored — Java `StreamingDelete` default).
     pub fn validate_files_exist(mut self) -> Self {
         self.validate_files_exist = true;
+        self
+    }
+
+    /// Commit the new snapshot to `name` instead of `main`. A branch that does
+    /// not exist yet is created with no parent. The commit fails if `name` is a
+    /// tag.
+    pub fn to_branch(mut self, name: impl Into<String>) -> Self {
+        self.target_branch = name.into();
         self
     }
 
@@ -146,8 +156,12 @@ impl DeleteFilesAction {
     }
 }
 
-async fn collect_alive_paths(table: &Table, paths: &HashSet<String>) -> Result<HashSet<String>> {
-    let Some(current_snapshot) = table.metadata().current_snapshot() else {
+async fn collect_alive_paths(
+    table: &Table,
+    branch: &str,
+    paths: &HashSet<String>,
+) -> Result<HashSet<String>> {
+    let Some(current_snapshot) = table.metadata().snapshot_for_ref(branch) else {
         return Ok(HashSet::new());
     };
     let manifest_list = table.manifest_list_reader(current_snapshot).load().await?;
@@ -197,7 +211,8 @@ impl TransactionAction for DeleteFilesAction {
             self.ids.commit_uuid(),
             self.snapshot_properties.clone(),
             vec![],
-        );
+        )
+        .with_target_branch(self.target_branch.clone());
 
         if self.validate_files_exist {
             snapshot_producer
@@ -205,10 +220,10 @@ impl TransactionAction for DeleteFilesAction {
                 .await?;
         }
 
-        // Only count files that are actually alive in the current snapshot toward
+        // Only count files that are actually alive in the target branch head toward
         // summary stats. Ghost files (absent from all manifests) are silently no-oped
         // and must not be subtracted from totals — they were never counted as added.
-        let alive_paths = collect_alive_paths(table, &seen_paths).await?;
+        let alive_paths = collect_alive_paths(table, &self.target_branch, &seen_paths).await?;
         let actually_removed: Vec<DataFile> = deduped
             .iter()
             .filter(|f| alive_paths.contains(f.file_path()))
@@ -258,7 +273,7 @@ impl SnapshotProduceOperation for DeleteFilesOperation {
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        let Some(snapshot) = snapshot_produce.table.metadata().current_snapshot() else {
+        let Some(snapshot) = snapshot_produce.base_snapshot() else {
             return Ok(vec![]);
         };
 

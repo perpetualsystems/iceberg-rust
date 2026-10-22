@@ -28,7 +28,7 @@ use crate::spec::snapshot_summary::{MANIFESTS_CREATED, MANIFESTS_KEPT, MANIFESTS
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType,
     ManifestEntry, ManifestFile, ManifestListWriter, ManifestWriter, ManifestWriterBuilder,
-    Operation, PartitionSpec, Snapshot, SnapshotReference, SnapshotRetention,
+    Operation, PartitionSpec, Snapshot, SnapshotRef, SnapshotReference, SnapshotRetention,
     SnapshotSummaryCollector, Struct, StructType, Summary, TableProperties,
     update_snapshot_summaries,
 };
@@ -96,7 +96,7 @@ fn inject_manifest_summary_keys(
 ///    This metadata helps track what kind of change was made to the table.
 ///
 /// 2. **Manifest File Selection**: The `existing_manifest()` method determines which existing
-///    manifest files from the current snapshot should be carried forward to the new snapshot.
+///    manifest files from the target branch head should be carried forward to the new snapshot.
 ///    For example:
 ///    - An `Append` operation typically includes all existing manifests plus new ones
 ///    - An `Overwrite` operation might exclude manifests for partitions being overwritten
@@ -119,7 +119,7 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
 
     /// Returns existing manifest files that should be included in the new snapshot.
     ///
-    /// This method determines which manifest files from the current snapshot should be
+    /// This method determines which manifest files from the target branch head should be
     /// carried forward to the new snapshot. The selection depends on the operation type:
     ///
     /// - **Append operations**: Typically include all existing manifests
@@ -182,6 +182,9 @@ pub(crate) struct SnapshotProducer<'a> {
     snapshot_id: i64,
     commit_uuid: Uuid,
     snapshot_properties: HashMap<String, String>,
+    /// Branch that the new snapshot is committed to. Every base-snapshot read
+    /// and the commit requirement use this ref. Defaults to `main`.
+    target_branch: String,
     added_data_files: Vec<DataFile>,
     removed_data_files: Vec<DataFile>,
     /// Explicit data sequence number for added manifest entries. When `Some`, all entries written
@@ -208,11 +211,27 @@ impl<'a> SnapshotProducer<'a> {
             snapshot_id,
             commit_uuid,
             snapshot_properties,
+            target_branch: MAIN_BRANCH.to_string(),
             added_data_files,
             removed_data_files: vec![],
             data_sequence_number: None,
             manifest_counter: (0..),
         }
+    }
+
+    pub(crate) fn with_target_branch(mut self, branch: String) -> Self {
+        self.target_branch = branch;
+        self
+    }
+
+    /// Head snapshot of the target branch. `None` when the branch does not
+    /// exist yet, which means the new snapshot has no parent.
+    pub(crate) fn base_snapshot(&self) -> Option<&SnapshotRef> {
+        self.table.metadata().snapshot_for_ref(&self.target_branch)
+    }
+
+    pub(crate) fn base_snapshot_id(&self) -> Option<i64> {
+        self.base_snapshot().map(|s| s.snapshot_id())
     }
 
     pub(crate) fn with_removed_data_files(mut self, files: Vec<DataFile>) -> Self {
@@ -276,7 +295,7 @@ impl<'a> SnapshotProducer<'a> {
         if metadata.format_version() == FormatVersion::V1 {
             return Ok(());
         }
-        let Some(parent) = metadata.current_snapshot() else {
+        let Some(parent) = self.base_snapshot() else {
             return Ok(());
         };
         if replaced_data_files.is_empty() {
@@ -380,7 +399,7 @@ impl<'a> SnapshotProducer<'a> {
     }
 
     pub(crate) async fn validate_duplicate_files(&self) -> Result<()> {
-        let Some(current_snapshot) = self.table.metadata().current_snapshot() else {
+        let Some(current_snapshot) = self.base_snapshot() else {
             return Ok(());
         };
 
@@ -441,7 +460,7 @@ impl<'a> SnapshotProducer<'a> {
             return Ok(());
         }
 
-        let Some(current_snapshot) = self.table.metadata().current_snapshot() else {
+        let Some(current_snapshot) = self.base_snapshot() else {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 "Cannot validate file existence on a table with no snapshots",
@@ -478,7 +497,8 @@ impl<'a> SnapshotProducer<'a> {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
-                    "Cannot commit, files being replaced are no longer alive in the current snapshot: {}",
+                    "Cannot commit, files being replaced are no longer alive in the head of branch '{}': {}",
+                    self.target_branch,
                     missing.join(", ")
                 ),
             ));
@@ -740,8 +760,8 @@ impl<'a> SnapshotProducer<'a> {
             );
         }
 
-        // The current snapshot becomes the parent of the new one being created.
-        let previous_snapshot = table_metadata.current_snapshot();
+        // The target branch head becomes the parent of the new one being created.
+        let previous_snapshot = self.base_snapshot();
 
         // Computed metrics must win over user-supplied snapshot properties.
         let mut additional_properties = self.snapshot_properties.clone();
@@ -777,6 +797,18 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_produce_operation: OP,
         process: MP,
     ) -> Result<CommitResult> {
+        if let Some(existing) = self.table.metadata().refs().get(&self.target_branch)
+            && !existing.is_branch()
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot commit a snapshot to '{}': it is a tag, not a branch",
+                    self.target_branch
+                ),
+            ));
+        }
+
         let manifest_list_path = self.generate_manifest_list_file_path(0)?;
         let next_seq_num = self.table.metadata().next_sequence_number();
         let first_row_id = self.table.metadata().next_row_id();
@@ -797,7 +829,7 @@ impl<'a> SnapshotProducer<'a> {
             None => (raw_output.writer().await?, None),
         };
 
-        let parent_snapshot_id = self.table.metadata().current_snapshot_id();
+        let parent_snapshot_id = self.base_snapshot_id();
         let mut manifest_list_writer = match self.table.metadata().format_version() {
             FormatVersion::V1 => {
                 ManifestListWriter::v1(writer, self.snapshot_id, parent_snapshot_id)
@@ -845,7 +877,7 @@ impl<'a> SnapshotProducer<'a> {
         let new_snapshot = Snapshot::builder()
             .with_manifest_list(manifest_list_path)
             .with_snapshot_id(self.snapshot_id)
-            .with_parent_snapshot_id(self.table.metadata().current_snapshot_id())
+            .with_parent_snapshot_id(self.base_snapshot_id())
             .with_sequence_number(next_seq_num)
             .with_summary(summary)
             .with_schema_id(self.table.metadata().current_schema_id())
@@ -881,7 +913,7 @@ impl<'a> SnapshotProducer<'a> {
                 snapshot: new_snapshot,
             },
             TableUpdate::SetSnapshotRef {
-                ref_name: MAIN_BRANCH.to_string(),
+                ref_name: self.target_branch.clone(),
                 reference: SnapshotReference::new(
                     self.snapshot_id,
                     SnapshotRetention::branch(None, None, None),
@@ -895,8 +927,8 @@ impl<'a> SnapshotProducer<'a> {
                 uuid: self.table.metadata().uuid(),
             },
             TableRequirement::RefSnapshotIdMatch {
-                r#ref: MAIN_BRANCH.to_string(),
-                snapshot_id: self.table.metadata().current_snapshot_id(),
+                r#ref: self.target_branch.clone(),
+                snapshot_id: self.base_snapshot_id(),
             },
         ];
 
