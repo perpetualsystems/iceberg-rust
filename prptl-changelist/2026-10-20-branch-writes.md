@@ -46,7 +46,8 @@ every upstream sync.
 
 Upstream code that reads `current_snapshot()` on the commit path does not
 cause a compile error. It makes a branch write use the `main` head. The tests
-and the guard check find this.
+find this. Each `base_snapshot()` call site has a test that fails if the call
+reads the `main` head.
 
 ## Known Sync Hotspot
 
@@ -56,40 +57,28 @@ an existing conflict: the previous-snapshot read for the summary
 `table_metadata.current_snapshot()` at this place.
 
 If you take the upstream side, branch handling stops. The code still compiles.
-Keep the fork side: `self.base_snapshot()`. Then run the checks below.
+Keep the fork side: `self.base_snapshot()`. Then run the tests below.
 
 `append.rs` has one small hunk (`current_snapshot()` replaced by
 `base_snapshot()`). Check it in the same way.
 
-## Guard Check
+## Main-Only Actions
 
-Run this command after each sync, before you run the unit tests:
+These actions do not have `to_branch(name)`. They read `current_snapshot()` or
+use `MAIN_BRANCH` on purpose:
 
-```sh
-dev/check_branch_write_guard.sh
-```
-
-The script fails when non-test code in `crates/iceberg/src/transaction/*.rs`
-calls `current_snapshot()` or uses `MAIN_BRANCH`. It skips `branch_writes.rs`,
-`use` lines, comments and inline test modules.
-
-The script has an allowlist. Each entry is a file and the exact line text:
-
-- `target_branch: MAIN_BRANCH.to_string(),` in the five actions and in
-  `snapshot.rs`. This is the default target.
 - `expire_snapshots.rs`: the `main` check when it selects refs to expire, and
-  the `RefSnapshotIdMatch` requirement. Expire works on `main` only.
-- `rewrite_manifests.rs`: the `current_snapshot()` read and two
-  `MAIN_BRANCH` requirements. Rewrite manifests works on `main` only.
+  the `RefSnapshotIdMatch` requirement.
+- `rewrite_manifests.rs`: the `current_snapshot()` read and two `MAIN_BRANCH`
+  requirements.
 
-If a new line needs `current_snapshot()` or `MAIN_BRANCH` for a good reason,
-add it to the allowlist in the script and write the reason there.
+## Sync Check
 
-Then run the branch-write tests:
+Run the branch-write tests after each sync:
 
 ```sh
 cargo test -p iceberg --lib transaction::branch_writes
 ```
 
-The fork does not change the upstream workflows in `.github/`, so no CI job
-runs the guard. Run it by hand in the sync steps.
+If upstream adds a new `current_snapshot()` read to the commit path of an
+action that has `to_branch(name)`, add a test for it to `branch_writes.rs`.

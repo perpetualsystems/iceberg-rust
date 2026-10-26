@@ -19,11 +19,13 @@
 
 use std::sync::Arc;
 
-use crate::spec::{DataFile, MAIN_BRANCH, Snapshot, SnapshotReference, SnapshotRetention};
+use crate::spec::{
+    DataContentType, DataFile, MAIN_BRANCH, Snapshot, SnapshotReference, SnapshotRetention,
+};
 use crate::table::Table;
 use crate::transaction::tests::{
     append_files, apply_updates_to_table, collect_alive_files, make_data_file,
-    make_v2_minimal_table,
+    make_file_with_content, make_v2_minimal_table,
 };
 use crate::transaction::{Transaction, TransactionAction};
 use crate::{ErrorKind, TableRequirement, TableUpdate};
@@ -300,10 +302,25 @@ async fn test_retry_rereads_target_branch_head() {
 #[tokio::test]
 async fn test_merge_append_to_branch() {
     let table = make_v2_minimal_table();
+    let table = append_files(table.clone(), vec![make_data_file(
+        &table,
+        "data/main.parquet",
+        1,
+    )])
+    .await;
+    let table = append_to_branch(table.clone(), STAGING, vec![make_data_file(
+        &table,
+        "data/s1.parquet",
+        2,
+    )])
+    .await;
+    let main_head = table.metadata().current_snapshot_id();
+    let staging_head = branch_head(&table, STAGING).unwrap().snapshot_id();
+
     let updates = Arc::new(
         Transaction::new(&table)
             .merge_append()
-            .add_data_files(vec![make_data_file(&table, "data/s1.parquet", 2)])
+            .add_data_files(vec![make_data_file(&table, "data/s2.parquet", 3)])
             .to_branch(STAGING),
     )
     .commit(&table)
@@ -311,8 +328,15 @@ async fn test_merge_append_to_branch() {
     .unwrap()
     .take_updates();
     let table = apply_updates_to_table(&table, &updates);
-    assert_eq!(alive(&table, STAGING).await, vec!["data/s1.parquet"]);
-    assert!(branch_head(&table, MAIN_BRANCH).is_none());
+
+    let head = branch_head(&table, STAGING).unwrap();
+    assert_eq!(head.parent_snapshot_id(), Some(staging_head));
+    assert_eq!(alive(&table, STAGING).await, vec![
+        "data/s1.parquet",
+        "data/s2.parquet"
+    ]);
+    assert_eq!(table.metadata().current_snapshot_id(), main_head);
+    assert_eq!(alive(&table, MAIN_BRANCH).await, vec!["data/main.parquet"]);
 }
 
 #[tokio::test]
@@ -349,7 +373,11 @@ async fn test_delete_files_on_branch() {
     let table = make_v2_minimal_table();
     let s1 = make_data_file(&table, "data/s1.parquet", 2);
     let s2 = make_data_file(&table, "data/s2.parquet", 3);
+    let main_file = make_data_file(&table, "data/main.parquet", 1);
+    let table = append_files(table, vec![main_file]).await;
     let table = append_to_branch(table, STAGING, vec![s1.clone(), s2]).await;
+    let main_head = table.metadata().current_snapshot_id();
+    let staging_head = branch_head(&table, STAGING).unwrap().snapshot_id();
 
     let updates = Arc::new(
         Transaction::new(&table)
@@ -364,6 +392,143 @@ async fn test_delete_files_on_branch() {
     .take_updates();
     let table = apply_updates_to_table(&table, &updates);
 
+    let head = branch_head(&table, STAGING).unwrap();
+    assert_eq!(head.parent_snapshot_id(), Some(staging_head));
     assert_eq!(alive(&table, STAGING).await, vec!["data/s2.parquet"]);
-    assert!(branch_head(&table, MAIN_BRANCH).is_none());
+    assert_eq!(table.metadata().current_snapshot_id(), main_head);
+    assert_eq!(alive(&table, MAIN_BRANCH).await, vec!["data/main.parquet"]);
+}
+
+#[tokio::test]
+async fn test_row_delta_on_branch() {
+    let table = make_v2_minimal_table();
+    let main_file = make_data_file(&table, "data/main.parquet", 1);
+    let table = append_files(table, vec![main_file]).await;
+    let s1 = make_data_file(&table, "data/s1.parquet", 2);
+    let table = append_to_branch(table, STAGING, vec![s1]).await;
+    let main_head = table.metadata().current_snapshot_id();
+    let staging_head = branch_head(&table, STAGING).unwrap().snapshot_id();
+
+    let pos_delete = make_file_with_content(
+        &table,
+        "deletes/pos1.parquet",
+        DataContentType::PositionDeletes,
+    );
+    let updates = Arc::new(
+        Transaction::new(&table)
+            .row_delta()
+            .add_delete_files(vec![pos_delete])
+            .to_branch(STAGING),
+    )
+    .commit(&table)
+    .await
+    .unwrap()
+    .take_updates();
+    let table = apply_updates_to_table(&table, &updates);
+
+    let head = branch_head(&table, STAGING).unwrap();
+    assert_eq!(head.parent_snapshot_id(), Some(staging_head));
+    assert_eq!(alive(&table, STAGING).await, vec![
+        "data/s1.parquet",
+        "deletes/pos1.parquet"
+    ]);
+    assert_eq!(table.metadata().current_snapshot_id(), main_head);
+    assert_eq!(alive(&table, MAIN_BRANCH).await, vec!["data/main.parquet"]);
+}
+
+#[tokio::test]
+async fn test_manifest_list_header_records_branch_parent() {
+    let table = make_v2_minimal_table();
+    let table = append_files(table.clone(), vec![make_data_file(
+        &table,
+        "data/main.parquet",
+        1,
+    )])
+    .await;
+    let table = append_to_branch(table.clone(), STAGING, vec![make_data_file(
+        &table,
+        "data/s1.parquet",
+        2,
+    )])
+    .await;
+    let staging_head = branch_head(&table, STAGING).unwrap().snapshot_id();
+    let table = append_to_branch(table.clone(), STAGING, vec![make_data_file(
+        &table,
+        "data/s2.parquet",
+        3,
+    )])
+    .await;
+
+    let head = branch_head(&table, STAGING).unwrap();
+    let bytes = table
+        .file_io()
+        .new_input(head.manifest_list())
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    let reader = apache_avro::Reader::new(&bytes[..]).unwrap();
+    let parent = reader
+        .user_metadata()
+        .get("parent-snapshot-id")
+        .expect("manifest list header has parent-snapshot-id");
+    assert_eq!(parent.as_slice(), staging_head.to_string().as_bytes());
+}
+
+#[tokio::test]
+async fn test_append_duplicate_file_on_branch_is_rejected() {
+    let table = make_v2_minimal_table();
+    let table = append_files(table.clone(), vec![make_data_file(
+        &table,
+        "data/main.parquet",
+        1,
+    )])
+    .await;
+    let s1 = make_data_file(&table, "data/s1.parquet", 2);
+    let table = append_to_branch(table, STAGING, vec![s1.clone()]).await;
+
+    let action = Transaction::new(&table)
+        .fast_append()
+        .add_data_files(vec![s1])
+        .to_branch(STAGING);
+    assert!(Arc::new(action).commit(&table).await.is_err());
+}
+
+#[tokio::test]
+async fn test_rewrite_on_branch_sees_new_branch_deletes() {
+    let table = make_v2_minimal_table();
+    let table = append_files(table.clone(), vec![make_data_file(
+        &table,
+        "data/main.parquet",
+        1,
+    )])
+    .await;
+    let s1 = make_data_file(&table, "data/s1.parquet", 2);
+    let table = append_to_branch(table, STAGING, vec![s1.clone()]).await;
+    let planned_from = branch_head(&table, STAGING).unwrap().snapshot_id();
+
+    let eq_delete = make_file_with_content(
+        &table,
+        "deletes/eq1.parquet",
+        DataContentType::EqualityDeletes,
+    );
+    let updates = Arc::new(
+        Transaction::new(&table)
+            .row_delta()
+            .add_delete_files(vec![eq_delete])
+            .to_branch(STAGING),
+    )
+    .commit(&table)
+    .await
+    .unwrap()
+    .take_updates();
+    let table = apply_updates_to_table(&table, &updates);
+
+    let action = Transaction::new(&table)
+        .rewrite_files()
+        .delete_files(vec![s1])
+        .add_files(vec![make_data_file(&table, "data/merged.parquet", 2)])
+        .validate_from_snapshot(planned_from)
+        .to_branch(STAGING);
+    assert!(Arc::new(action).commit(&table).await.is_err());
 }
