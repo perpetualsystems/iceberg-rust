@@ -336,6 +336,12 @@ impl TableMetadata {
         self.current_snapshot_id
     }
 
+    /// All snapshot references (branches and tags), keyed by ref name.
+    #[inline]
+    pub fn refs(&self) -> &HashMap<String, SnapshotReference> {
+        &self.refs
+    }
+
     /// Get the snapshot for a reference
     /// Returns an option if the `ref_name` is not found
     #[inline]
@@ -3409,7 +3415,9 @@ mod tests {
         // The point of enumerating: `snapshot_for_ref` can only answer for a
         // name the caller already knows.
         assert_eq!(
-            metadata.snapshot_for_ref(MAIN_BRANCH).map(|s| s.snapshot_id()),
+            metadata
+                .snapshot_for_ref(MAIN_BRANCH)
+                .map(|s| s.snapshot_id()),
             Some(main.snapshot_id)
         );
     }
