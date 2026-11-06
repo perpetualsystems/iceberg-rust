@@ -3977,6 +3977,7 @@ dependencies = [
  "once_cell",
  "opendal",
  "opendal-http-transport-reqwest",
+ "opendal-service-fs",
  "reqsign-aws-v4",
  "reqsign-core",
  "reqwest 0.13.4",
@@ -5106,9 +5107,9 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "opendal"
-version = "0.59.5"
+version = "0.59.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46081824c74bac9f68f0bc4408077f77b0e315c006514719c97af1c2227ac2d2"
+checksum = "f950151f9587a51a7bed70a15fa0cff464eae96e41ae7499f97067bdafdf43eb"
 dependencies = [
  "ctor",
  "opendal-core",
@@ -5241,9 +5242,9 @@ dependencies = [
 
 [[package]]
 name = "opendal-service-fs"
-version = "0.59.5"
+version = "0.59.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70768b8f5af6996a494e784a1dc2a76b5cf890c422aff31ad094319bde98feb7"
+checksum = "fb9caf04d6d38713299dd4abac984b95ab16ee20e1ff09160f495c5a64644083"
 dependencies = [
  "bytes",
  "log",

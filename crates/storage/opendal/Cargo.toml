@@ -56,6 +56,9 @@ futures = { workspace = true }
 iceberg = { workspace = true }
 once_cell = { workspace = true }
 opendal = { workspace = true }
+# Version-only pin: forces opendal-service-fs <0.59.2, whose confined_join
+# rejects Windows-prefixed absolute paths served by the local-fs backend.
+opendal-service-fs = { workspace = true }
 opendal-http-transport-reqwest = { version = "0.59", default-features = false }
 reqsign-aws-v4 = { version = "3.0.0", optional = true }
 reqsign-core = { version = "3.0.0", optional = true }
