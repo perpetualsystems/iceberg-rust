@@ -22,9 +22,10 @@ use datafusion::arrow::array::{Array, ArrayRef, RecordBatch, StringArray, UInt64
 use datafusion::arrow::datatypes::{
     DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
@@ -161,6 +162,13 @@ impl ExecutionPlan for IcebergCommitExec {
             children[0].clone(),
             self.schema.clone(),
         )))
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn execute(
@@ -343,6 +351,15 @@ mod tests {
             _children: Vec<Arc<dyn ExecutionPlan>>,
         ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
             Ok(self)
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn PhysicalExpr>,
+            ) -> datafusion::common::Result<TreeNodeRecursion>,
+        ) -> datafusion::common::Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
         }
 
         fn execute(
