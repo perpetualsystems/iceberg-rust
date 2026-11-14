@@ -126,11 +126,20 @@ impl TableProviderFactory for IcebergTableProviderFactory {
         check_cmd(cmd).map_err(to_datafusion_error)?;
 
         let table_name = &cmd.name;
-        let metadata_file_path = cmd.locations.first().ok_or_else(|| {
-            datafusion::error::DataFusionError::Plan(
-                "CREATE EXTERNAL TABLE requires a location".to_string(),
-            )
-        })?;
+        let metadata_file_path = match cmd.locations.as_slice() {
+            [location] => location,
+            [] => {
+                return Err(datafusion::error::DataFusionError::Plan(
+                    "CREATE EXTERNAL TABLE requires a location".to_string(),
+                ));
+            }
+            _ => {
+                return Err(datafusion::error::DataFusionError::Plan(
+                    "CREATE EXTERNAL TABLE with an Iceberg provider supports exactly one location"
+                        .to_string(),
+                ));
+            }
+        };
         let options = &cmd.options;
 
         let table_name_with_ns = complement_namespace_if_necessary(table_name);
