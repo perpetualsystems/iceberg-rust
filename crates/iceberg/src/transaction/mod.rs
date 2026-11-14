@@ -51,6 +51,8 @@
 /// The `ApplyTransactionAction` trait provides an `apply` method
 /// that allows users to apply a transaction action to a `Transaction`.
 mod action;
+#[cfg(test)]
+mod branch_writes;
 mod commit_ids;
 mod manifest_filter;
 mod manifest_merge;

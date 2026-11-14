@@ -38,11 +38,6 @@ ignore = [
   #
   # Introduced by object_store, see https://github.com/apache/arrow-rs-object-store/issues/564
   "RUSTSEC-2025-0134",
-  # `rand` unsoundness with custom logger using `rand::rng()`
-  #
-  # Direct dependency upgraded to 0.9.3+. Transitive rand 0.8.5 remains
-  # from reqsign/sqllogictest/rustc-hash — no 0.8.x patch exists.
-  "RUSTSEC-2026-0097",
   # pyo3 < 0.29: out-of-bounds read in PyList/PyTuple `nth`/`nth_back`, and
   # missing `Sync` bound on `PyCFunction::new_closure` closures.
   #
@@ -55,9 +50,9 @@ ignore = [
   # `quick-xml` < 0.41.0 has quadratic duplicate-attribute validation and
   # unbounded namespace-declaration allocation (parser DoS).
   #
-  # It is transitive through object_store 0.13.2 (DataFusion 53 / Parquet 58),
-  # OpenDAL 0.57.0, and reqsign-aws-v4 3.0.0. Their released compatible
-  # versions cannot select the fixed quick-xml >=0.41.0 release.
+  # The remaining affected version is transitive through object_store 0.13.2
+  # (DataFusion 54), which requires quick-xml ^0.39. OpenDAL and reqsign
+  # already use fixed quick-xml 0.41.0.
   #
   # Per SECURITY-THREAT-MODEL.md, malformed-input parser CPU/memory DoS is
   # hardening rather than an Iceberg Rust trust-boundary vulnerability. Remove

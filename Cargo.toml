@@ -131,7 +131,7 @@ pretty_assertions = "1.4"
 proc-macro2 = "1"
 pyo3 = "0.29"
 quote = "1"
-rand = "0.9.3"
+rand = "0.9.5"
 regex = "1.11.3"
 reqwest = { version = "0.12.12", default-features = false, features = ["json"] }
 roaring = { version = "0.11" }
@@ -148,7 +148,7 @@ stacker = "0.1.20"
 strum = "0.27.2"
 syn = "2"
 tempfile = "3.18"
-thrift = "0.17.0"
+thrift = "0.23.0"
 tokio = { version = "1.47", default-features = false, features = [
   "sync",
   "rt-multi-thread",
@@ -164,4 +164,4 @@ uuid = { version = "1.18", features = ["v7"] }
 volo = "0.10.6"
 volo-thrift = "0.10.8"
 zeroize = "1.7"
-zstd = "0.13.3"
+zstd = "0.13.5"

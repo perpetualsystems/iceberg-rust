@@ -22,7 +22,7 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 use crate::spec::{
-    DataContentType, DataFile, FormatVersion, ManifestEntry, ManifestFile, Operation,
+    DataContentType, DataFile, FormatVersion, MAIN_BRANCH, ManifestEntry, ManifestFile, Operation,
 };
 use crate::table::Table;
 use crate::transaction::commit_ids::CommitIds;
@@ -59,6 +59,7 @@ pub struct RowDeltaAction {
     ids: CommitIds,
 
     snapshot_properties: HashMap<String, String>,
+    target_branch: String,
     manifest_read_concurrency: usize,
     manifest_write_concurrency: usize,
     merging_state: OnceLock<Arc<MergingState>>,
@@ -72,6 +73,7 @@ impl RowDeltaAction {
             ids: CommitIds::new(),
 
             snapshot_properties: HashMap::default(),
+            target_branch: MAIN_BRANCH.to_string(),
             manifest_read_concurrency: num_cpus,
             manifest_write_concurrency: std::cmp::max(1, num_cpus / 4),
             merging_state: OnceLock::new(),
@@ -81,6 +83,14 @@ impl RowDeltaAction {
     /// Add equality-delete or position-delete files to this snapshot.
     pub fn add_delete_files(mut self, files: impl IntoIterator<Item = DataFile>) -> Self {
         self.added_delete_files.extend(files);
+        self
+    }
+
+    /// Commit the new snapshot to `name` instead of `main`. A branch that does
+    /// not exist yet is created with no parent. The commit fails if `name` is a
+    /// tag.
+    pub fn to_branch(mut self, name: impl Into<String>) -> Self {
+        self.target_branch = name.into();
         self
     }
 
@@ -163,7 +173,8 @@ impl TransactionAction for RowDeltaAction {
             self.ids.commit_uuid(),
             self.snapshot_properties.clone(),
             vec![],
-        );
+        )
+        .with_target_branch(self.target_branch.clone());
 
         let CommitResult {
             commit,
@@ -198,7 +209,7 @@ impl SnapshotProduceOperation for RowDeltaOperation {
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        let Some(snapshot) = snapshot_produce.table.metadata().current_snapshot() else {
+        let Some(snapshot) = snapshot_produce.base_snapshot() else {
             return Ok(vec![]);
         };
 
