@@ -273,6 +273,11 @@ impl FileScanTask {
         self.column_stats.as_deref()
     }
 
+    /// Removes and returns the planning statistics for this file.
+    pub fn take_column_stats(&mut self) -> Option<FileScanTaskColumnStats> {
+        self.column_stats.take().map(|stats| *stats)
+    }
+
     /// Returns whether names are treated as case-sensitive.
     pub fn case_sensitive(&self) -> bool {
         self.case_sensitive
