@@ -50,6 +50,13 @@ const CHANGED_PARTITION_COUNT_PROP: &str = "changed-partition-count";
 const CHANGED_PARTITION_PREFIX: &str = "partitions.";
 const ICEBERG_VERSION_PROP: &str = "iceberg-version";
 
+/// Per-commit manifest activity counters. Java parity:
+/// `org.apache.iceberg.SnapshotSummary::CREATED_MANIFESTS_COUNT` etc.
+pub(crate) const MANIFESTS_CREATED: &str = "manifests-created";
+pub(crate) const MANIFESTS_REPLACED: &str = "manifests-replaced";
+pub(crate) const MANIFESTS_KEPT: &str = "manifests-kept";
+pub(crate) const ENTRIES_PROCESSED: &str = "entries-processed";
+
 /// `SnapshotSummaryCollector` collects and aggregates snapshot update metrics.
 /// It gathers metrics about added or removed data files and manifests, and tracks
 /// partition-specific updates.
@@ -348,6 +355,7 @@ pub(crate) fn update_snapshot_summaries(
     if summary.operation != Operation::Append
         && summary.operation != Operation::Overwrite
         && summary.operation != Operation::Delete
+        && summary.operation != Operation::Replace
     {
         return Err(invalid_data!("Operation is not supported."));
     }

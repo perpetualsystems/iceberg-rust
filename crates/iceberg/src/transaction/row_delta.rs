@@ -16,7 +16,7 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -25,9 +25,9 @@ use crate::spec::{
     DataContentType, DataFile, FormatVersion, MAIN_BRANCH, ManifestEntry, ManifestFile, Operation,
 };
 use crate::table::Table;
-use crate::transaction::commit_ids::CommitIds;
+use crate::transaction::commit_ids::MergingActionState;
 use crate::transaction::merging_state::MergingState;
-use crate::transaction::snapshot::{CommitResult, SnapshotProduceOperation, SnapshotProducer};
+use crate::transaction::snapshot::merging::{SnapshotProduceOperation, SnapshotProducer};
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::util::available_parallelism;
 use crate::{Error, ErrorKind};
@@ -54,15 +54,14 @@ use crate::{Error, ErrorKind};
 /// - `validateNoConflictingDataFiles` — reject new overlapping data files
 /// - `validateDataFilesExistWhenDataFileReferenced` — referenced file existence check
 /// - DV (deletion vector) support
+#[derive(Clone)]
 pub struct RowDeltaAction {
     added_delete_files: Vec<DataFile>,
-    ids: CommitIds,
 
     snapshot_properties: HashMap<String, String>,
     target_branch: String,
     manifest_read_concurrency: usize,
     manifest_write_concurrency: usize,
-    merging_state: OnceLock<Arc<MergingState>>,
 }
 
 impl RowDeltaAction {
@@ -70,13 +69,11 @@ impl RowDeltaAction {
         let num_cpus = available_parallelism().get();
         Self {
             added_delete_files: vec![],
-            ids: CommitIds::new(),
 
             snapshot_properties: HashMap::default(),
             target_branch: MAIN_BRANCH.to_string(),
             manifest_read_concurrency: num_cpus,
             manifest_write_concurrency: std::cmp::max(1, num_cpus / 4),
-            merging_state: OnceLock::new(),
         }
     }
 
@@ -112,19 +109,6 @@ impl RowDeltaAction {
         self
     }
 
-    fn merging_state(&self, table: &Table) -> Result<Arc<MergingState>> {
-        if let Some(state) = self.merging_state.get() {
-            return Ok(state.clone());
-        }
-        let state = Arc::new(MergingState::from_table(
-            table,
-            self.manifest_read_concurrency,
-            self.manifest_write_concurrency,
-        )?);
-        let _ = self.merging_state.set(state);
-        Ok(self.merging_state.get().expect("just initialized").clone())
-    }
-
     fn validate_added_delete_files(&self) -> Result<()> {
         for f in &self.added_delete_files {
             if f.content_type() == DataContentType::Data {
@@ -143,7 +127,19 @@ impl RowDeltaAction {
 
 #[async_trait]
 impl TransactionAction for RowDeltaAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+    type State = MergingActionState;
+    fn new_state(&self) -> Self::State {
+        Self::State::default()
+    }
+    async fn cleanup(
+        self,
+        state: Self::State,
+        table: &Table,
+        status: crate::transaction::action::CommitStatus,
+    ) {
+        state.cleanup(table, status).await;
+    }
+    async fn commit(&self, attempt: &mut Self::State, table: &Table) -> Result<ActionCommit> {
         if table.metadata().format_version() == FormatVersion::V1 {
             return Err(Error::new(
                 ErrorKind::FeatureUnsupported,
@@ -160,7 +156,11 @@ impl TransactionAction for RowDeltaAction {
             ));
         }
 
-        let state = self.merging_state(table)?;
+        let state = attempt.merging_state(
+            table,
+            self.manifest_read_concurrency,
+            self.manifest_write_concurrency,
+        )?;
 
         let op = RowDeltaOperation {
             added_delete_files: self.added_delete_files.clone(),
@@ -169,22 +169,18 @@ impl TransactionAction for RowDeltaAction {
 
         let snapshot_producer = SnapshotProducer::new(
             table,
-            self.ids.snapshot_id(table),
-            self.ids.commit_uuid(),
+            attempt.ids.snapshot_id(table),
+            attempt.ids.commit_uuid(),
             self.snapshot_properties.clone(),
             vec![],
         )
-        .with_target_branch(self.target_branch.clone());
+        .with_target_branch(self.target_branch.clone())
+        .with_attempt(attempt.next_attempt());
 
-        let CommitResult {
-            commit,
-            committed_manifest_paths,
-        } = snapshot_producer.commit(op, state.clone()).await?;
-
-        state
-            .clean_uncommitted(table.file_io(), &committed_manifest_paths)
-            .await;
-        Ok(commit)
+        let result = snapshot_producer
+            .commit(op, state, &mut attempt.added_manifests)
+            .await?;
+        Ok(attempt.record_attempt(result))
     }
 }
 
@@ -236,9 +232,9 @@ impl SnapshotProduceOperation for RowDeltaOperation {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use crate::spec::{DataContentType, ManifestContentType, ManifestStatus};
+    use crate::test_utils::commit_with_fresh_state;
     use crate::transaction::tests::{
         apply_updates_to_table, commit_uuid_from, make_file_with_content, make_v2_minimal_table,
         snapshot_id_from,
@@ -251,7 +247,7 @@ mod tests {
         let tx = Transaction::new(&table);
         let df = make_file_with_content(&table, "data/x.parquet", DataContentType::Data);
         let action = tx.row_delta().add_delete_files(vec![df]);
-        assert!(Arc::new(action).commit(&table).await.is_err());
+        assert!(commit_with_fresh_state(action, &table).await.is_err());
     }
 
     #[tokio::test]
@@ -264,8 +260,7 @@ mod tests {
             DataContentType::EqualityDeletes,
         );
         let action = tx.row_delta().add_delete_files(vec![eq_delete]);
-        let updates = Arc::new(action)
-            .commit(&table)
+        let updates = commit_with_fresh_state(action, &table)
             .await
             .unwrap()
             .take_updates();
@@ -306,8 +301,7 @@ mod tests {
             DataContentType::PositionDeletes,
         );
         let action = tx.row_delta().add_delete_files(vec![eq_delete, pos_delete]);
-        let updates = Arc::new(action)
-            .commit(&table)
+        let updates = commit_with_fresh_state(action, &table)
             .await
             .unwrap()
             .take_updates();
@@ -333,14 +327,21 @@ mod tests {
             DataContentType::EqualityDeletes,
         );
 
-        let action = Arc::new(
-            Transaction::new(&table)
-                .row_delta()
-                .add_delete_files(vec![eq_delete]),
-        );
+        let action = Transaction::new(&table)
+            .row_delta()
+            .add_delete_files(vec![eq_delete]);
+        let mut action_state = action.new_state();
 
-        let updates1 = action.clone().commit(&table).await.unwrap().take_updates();
-        let updates2 = action.commit(&table).await.unwrap().take_updates();
+        let updates1 = action
+            .commit(&mut action_state, &table)
+            .await
+            .unwrap()
+            .take_updates();
+        let updates2 = action
+            .commit(&mut action_state, &table)
+            .await
+            .unwrap()
+            .take_updates();
 
         assert_eq!(
             snapshot_id_from(&updates1),

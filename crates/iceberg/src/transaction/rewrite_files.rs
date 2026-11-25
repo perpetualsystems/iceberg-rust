@@ -16,16 +16,16 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::error::Result;
 use crate::spec::{DataFile, MAIN_BRANCH, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
-use crate::transaction::commit_ids::CommitIds;
+use crate::transaction::commit_ids::MergingActionState;
 use crate::transaction::merging_state::MergingState;
-use crate::transaction::snapshot::{CommitResult, SnapshotProduceOperation, SnapshotProducer};
+use crate::transaction::snapshot::merging::{SnapshotProduceOperation, SnapshotProducer};
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::util::available_parallelism;
 use crate::{Error, ErrorKind};
@@ -52,9 +52,8 @@ use crate::{Error, ErrorKind};
 ///
 /// Java analog: `org.apache.iceberg.BaseRewriteFiles` extending
 /// `MergingSnapshotProducer`.
+#[derive(Clone)]
 pub struct RewriteFilesAction {
-    ids: CommitIds,
-
     snapshot_properties: HashMap<String, String>,
     target_branch: String,
     files_to_delete: Vec<DataFile>,
@@ -66,9 +65,6 @@ pub struct RewriteFilesAction {
     /// Stamps added entries with this sequence number instead of inheriting it.
     /// Required for v2 equality-delete coverage on rewrites.
     data_sequence_number: Option<i64>,
-    /// Initialized on the first commit attempt and shared across catalog retries
-    /// so the filter+merge caches survive — Java's idempotent retry contract.
-    merging_state: OnceLock<Arc<MergingState>>,
     manifest_read_concurrency: usize,
     manifest_write_concurrency: usize,
 }
@@ -77,15 +73,12 @@ impl RewriteFilesAction {
     pub(crate) fn new() -> Self {
         let num_cpus = available_parallelism().get();
         Self {
-            ids: CommitIds::new(),
-
             snapshot_properties: HashMap::default(),
             target_branch: MAIN_BRANCH.to_string(),
             files_to_delete: vec![],
             files_to_add: vec![],
             validate_from_snapshot_id: None,
             data_sequence_number: None,
-            merging_state: OnceLock::new(),
             manifest_read_concurrency: num_cpus,
             manifest_write_concurrency: std::cmp::max(1, num_cpus / 4),
         }
@@ -102,17 +95,6 @@ impl RewriteFilesAction {
     pub fn with_manifest_write_concurrency(mut self, n: usize) -> Self {
         self.manifest_write_concurrency = std::cmp::max(1, n);
         self
-    }
-
-    fn merging_state(&self, table: &Table) -> Result<Arc<MergingState>> {
-        if let Some(state) = self.merging_state.get() {
-            return Ok(state.clone());
-        }
-        let read = self.manifest_read_concurrency;
-        let write = self.manifest_write_concurrency;
-        let state = Arc::new(MergingState::from_table(table, read, write)?);
-        let _ = self.merging_state.set(state);
-        Ok(self.merging_state.get().expect("just initialized").clone())
     }
 
     /// Old files being replaced. Paths cannot also appear in `add_files`:
@@ -162,7 +144,19 @@ impl RewriteFilesAction {
 
 #[async_trait]
 impl TransactionAction for RewriteFilesAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+    type State = MergingActionState;
+    fn new_state(&self) -> Self::State {
+        Self::State::default()
+    }
+    async fn cleanup(
+        self,
+        state: Self::State,
+        table: &Table,
+        status: crate::transaction::action::CommitStatus,
+    ) {
+        state.cleanup(table, status).await;
+    }
+    async fn commit(&self, attempt: &mut Self::State, table: &Table) -> Result<ActionCommit> {
         if self.files_to_add.is_empty() {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -184,16 +178,15 @@ impl TransactionAction for RewriteFilesAction {
             }
         }
 
-        // `commit` takes `Arc<Self>` and can't move out of fields, so the file
-        // vectors must be cloned. Non-trivial for large compaction jobs.
         let mut snapshot_producer = SnapshotProducer::new(
             table,
-            self.ids.snapshot_id(table),
-            self.ids.commit_uuid(),
+            attempt.ids.snapshot_id(table),
+            attempt.ids.commit_uuid(),
             self.snapshot_properties.clone(),
             self.files_to_add.clone(),
         )
         .with_target_branch(self.target_branch.clone())
+        .with_attempt(attempt.next_attempt())
         .with_removed_data_files(self.files_to_delete.clone());
 
         if let Some(seq_num) = self.data_sequence_number {
@@ -222,7 +215,11 @@ impl TransactionAction for RewriteFilesAction {
                 .await?;
         }
 
-        let state = self.merging_state(table)?;
+        let state = attempt.merging_state(
+            table,
+            self.manifest_read_concurrency,
+            self.manifest_write_concurrency,
+        )?;
         for f in &self.files_to_delete {
             state.delete(f);
         }
@@ -231,17 +228,10 @@ impl TransactionAction for RewriteFilesAction {
             state: state.clone(),
         };
 
-        let CommitResult {
-            commit,
-            committed_manifest_paths,
-        } = snapshot_producer.commit(rewrite_op, state.clone()).await?;
-        // Only clean up on confirmed success. On error the commit may have reached the
-        // catalog (ACK loss) — deleting committed manifests would cause silent corruption.
-        // Java analog: MergingSnapshotProducer#cleanUncommitted.
-        state
-            .clean_uncommitted(table.file_io(), &committed_manifest_paths)
-            .await;
-        Ok(commit)
+        let result = snapshot_producer
+            .commit(rewrite_op, state, &mut attempt.added_manifests)
+            .await?;
+        Ok(attempt.record_attempt(result))
     }
 }
 
@@ -289,6 +279,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::spec::{MAIN_BRANCH, ManifestStatus, Operation};
+    use crate::test_utils::commit_with_fresh_state;
     use crate::transaction::action::ActionCommit;
     use crate::transaction::tests::{
         append_files, apply_updates_to_table, collect_alive_files, commit_uuid_from,
@@ -310,7 +301,7 @@ mod tests {
         let table = make_v2_minimal_table();
         let tx = Transaction::new(&table);
         let action = tx.rewrite_files();
-        assert!(Arc::new(action).commit(&table).await.is_err());
+        assert!(commit_with_fresh_state(action, &table).await.is_err());
     }
 
     #[tokio::test]
@@ -326,7 +317,7 @@ mod tests {
             .rewrite_files()
             .delete_files(vec![file1.clone()])
             .add_files(vec![file1.clone()]);
-        let Err(err) = Arc::new(action).commit(&table_with_file).await else {
+        let Err(err) = commit_with_fresh_state(action, &table_with_file).await else {
             panic!("expected duplicate-file error");
         };
         assert!(
@@ -348,7 +339,7 @@ mod tests {
             .rewrite_files()
             .delete_files(vec![phantom])
             .add_files(vec![compacted]);
-        let Err(err) = Arc::new(action).commit(&table_with_file).await else {
+        let Err(err) = commit_with_fresh_state(action, &table_with_file).await else {
             panic!("expected phantom-delete error");
         };
         assert!(
@@ -370,7 +361,7 @@ mod tests {
             .rewrite_files()
             .delete_files(vec![file1.clone(), file1.clone()]) // duplicate
             .add_files(vec![compacted]);
-        let Err(err) = Arc::new(action).commit(&table_with_file).await else {
+        let Err(err) = commit_with_fresh_state(action, &table_with_file).await else {
             panic!("expected duplicate-path error");
         };
         assert!(
@@ -397,8 +388,7 @@ mod tests {
             .rewrite_files()
             .delete_files(vec![file1.clone(), file2.clone()])
             .add_files(vec![compacted.clone()]);
-        let mut replace_commit = Arc::new(replace_action)
-            .commit(&table_with_files)
+        let mut replace_commit = commit_with_fresh_state(replace_action, &table_with_files)
             .await
             .unwrap();
 
@@ -512,8 +502,7 @@ mod tests {
             .rewrite_files()
             .delete_files(vec![file1, file2])
             .add_files(vec![compacted]);
-        let updates = Arc::new(replace_action)
-            .commit(&table_with_files)
+        let updates = commit_with_fresh_state(replace_action, &table_with_files)
             .await
             .unwrap()
             .take_updates();
@@ -573,7 +562,7 @@ mod tests {
             .validate_from_snapshot(planning_snapshot_id)
             .delete_files(vec![file1])
             .add_files(vec![compacted]);
-        assert!(Arc::new(replace).commit(&table1).await.is_ok());
+        assert!(commit_with_fresh_state(replace, &table1).await.is_ok());
     }
 
     #[tokio::test]
@@ -592,7 +581,7 @@ mod tests {
             .validate_from_snapshot(999_999_999)
             .delete_files(vec![file1])
             .add_files(vec![compacted]);
-        let Err(err) = Arc::new(replace).commit(&table1).await else {
+        let Err(err) = commit_with_fresh_state(replace, &table1).await else {
             panic!("expected hard error on expired planning snapshot");
         };
         let msg = err.to_string();
@@ -622,8 +611,7 @@ mod tests {
             .rewrite_files()
             .delete_files(vec![file_a])
             .add_files(vec![compacted]);
-        let mut commit = Arc::new(replace)
-            .commit(&table_with_files)
+        let mut commit = commit_with_fresh_state(replace, &table_with_files)
             .await
             .expect("partial manifest should succeed, not error");
         let updates = commit.take_updates();
@@ -691,7 +679,11 @@ mod tests {
             .rewrite_files()
             .delete_files(vec![file_a, file_b])
             .add_files(vec![compacted]);
-        assert!(Arc::new(replace).commit(&table_with_files).await.is_ok());
+        assert!(
+            commit_with_fresh_state(replace, &table_with_files)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -712,8 +704,7 @@ mod tests {
             .rewrite_files()
             .delete_files(vec![file_a])
             .add_files(vec![compacted]);
-        let mut commit = Arc::new(replace)
-            .commit(&table_with_files)
+        let mut commit = commit_with_fresh_state(replace, &table_with_files)
             .await
             .expect("single-file-manifest delete should succeed");
         let updates = commit.take_updates();
@@ -757,8 +748,7 @@ mod tests {
             .rewrite_files()
             .delete_files(vec![file_a, file_c])
             .add_files(vec![compacted]);
-        let mut commit = Arc::new(replace)
-            .commit(&table_with_files)
+        let mut commit = commit_with_fresh_state(replace, &table_with_files)
             .await
             .expect("multiple partial manifests should succeed");
         let updates = commit.take_updates();
@@ -810,8 +800,7 @@ mod tests {
             .rewrite_files()
             .delete_files(vec![file_a, file_b, file_c])
             .add_files(vec![compacted]);
-        let mut commit = Arc::new(replace)
-            .commit(&table_with_files)
+        let mut commit = commit_with_fresh_state(replace, &table_with_files)
             .await
             .expect("complete+partial mix should succeed");
         let updates = commit.take_updates();
@@ -844,8 +833,7 @@ mod tests {
             .delete_files(vec![file1])
             .add_files(vec![compacted]);
 
-        let updates = Arc::new(replace)
-            .commit(&table1)
+        let updates = commit_with_fresh_state(replace, &table1)
             .await
             .unwrap()
             .take_updates();
@@ -876,7 +864,7 @@ mod tests {
         let table = make_v2_minimal_table();
         let tx = Transaction::new(&table);
         let action = tx.rewrite_files();
-        let Err(err) = Arc::new(action).commit(&table).await else {
+        let Err(err) = commit_with_fresh_state(action, &table).await else {
             panic!("empty rewrite must error");
         };
         assert!(err.to_string().contains("files to add"));
@@ -895,7 +883,11 @@ mod tests {
         let new_file = make_data_file(&table, "data/new.parquet", 10);
         let tx = Transaction::new(&table_with_files);
         let action = tx.rewrite_files().add_files(vec![new_file]);
-        assert!(Arc::new(action).commit(&table_with_files).await.is_ok());
+        assert!(
+            commit_with_fresh_state(action, &table_with_files)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -910,7 +902,10 @@ mod tests {
             .rewrite_files()
             .delete_files(vec![f1.clone()])
             .add_files(vec![new1]);
-        let updates = Arc::new(r1).commit(&table).await.unwrap().take_updates();
+        let updates = commit_with_fresh_state(r1, &table)
+            .await
+            .unwrap()
+            .take_updates();
         let table = apply_updates_to_table(&table, &updates);
 
         let new2 = make_data_file(&table, "data/new2.parquet", 10);
@@ -919,7 +914,7 @@ mod tests {
             .rewrite_files()
             .delete_files(vec![f1])
             .add_files(vec![new2]);
-        let Err(err) = Arc::new(r2).commit(&table).await else {
+        let Err(err) = commit_with_fresh_state(r2, &table).await else {
             panic!("rewriting an already-deleted file must error");
         };
         assert!(err.to_string().contains("no longer alive"));
@@ -937,8 +932,7 @@ mod tests {
             .rewrite_files()
             .delete_files(vec![f1])
             .add_files(vec![new]);
-        let updates = Arc::new(action)
-            .commit(&table)
+        let updates = commit_with_fresh_state(action, &table)
             .await
             .unwrap()
             .take_updates();
@@ -959,8 +953,7 @@ mod tests {
             "commit.manifest-merge.enabled".to_string(),
             "false".to_string(),
         );
-        let updates = Arc::new(prop_action)
-            .commit(&table)
+        let updates = commit_with_fresh_state(prop_action, &table)
             .await
             .unwrap()
             .take_updates();
@@ -986,8 +979,7 @@ mod tests {
             .rewrite_files()
             .delete_files(vec![f1])
             .add_files(vec![c1.clone()]);
-        let updates = Arc::new(action)
-            .commit(&table)
+        let updates = commit_with_fresh_state(action, &table)
             .await
             .unwrap()
             .take_updates();
@@ -999,8 +991,7 @@ mod tests {
             .rewrite_files()
             .delete_files(vec![f2])
             .add_files(vec![c2]);
-        let updates = Arc::new(action)
-            .commit(&table)
+        let updates = commit_with_fresh_state(action, &table)
             .await
             .unwrap()
             .take_updates();
@@ -1036,8 +1027,7 @@ mod tests {
                 "commit.manifest.target-size-bytes".to_string(),
                 "1048576".to_string(),
             );
-        let updates = Arc::new(prop_action)
-            .commit(&table)
+        let updates = commit_with_fresh_state(prop_action, &table)
             .await
             .unwrap()
             .take_updates();
@@ -1066,7 +1056,10 @@ mod tests {
             .rewrite_files()
             .delete_files(vec![f1])
             .add_files(vec![c1]);
-        let updates = Arc::new(action).commit(&t).await.unwrap().take_updates();
+        let updates = commit_with_fresh_state(action, &t)
+            .await
+            .unwrap()
+            .take_updates();
         let t = apply_updates_to_table(&t, &updates);
 
         let post_count = t
@@ -1104,8 +1097,7 @@ mod tests {
             "commit.manifest.min-count-to-merge".to_string(),
             "2".to_string(),
         );
-        let updates = Arc::new(prop_action)
-            .commit(&table)
+        let updates = commit_with_fresh_state(prop_action, &table)
             .await
             .unwrap()
             .take_updates();
@@ -1128,8 +1120,7 @@ mod tests {
             .rewrite_files()
             .delete_files(vec![other])
             .add_files(vec![compacted]);
-        let updates = Arc::new(action)
-            .commit(&table)
+        let updates = commit_with_fresh_state(action, &table)
             .await
             .unwrap()
             .take_updates();
@@ -1152,17 +1143,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_rewrite_idempotent_merging_state() {
-        // Re-invoking commit() on the same Arc<RewriteFilesAction> structurally
-        // models the Transaction-level retry path. The merging-state caches
-        // must short-circuit so the second attempt produces identical paths.
         let mut table = make_v2_minimal_table();
         let tx = Transaction::new(&table);
         let prop_action = tx.update_table_properties().set(
             "commit.manifest.min-count-to-merge".to_string(),
             "2".to_string(),
         );
-        let updates = Arc::new(prop_action)
-            .commit(&table)
+        let updates = commit_with_fresh_state(prop_action, &table)
             .await
             .unwrap()
             .take_updates();
@@ -1174,14 +1161,13 @@ mod tests {
         let table = append_files(table, vec![f2.clone()]).await;
 
         let c1 = make_data_file(&table, "data/c1.parquet", 10);
-        let action = Arc::new(
-            Transaction::new(&table)
-                .rewrite_files()
-                .delete_files(vec![f1])
-                .add_files(vec![c1]),
-        );
-        let _ = action.clone().commit(&table).await.unwrap();
-        let _ = action.commit(&table).await.unwrap();
+        let action = Transaction::new(&table)
+            .rewrite_files()
+            .delete_files(vec![f1])
+            .add_files(vec![c1]);
+        let mut action_state = action.new_state();
+        let _ = action.commit(&mut action_state, &table).await.unwrap();
+        let _ = action.commit(&mut action_state, &table).await.unwrap();
     }
 
     #[tokio::test]
@@ -1191,12 +1177,11 @@ mod tests {
         let table = append_files(table, vec![f1.clone()]).await;
 
         let c1 = make_data_file(&table, "data/c1.parquet", 10);
-        let action = Arc::new(
-            Transaction::new(&table)
-                .rewrite_files()
-                .delete_files(vec![f1])
-                .add_files(vec![c1]),
-        );
+        let action = Transaction::new(&table)
+            .rewrite_files()
+            .delete_files(vec![f1])
+            .add_files(vec![c1]);
+        let mut action_state = action.new_state();
 
         fn replaced_count(ac: &mut ActionCommit) -> String {
             for u in ac.take_updates() {
@@ -1212,8 +1197,8 @@ mod tests {
             panic!("no manifests-replaced in snapshot summary");
         }
 
-        let count1 = replaced_count(&mut action.clone().commit(&table).await.unwrap());
-        let count2 = replaced_count(&mut action.commit(&table).await.unwrap());
+        let count1 = replaced_count(&mut action.commit(&mut action_state, &table).await.unwrap());
+        let count2 = replaced_count(&mut action.commit(&mut action_state, &table).await.unwrap());
         assert_eq!(
             count1, count2,
             "manifests-replaced must be stable across retries"
@@ -1234,30 +1219,32 @@ mod tests {
 
         // Compaction A
         let new_a = make_data_file(&table, "data/new_a.parquet", 10);
-        let action_a = Arc::new(
-            Transaction::new(&table)
-                .rewrite_files()
-                .delete_files(vec![f1.clone()])
-                .add_files(vec![new_a])
-                .validate_from_snapshot(s0_id),
-        );
+        let action_a = Transaction::new(&table)
+            .rewrite_files()
+            .delete_files(vec![f1.clone()])
+            .add_files(vec![new_a])
+            .validate_from_snapshot(s0_id);
+        let mut action_a_state = action_a.new_state();
 
         // Compaction B
         let new_b = make_data_file(&table, "data/new_b.parquet", 10);
-        let action_b = Arc::new(
-            Transaction::new(&table)
-                .rewrite_files()
-                .delete_files(vec![f1.clone()])
-                .add_files(vec![new_b])
-                .validate_from_snapshot(s0_id),
-        );
+        let action_b = Transaction::new(&table)
+            .rewrite_files()
+            .delete_files(vec![f1.clone()])
+            .add_files(vec![new_b])
+            .validate_from_snapshot(s0_id);
+        let mut action_b_state = action_b.new_state();
 
         // A commits first
-        let updates_a = action_a.commit(&table).await.unwrap().take_updates();
+        let updates_a = action_a
+            .commit(&mut action_a_state, &table)
+            .await
+            .unwrap()
+            .take_updates();
         table = apply_updates_to_table(&table, &updates_a);
 
         // B attempts to commit against the new table state
-        let Err(err) = action_b.commit(&table).await else {
+        let Err(err) = action_b.commit(&mut action_b_state, &table).await else {
             panic!("Parallel rewrite targeting same file must be rejected");
         };
 
@@ -1279,31 +1266,33 @@ mod tests {
 
         // Compaction A targets f1
         let new_a = make_data_file(&table, "data/new_a.parquet", 10);
-        let action_a = Arc::new(
-            Transaction::new(&table)
-                .rewrite_files()
-                .delete_files(vec![f1])
-                .add_files(vec![new_a])
-                .validate_from_snapshot(s0_id),
-        );
+        let action_a = Transaction::new(&table)
+            .rewrite_files()
+            .delete_files(vec![f1])
+            .add_files(vec![new_a])
+            .validate_from_snapshot(s0_id);
+        let mut action_a_state = action_a.new_state();
 
         // Compaction B targets f2
         let new_b = make_data_file(&table, "data/new_b.parquet", 10);
-        let action_b = Arc::new(
-            Transaction::new(&table)
-                .rewrite_files()
-                .delete_files(vec![f2])
-                .add_files(vec![new_b])
-                .validate_from_snapshot(s0_id),
-        );
+        let action_b = Transaction::new(&table)
+            .rewrite_files()
+            .delete_files(vec![f2])
+            .add_files(vec![new_b])
+            .validate_from_snapshot(s0_id);
+        let mut action_b_state = action_b.new_state();
 
         // A commits first
-        let updates_a = action_a.commit(&table).await.unwrap().take_updates();
+        let updates_a = action_a
+            .commit(&mut action_a_state, &table)
+            .await
+            .unwrap()
+            .take_updates();
         table = apply_updates_to_table(&table, &updates_a);
 
         // B attempts to commit against the new table state and should succeed
         // because f2 is still alive.
-        let result_b = action_b.commit(&table).await;
+        let result_b = action_b.commit(&mut action_b_state, &table).await;
         assert!(
             result_b.is_ok(),
             "Parallel disjoint rewrite failed: {:?}",
@@ -1333,8 +1322,7 @@ mod tests {
                 "commit.manifest.target-size-bytes".to_string(),
                 "104857600".to_string(),
             );
-        let updates = Arc::new(prop_action)
-            .commit(&table)
+        let updates = commit_with_fresh_state(prop_action, &table)
             .await
             .unwrap()
             .take_updates();
@@ -1362,8 +1350,7 @@ mod tests {
             .rewrite_files()
             .delete_files(vec![f1])
             .add_files(vec![c1.clone()]);
-        let updates = Arc::new(action)
-            .commit(&table)
+        let updates = commit_with_fresh_state(action, &table)
             .await
             .unwrap()
             .take_updates();
@@ -1410,8 +1397,7 @@ mod tests {
                 "commit.manifest.target-size-bytes".to_string(),
                 "104857600".to_string(),
             );
-        let updates = Arc::new(prop_action)
-            .commit(&table)
+        let updates = commit_with_fresh_state(prop_action, &table)
             .await
             .unwrap()
             .take_updates();
@@ -1435,7 +1421,10 @@ mod tests {
             .rewrite_files()
             .delete_files(vec![f1])
             .add_files(vec![c1.clone()]);
-        let updates = Arc::new(action).commit(&t).await.unwrap().take_updates();
+        let updates = commit_with_fresh_state(action, &t)
+            .await
+            .unwrap()
+            .take_updates();
         let t = apply_updates_to_table(&t, &updates);
 
         let snap = t.metadata().current_snapshot().unwrap();
@@ -1466,8 +1455,7 @@ mod tests {
                 "commit.manifest.target-size-bytes".to_string(),
                 "104857600".to_string(),
             );
-        let updates = Arc::new(prop_action)
-            .commit(&table)
+        let updates = commit_with_fresh_state(prop_action, &table)
             .await
             .unwrap()
             .take_updates();
@@ -1498,7 +1486,10 @@ mod tests {
             .rewrite_files()
             .delete_files(vec![carry_files[0].clone()])
             .add_files(vec![new_f.clone()]);
-        let updates = Arc::new(action).commit(&t).await.unwrap().take_updates();
+        let updates = commit_with_fresh_state(action, &t)
+            .await
+            .unwrap()
+            .take_updates();
         let t = apply_updates_to_table(&t, &updates);
 
         let snap = t.metadata().current_snapshot().unwrap();
@@ -1549,7 +1540,10 @@ mod tests {
                 .rewrite_files()
                 .delete_files(current.clone())
                 .add_files(vec![compacted.clone()]);
-            let updates = Arc::new(action).commit(&t).await.unwrap().take_updates();
+            let updates = commit_with_fresh_state(action, &t)
+                .await
+                .unwrap()
+                .take_updates();
             t = apply_updates_to_table(&t, &updates);
 
             let snap = t.metadata().current_snapshot().unwrap();
@@ -1592,7 +1586,10 @@ mod tests {
             "commit.manifest.min-count-to-merge".to_string(),
             "2".to_string(),
         );
-        let updates = Arc::new(prop).commit(&table).await.unwrap().take_updates();
+        let updates = commit_with_fresh_state(prop, &table)
+            .await
+            .unwrap()
+            .take_updates();
         table = apply_updates_to_table(&table, &updates);
 
         let f1 = make_data_file(&table, "data/f1.parquet", 10);
@@ -1703,8 +1700,7 @@ mod tests {
             .rewrite_files()
             .delete_files(vec![f1])
             .add_files(vec![c1]);
-        let updates = Arc::new(action)
-            .commit(&table)
+        let updates = commit_with_fresh_state(action, &table)
             .await
             .unwrap()
             .take_updates();
@@ -1729,15 +1725,22 @@ mod tests {
         let table = append_files(table, vec![f1.clone()]).await;
         let c1 = make_data_file(&table, "data/c1.parquet", 10);
 
-        let action = Arc::new(
-            Transaction::new(&table)
-                .rewrite_files()
-                .delete_files(vec![f1])
-                .add_files(vec![c1]),
-        );
+        let action = Transaction::new(&table)
+            .rewrite_files()
+            .delete_files(vec![f1])
+            .add_files(vec![c1]);
+        let mut action_state = action.new_state();
 
-        let updates1 = action.clone().commit(&table).await.unwrap().take_updates();
-        let updates2 = action.commit(&table).await.unwrap().take_updates();
+        let updates1 = action
+            .commit(&mut action_state, &table)
+            .await
+            .unwrap()
+            .take_updates();
+        let updates2 = action
+            .commit(&mut action_state, &table)
+            .await
+            .unwrap()
+            .take_updates();
 
         assert_eq!(
             snapshot_id_from(&updates1),

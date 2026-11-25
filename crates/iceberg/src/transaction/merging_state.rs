@@ -34,7 +34,7 @@ use crate::spec::{DataFile, ManifestFile};
 use crate::table::Table;
 use crate::transaction::manifest_filter::ManifestFilterManager;
 use crate::transaction::manifest_merge::ManifestMergeManager;
-use crate::transaction::snapshot::{ManifestProcess, SnapshotProducer};
+use crate::transaction::snapshot::merging::{ManifestProcess, SnapshotProducer};
 
 pub(crate) struct MergingState {
     data_filter: ManifestFilterManager,

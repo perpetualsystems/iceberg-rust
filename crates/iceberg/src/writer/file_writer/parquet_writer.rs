@@ -35,7 +35,7 @@ use parquet::file::statistics::Statistics;
 use parquet::geospatial::bounding_box::BoundingBox;
 use parquet_geospatial::interval::{Interval, IntervalTrait, WraparoundInterval};
 
-use super::{FileWriter, FileWriterBuilder};
+use super::{FileWriter, FileWriterBuilder, RowGroupFlushable};
 use crate::arrow::{
     ArrowFileReader, DEFAULT_MAP_FIELD_NAME, FieldMatchMode, NanValueCountVisitor,
     get_parquet_stat_max_as_datum, get_parquet_stat_min_as_datum,
@@ -61,6 +61,14 @@ pub struct ParquetWriterBuilder {
     schema: SchemaRef,
     match_mode: FieldMatchMode,
     encryption_manager: Option<Arc<EncryptionManager>>,
+    /// Optional override for the Arrow schema the writer uses when initializing the
+    /// underlying `AsyncArrowWriter`. When `None`, derived from `schema`.
+    ///
+    /// Useful when the caller wants the writer to accept batches whose Arrow types
+    /// differ from the default `schema_to_arrow_schema` mapping — e.g. `Utf8View`
+    /// instead of `Utf8` — without a physical cast. The types must still share the
+    /// same Parquet physical encoding (e.g. both map to `BYTE_ARRAY`).
+    arrow_schema_override: Option<ArrowSchemaRef>,
 }
 
 impl ParquetWriterBuilder {
@@ -85,6 +93,7 @@ impl ParquetWriterBuilder {
             schema,
             match_mode,
             encryption_manager: None,
+            arrow_schema_override: None,
         }
     }
 
@@ -122,6 +131,17 @@ impl ParquetWriterBuilder {
     /// incoming Arrow schema does not carry Iceberg field-id metadata.
     pub fn with_match_mode(mut self, match_mode: FieldMatchMode) -> Self {
         self.match_mode = match_mode;
+        self
+    }
+
+    /// Override the Arrow schema used by the underlying `AsyncArrowWriter`.
+    ///
+    /// The override must be encoding-compatible with the Iceberg schema — same
+    /// field IDs, same Parquet physical types. The only permitted divergence is
+    /// Arrow-level layout variants like `Utf8View` vs `Utf8` or `BinaryView` vs
+    /// `Binary`, which share their Parquet physical encoding (`BYTE_ARRAY`).
+    pub fn with_arrow_schema(mut self, arrow_schema: ArrowSchemaRef) -> Self {
+        self.arrow_schema_override = Some(arrow_schema);
         self
     }
 
@@ -172,8 +192,13 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             .map(|em| em.generate_key_metadata());
         let writer_properties =
             resolve_writer_properties(self.props.clone(), key_metadata.as_ref())?;
+        let arrow_schema: ArrowSchemaRef = match &self.arrow_schema_override {
+            Some(override_schema) => override_schema.clone(),
+            None => Arc::new(self.schema.as_ref().try_into()?),
+        };
         Ok(ParquetWriter {
             schema: self.schema.clone(),
+            arrow_schema,
             inner_writer: None,
             writer_properties,
             current_row_num: 0,
@@ -299,16 +324,16 @@ impl SchemaVisitor for IndexByParquetPathName {
     }
 
     fn variant(&mut self, _v: &VariantType) -> Result<Self::T> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Writing variant columns to Parquet is not supported yet",
-        ))
+        // A Variant is a Parquet group whose physical metadata/value leaves have
+        // no Iceberg field IDs. There are no primitive min/max metrics to collect.
+        Ok(())
     }
 }
 
 /// `ParquetWriter`` is used to write arrow data into parquet file on storage.
 pub struct ParquetWriter {
     schema: SchemaRef,
+    arrow_schema: ArrowSchemaRef,
     output_file: OutputFile,
     inner_writer: Option<AsyncArrowWriter<AsyncFileWriter>>,
     writer_properties: WriterProperties,
@@ -748,12 +773,11 @@ impl FileWriter for ParquetWriter {
         let writer = if let Some(writer) = &mut self.inner_writer {
             writer
         } else {
-            let arrow_schema: ArrowSchemaRef = Arc::new(self.schema.as_ref().try_into()?);
             let inner_writer = self.output_file.writer().await?;
             let async_writer = AsyncFileWriter::new(inner_writer);
             let writer = AsyncArrowWriter::try_new(
                 async_writer,
-                arrow_schema.clone(),
+                self.arrow_schema.clone(),
                 Some(self.writer_properties.clone()),
             )
             .map_err(|err| {
@@ -832,6 +856,24 @@ impl CurrentFileStatus for ParquetWriter {
     }
 }
 
+impl RowGroupFlushable for ParquetWriter {
+    fn in_progress_row_group_bytes(&self) -> usize {
+        self.inner_writer
+            .as_ref()
+            .map(|w| w.in_progress_size())
+            .unwrap_or(0)
+    }
+
+    async fn flush_row_group(&mut self) -> Result<()> {
+        if let Some(writer) = self.inner_writer.as_mut() {
+            writer.flush().await.map_err(|e| {
+                Error::new(ErrorKind::Unexpected, "Failed to flush row group.").with_source(e)
+            })?;
+        }
+        Ok(())
+    }
+}
+
 /// AsyncFileWriter is a wrapper of FileWrite to make it compatible with tokio::io::AsyncWrite.
 ///
 /// # NOTES
@@ -891,6 +933,10 @@ mod tests {
     use parquet::file::statistics::ValueStatistics;
     use parquet::schema::types::ColumnPath;
     use parquet_geospatial::testing::wkb_point_xy;
+    use parquet_variant_compute::{
+        VariantArray, VariantArrayBuilder, VariantType as ArrowVariantType,
+    };
+    use parquet_variant_json::{JsonToVariant, VariantToJson};
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -1061,9 +1107,7 @@ mod tests {
     }
 
     #[test]
-    fn test_index_by_parquet_path_variant_is_unsupported() {
-        // Writing variant columns to Parquet is not supported yet; indexing a schema that
-        // contains one must error rather than silently miss-map columns.
+    fn test_index_by_parquet_path_skips_variant_storage_leaves() {
         let schema = Schema::builder()
             .with_fields(vec![
                 NestedField::optional(1, "v", Type::Variant(VariantType)).into(),
@@ -1071,8 +1115,123 @@ mod tests {
             .build()
             .unwrap();
         let mut visitor = IndexByParquetPathName::new();
-        let err = visit_schema(&schema, &mut visitor).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported, "{err}");
+        visit_schema(&schema, &mut visitor).unwrap();
+        assert!(visitor.name_to_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_parquet_writer_variant_round_trip() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let file_io = FileIO::new_with_fs();
+        let file_path = temp_dir.path().join("variant.parquet");
+        let output = file_io.new_output(file_path.to_str().unwrap())?;
+        let iceberg_schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "payload", Type::Variant(VariantType)).into(),
+                ])
+                .build()?,
+        );
+
+        let mut values = VariantArrayBuilder::new(3);
+        values.append_json(r#"{"nested":[1,true,null]}"#)?;
+        values.append_null();
+        values.append_json("null")?;
+        let storage: StructArray = values.build().into();
+        // Hamelin makes the value child nullable even for unshredded input.
+        let storage = StructArray::new(
+            Fields::from(vec![
+                Field::new("metadata", DataType::BinaryView, false),
+                Field::new("value", DataType::BinaryView, true),
+            ]),
+            storage.columns().to_vec(),
+            storage.nulls().cloned(),
+        );
+        let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("payload", storage.data_type().clone(), true)
+                .with_metadata(HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "2".to_string(),
+                )]))
+                .with_extension_type(ArrowVariantType),
+        ]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(storage),
+        ])?;
+        let mut writer =
+            ParquetWriterBuilder::new(WriterProperties::default(), iceberg_schema.clone())
+                .build(output)
+                .await?;
+        writer.write(&batch).await?;
+        let files = writer.close().await?;
+        assert_eq!(files.len(), 1);
+
+        let raw = file_io
+            .new_input(file_path.to_str().unwrap())?
+            .read()
+            .await?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(raw)?;
+        let parquet_field = &reader.parquet_schema().root_schema().get_fields()[1];
+        assert!(matches!(
+            parquet_field.get_basic_info().logical_type_ref(),
+            Some(LogicalType::Variant { .. })
+        ));
+        assert_eq!(parquet_field.get_basic_info().id(), 2);
+        assert!(
+            parquet_field
+                .get_fields()
+                .iter()
+                .all(|child| !child.get_basic_info().has_id())
+        );
+
+        let batches: Vec<_> = reader.build()?.collect::<std::result::Result<_, _>>()?;
+        let read = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let read = VariantArray::try_new(read)?;
+        assert_eq!(
+            read.value(0).to_json_string()?,
+            r#"{"nested":[1,true,null]}"#
+        );
+        assert!(read.is_null(1));
+        assert_eq!(read.value(2).to_json_string()?, "null");
+
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(std::fs::metadata(&file_path)?.len())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(file_path.to_str().unwrap().to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(iceberg_schema)
+            .with_project_field_ids(vec![2])
+            .with_case_sensitive(false)
+            .build()?;
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let scan = ArrowReaderBuilder::new(file_io, Runtime::current()).build();
+        let projected: Vec<RecordBatch> = scan.read(tasks)?.stream().try_collect().await?;
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].num_columns(), 1);
+        let payload = projected[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let payload = VariantArray::try_new(payload)?;
+        assert_eq!(
+            payload.value(0).to_json_string()?,
+            r#"{"nested":[1,true,null]}"#
+        );
+        assert!(payload.is_null(1));
+        assert_eq!(payload.value(2).to_json_string()?, "null");
+        Ok(())
     }
 
     #[tokio::test]

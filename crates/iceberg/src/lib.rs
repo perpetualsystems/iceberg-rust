@@ -100,6 +100,7 @@ pub use runtime::{JoinHandle, Runtime, RuntimeHandle};
 pub mod arrow;
 pub(crate) mod delete_file_index;
 pub mod encryption;
+mod prptl_utils;
 #[cfg(test)]
 mod test_utils;
 pub mod writer;

@@ -71,6 +71,7 @@ parquet = { workspace = true, features = [
   "encryption",
   "arrow_canonical_extension_types",
   "geospatial",
+  "variant_experimental",
 ] }
 parquet-geospatial = { workspace = true }
 rand = { workspace = true }
@@ -93,6 +94,8 @@ zeroize = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
+parquet-variant-compute = "60"
+parquet-variant-json = "60"
 expect-test = { workspace = true }
 iceberg_test_utils = { path = "../test_utils", features = ["tests"] }
 minijinja = { workspace = true }

@@ -32,6 +32,7 @@ use crate::{Error, ErrorKind};
 /// FastAppendAction is a transaction action for fast append data files to the table.
 #[derive(Clone)]
 pub struct FastAppendAction {
+    target_branch: String,
     check_duplicate: bool,
     /// Overrides the commit UUID of the producer created in `new_state`.
     commit_uuid: Option<Uuid>,
@@ -45,12 +46,19 @@ pub struct FastAppendAction {
 impl FastAppendAction {
     pub(crate) fn new() -> Self {
         Self {
+            target_branch: crate::spec::MAIN_BRANCH.to_string(),
             check_duplicate: true,
             commit_uuid: None,
             snapshot_properties: HashMap::default(),
             added_data_files: vec![],
             added_paths: HashSet::new(),
         }
+    }
+
+    /// Commits the append to the named branch, creating it if necessary.
+    pub fn to_branch(mut self, name: impl Into<String>) -> Self {
+        self.target_branch = name.into();
+        self
     }
 
     /// Set whether to check duplicate files
@@ -117,6 +125,7 @@ impl TransactionAction for FastAppendAction {
 
     fn new_state(&self) -> SimpleSnapshotProducer {
         SimpleSnapshotProducer::new(AppendIntent {
+            target_branch: self.target_branch.clone(),
             commit_uuid: self.commit_uuid,
             snapshot_properties: self.snapshot_properties.clone(),
             data_files: self.added_data_files.clone(),
@@ -130,7 +139,7 @@ impl TransactionAction for FastAppendAction {
     ) -> Result<ActionCommit> {
         self.validate()?;
         if self.check_duplicate {
-            validate_files_not_live(table, &self.added_data_files).await?;
+            validate_files_not_live(table, &self.target_branch, &self.added_data_files).await?;
         }
         state.apply(table).await
     }

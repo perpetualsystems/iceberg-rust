@@ -16,7 +16,7 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -25,9 +25,9 @@ use crate::spec::{
     DataContentType, DataFile, FormatVersion, MAIN_BRANCH, ManifestEntry, ManifestFile, Operation,
 };
 use crate::table::Table;
-use crate::transaction::commit_ids::CommitIds;
+use crate::transaction::commit_ids::MergingActionState;
 use crate::transaction::merging_state::MergingState;
-use crate::transaction::snapshot::{CommitResult, SnapshotProduceOperation, SnapshotProducer};
+use crate::transaction::snapshot::merging::{SnapshotProduceOperation, SnapshotProducer};
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::util::available_parallelism;
 use crate::{Error, ErrorKind};
@@ -51,16 +51,15 @@ use crate::{Error, ErrorKind};
 /// - `deleteFromRowFilter` — delete files matching a predicate
 /// - `caseSensitive` — case sensitivity for filter evaluation
 /// - `validateNoConflictingAppends` — conflict detection
+#[derive(Clone)]
 pub struct DeleteFilesAction {
     deleted_data_files: Vec<DataFile>,
     validate_files_exist: bool,
-    ids: CommitIds,
 
     snapshot_properties: HashMap<String, String>,
     target_branch: String,
     manifest_read_concurrency: usize,
     manifest_write_concurrency: usize,
-    merging_state: OnceLock<Arc<MergingState>>,
 }
 
 impl DeleteFilesAction {
@@ -69,13 +68,11 @@ impl DeleteFilesAction {
         Self {
             deleted_data_files: vec![],
             validate_files_exist: false,
-            ids: CommitIds::new(),
 
             snapshot_properties: HashMap::default(),
             target_branch: MAIN_BRANCH.to_string(),
             manifest_read_concurrency: num_cpus,
             manifest_write_concurrency: std::cmp::max(1, num_cpus / 4),
-            merging_state: OnceLock::new(),
         }
     }
 
@@ -141,19 +138,6 @@ impl DeleteFilesAction {
         }
         Ok(())
     }
-
-    fn merging_state(&self, table: &Table) -> Result<Arc<MergingState>> {
-        if let Some(state) = self.merging_state.get() {
-            return Ok(state.clone());
-        }
-        let state = Arc::new(MergingState::from_table(
-            table,
-            self.manifest_read_concurrency,
-            self.manifest_write_concurrency,
-        )?);
-        let _ = self.merging_state.set(state);
-        Ok(self.merging_state.get().expect("just initialized").clone())
-    }
 }
 
 async fn collect_alive_paths(
@@ -179,7 +163,19 @@ async fn collect_alive_paths(
 
 #[async_trait]
 impl TransactionAction for DeleteFilesAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+    type State = MergingActionState;
+    fn new_state(&self) -> Self::State {
+        Self::State::default()
+    }
+    async fn cleanup(
+        self,
+        state: Self::State,
+        table: &Table,
+        status: crate::transaction::action::CommitStatus,
+    ) {
+        state.cleanup(table, status).await;
+    }
+    async fn commit(&self, attempt: &mut Self::State, table: &Table) -> Result<ActionCommit> {
         if self.deleted_data_files.is_empty() {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -207,12 +203,13 @@ impl TransactionAction for DeleteFilesAction {
 
         let snapshot_producer = SnapshotProducer::new(
             table,
-            self.ids.snapshot_id(table),
-            self.ids.commit_uuid(),
+            attempt.ids.snapshot_id(table),
+            attempt.ids.commit_uuid(),
             self.snapshot_properties.clone(),
             vec![],
         )
-        .with_target_branch(self.target_branch.clone());
+        .with_target_branch(self.target_branch.clone())
+        .with_attempt(attempt.next_attempt());
 
         if self.validate_files_exist {
             snapshot_producer
@@ -231,7 +228,11 @@ impl TransactionAction for DeleteFilesAction {
             .collect();
         let snapshot_producer = snapshot_producer.with_removed_data_files(actually_removed);
 
-        let state = self.merging_state(table)?;
+        let state = attempt.merging_state(
+            table,
+            self.manifest_read_concurrency,
+            self.manifest_write_concurrency,
+        )?;
 
         for f in &deduped {
             state.delete(f);
@@ -241,15 +242,10 @@ impl TransactionAction for DeleteFilesAction {
             state: state.clone(),
         };
 
-        let CommitResult {
-            commit,
-            committed_manifest_paths,
-        } = snapshot_producer.commit(op, state.clone()).await?;
-
-        state
-            .clean_uncommitted(table.file_io(), &committed_manifest_paths)
-            .await;
-        Ok(commit)
+        let result = snapshot_producer
+            .commit(op, state, &mut attempt.added_manifests)
+            .await?;
+        Ok(attempt.record_attempt(result))
     }
 }
 
@@ -298,9 +294,9 @@ impl SnapshotProduceOperation for DeleteFilesOperation {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use crate::spec::{DataContentType, DataFileBuilder, DataFileFormat, Literal, Struct};
+    use crate::test_utils::commit_with_fresh_state;
     use crate::transaction::tests::{
         append_files, apply_updates_to_table, collect_alive_files, commit_uuid_from,
         make_data_file, make_v2_minimal_table, snapshot_id_from,
@@ -319,8 +315,7 @@ mod tests {
 
         let tx = Transaction::new(&table);
         let action = tx.delete_files().delete_file(f1.clone());
-        let updates = Arc::new(action)
-            .commit(&table)
+        let updates = commit_with_fresh_state(action, &table)
             .await
             .unwrap()
             .take_updates();
@@ -347,7 +342,7 @@ mod tests {
             .validate_files_exist()
             .delete_file(f1.clone());
 
-        let result = Arc::new(action).commit(&table).await;
+        let result = commit_with_fresh_state(action, &table).await;
         assert!(
             result.is_err(),
             "validate_files_exist must reject missing paths"
@@ -363,8 +358,7 @@ mod tests {
         // Pass the same file twice — should succeed silently, not double-delete.
         let tx = Transaction::new(&table);
         let action = tx.delete_files().delete_files(vec![f1.clone(), f1.clone()]);
-        let updates = Arc::new(action)
-            .commit(&table)
+        let updates = commit_with_fresh_state(action, &table)
             .await
             .unwrap()
             .take_updates();
@@ -383,7 +377,7 @@ mod tests {
 
         let tx = Transaction::new(&table);
         let action = tx.delete_files().delete_file(f1.clone());
-        let result = Arc::new(action).commit(&table).await;
+        let result = commit_with_fresh_state(action, &table).await;
         assert!(
             result.is_ok(),
             "absent path without validate_files_exist must succeed silently"
@@ -401,8 +395,7 @@ mod tests {
 
         let tx = Transaction::new(&table);
         let action = tx.delete_files().delete_file(f1.clone());
-        let updates = Arc::new(action)
-            .commit(&table)
+        let updates = commit_with_fresh_state(action, &table)
             .await
             .unwrap()
             .take_updates();
@@ -431,7 +424,7 @@ mod tests {
 
         let tx = Transaction::new(&table);
         let action = tx.delete_files().delete_file(eq_delete);
-        let result = Arc::new(action).commit(&table).await;
+        let result = commit_with_fresh_state(action, &table).await;
         assert!(
             result.is_err(),
             "DeleteFiles must reject equality-delete files"
@@ -444,10 +437,19 @@ mod tests {
         let f1 = make_data_file(&table, "data/f1.parquet", 10);
         let table = append_files(table, vec![f1.clone()]).await;
 
-        let action = Arc::new(Transaction::new(&table).delete_files().delete_file(f1));
+        let action = Transaction::new(&table).delete_files().delete_file(f1);
+        let mut action_state = action.new_state();
 
-        let updates1 = action.clone().commit(&table).await.unwrap().take_updates();
-        let updates2 = action.commit(&table).await.unwrap().take_updates();
+        let updates1 = action
+            .commit(&mut action_state, &table)
+            .await
+            .unwrap()
+            .take_updates();
+        let updates2 = action
+            .commit(&mut action_state, &table)
+            .await
+            .unwrap()
+            .take_updates();
 
         assert_eq!(
             snapshot_id_from(&updates1),

@@ -118,6 +118,10 @@ pub struct FileScanTask {
     #[builder(default)]
     unified_partition_type: Option<Arc<StructType>>,
 
+    /// Row group offsets recorded in the data file manifest.
+    #[builder(default)]
+    pub split_offsets: Option<Vec<i64>>,
+
     /// The raw `sort_order_id` recorded on the data file (spec field 140), carried through
     /// unresolved. See [`DataFile::sort_order_id()`](crate::spec::DataFile::sort_order_id).
     /// `None` if the file has no sort order id.
