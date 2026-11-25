@@ -15,12 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::OnceLock;
+use std::collections::HashSet;
+use std::sync::{Arc, OnceLock};
 
 use uuid::Uuid;
 
+use super::action::CommitStatus;
+use super::merging_state::MergingState;
+use super::snapshot::merging::{AddedManifestState, CommitResult};
+use crate::Result;
 use crate::table::Table;
-use crate::transaction::snapshot::SnapshotProducer;
+use crate::transaction::ActionCommit;
 
 /// Snapshot id and commit UUID held behind `OnceLock`s so they survive OCC retries.
 ///
@@ -28,27 +33,70 @@ use crate::transaction::snapshot::SnapshotProducer;
 /// both values; subsequent retries observe the same pair, which is the contract the
 /// catalog requires for idempotent retries (matching path planning, manifest list
 /// filenames, and snapshot identity across attempts).
+#[derive(Default)]
 pub(crate) struct CommitIds {
     snapshot_id: OnceLock<i64>,
     commit_uuid: OnceLock<Uuid>,
 }
 
 impl CommitIds {
-    pub(crate) fn new() -> Self {
-        Self {
-            snapshot_id: OnceLock::new(),
-            commit_uuid: OnceLock::new(),
-        }
-    }
-
     pub(crate) fn snapshot_id(&self, table: &Table) -> i64 {
         *self
             .snapshot_id
-            .get_or_init(|| SnapshotProducer::generate_unique_snapshot_id(table))
+            .get_or_init(|| crate::transaction::snapshot::generate_snapshot_id(table))
     }
 
     pub(crate) fn commit_uuid(&self) -> Uuid {
         *self.commit_uuid.get_or_init(Uuid::now_v7)
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct MergingActionState {
+    pub(crate) ids: CommitIds,
+    pub(crate) added_manifests: AddedManifestState,
+    retained_paths: HashSet<String>,
+    attempt: u64,
+    merging: Option<Arc<MergingState>>,
+}
+
+impl MergingActionState {
+    pub(crate) fn next_attempt(&mut self) -> u64 {
+        let current = self.attempt;
+        self.attempt += 1;
+        current
+    }
+
+    pub(crate) fn record_attempt(&mut self, result: CommitResult) -> ActionCommit {
+        self.retained_paths = result.committed_manifest_paths;
+        result.commit
+    }
+
+    pub(crate) async fn cleanup(mut self, table: &Table, status: CommitStatus) {
+        match status {
+            CommitStatus::Committed => {}
+            CommitStatus::Failed => self.retained_paths.clear(),
+            CommitStatus::Unknown => return,
+        }
+        if let Some(state) = self.merging {
+            state
+                .clean_uncommitted(table.file_io(), &self.retained_paths)
+                .await;
+        }
+    }
+
+    pub(crate) fn merging_state(
+        &mut self,
+        table: &Table,
+        reads: usize,
+        writes: usize,
+    ) -> Result<Arc<MergingState>> {
+        if let Some(state) = &self.merging {
+            return Ok(state.clone());
+        }
+        let state = Arc::new(MergingState::from_table(table, reads, writes)?);
+        self.merging = Some(state.clone());
+        Ok(state)
     }
 }
 
@@ -60,13 +108,13 @@ mod tests {
     #[test]
     fn snapshot_id_is_idempotent() {
         let table = make_v2_minimal_table();
-        let ids = CommitIds::new();
+        let ids = CommitIds::default();
         assert_eq!(ids.snapshot_id(&table), ids.snapshot_id(&table));
     }
 
     #[test]
     fn commit_uuid_is_idempotent() {
-        let ids = CommitIds::new();
+        let ids = CommitIds::default();
         assert_eq!(ids.commit_uuid(), ids.commit_uuid());
     }
 }

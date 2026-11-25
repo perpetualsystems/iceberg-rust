@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, SchemaRef as ArrowSchemaRef};
 use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::{
@@ -37,7 +37,8 @@ use super::predicate_visitor::residual_for_missing_fields;
 use super::row_lineage::synthesize_row_id_column;
 use super::{
     ArrowFileReader, ArrowReader, ParquetReadOptions, add_fallback_field_ids_to_arrow_schema,
-    apply_name_mapping_to_arrow_schema, coerce_fixed_size_lists, find_leaf_by_field_id,
+    apply_arrow_schema_override, apply_name_mapping_to_arrow_schema, coerce_fixed_size_lists,
+    find_leaf_by_field_id,
 };
 use crate::arrow::build_partition_constant;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
@@ -85,6 +86,7 @@ impl ArrowReader {
             parquet_read_options: self.options.parquet_options().clone(),
             scan_metrics: scan_metrics.clone(),
             runtime: self.runtime,
+            arrow_schema_override: self.arrow_schema_override,
         };
 
         // Fast-path for single concurrency to avoid overhead of try_flatten_unordered
@@ -140,6 +142,7 @@ struct FileScanTaskReader {
     bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     scan_metrics: ScanMetrics,
+    arrow_schema_override: Option<ArrowSchemaRef>,
     runtime: Runtime,
 }
 
@@ -231,7 +234,7 @@ impl FileScanTaskReader {
 
         let install_row_number = need_row_number || no_data_columns_projected;
 
-        let arrow_metadata = Self::configure_arrow_reader_metadata(
+        let arrow_metadata = self.configure_arrow_reader_metadata(
             arrow_metadata,
             &task,
             missing_field_ids,
@@ -362,6 +365,11 @@ impl FileScanTaskReader {
         // column re-ordering, partition constants, and virtual field addition (like _file)
         let mut record_batch_transformer_builder =
             RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids());
+
+        if let Some(override_schema) = self.arrow_schema_override.as_ref() {
+            record_batch_transformer_builder =
+                record_batch_transformer_builder.with_arrow_schema(override_schema.clone());
+        }
 
         // Add the _file metadata column if it's in the projected fields
         if task.project_field_ids().contains(&RESERVED_FIELD_ID_FILE) {
@@ -697,6 +705,7 @@ impl FileScanTaskReader {
     /// Applies all task-specific schema and virtual-column options, rebuilding the
     /// Arrow reader metadata at most once.
     fn configure_arrow_reader_metadata(
+        &self,
         arrow_metadata: ArrowReaderMetadata,
         task: &FileScanTask,
         missing_field_ids: bool,
@@ -729,12 +738,17 @@ impl FileScanTaskReader {
             coerce_int96_timestamps(&schema, task.schema()).unwrap_or(schema)
         } else if let Some(coerced) = coerce_int96_timestamps(file_schema, task.schema()) {
             coerced
-        } else if without_fixed_size_lists.is_some() || install_row_number {
+        } else if without_fixed_size_lists.is_some()
+            || install_row_number
+            || self.arrow_schema_override.is_some()
+        {
             Arc::clone(file_schema)
         } else {
             return Ok(arrow_metadata);
         };
 
+        let arrow_schema =
+            apply_arrow_schema_override(&arrow_schema, self.arrow_schema_override.as_deref());
         let mut options = ArrowReaderOptions::new().with_schema(Arc::clone(&arrow_schema));
         if install_row_number {
             let row_number_field = Arc::new(

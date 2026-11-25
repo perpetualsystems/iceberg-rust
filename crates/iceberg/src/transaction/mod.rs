@@ -54,7 +54,18 @@ mod action;
 
 pub use action::*;
 mod append;
+#[cfg(test)]
+mod branch_writes;
+mod commit_ids;
+mod delete_files;
 mod expire_snapshots;
+mod manifest_filter;
+mod manifest_merge;
+mod merge_append;
+mod merging_state;
+mod rewrite_files;
+mod rewrite_manifests;
+mod row_delta;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -74,7 +85,12 @@ use crate::spec::TableProperties;
 use crate::table::Table;
 use crate::transaction::action::TransactionActionEntry;
 pub use crate::transaction::append::FastAppendAction;
+pub use crate::transaction::delete_files::DeleteFilesAction;
 pub use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
+pub use crate::transaction::merge_append::MergeAppendAction;
+pub use crate::transaction::rewrite_files::RewriteFilesAction;
+pub use crate::transaction::rewrite_manifests::RewriteManifestsAction;
+pub use crate::transaction::row_delta::RowDeltaAction;
 pub use crate::transaction::sort_order::ReplaceSortOrderAction;
 pub use crate::transaction::update_location::UpdateLocationAction;
 pub use crate::transaction::update_properties::UpdatePropertiesAction;
@@ -148,6 +164,52 @@ impl Transaction {
     /// Creates a fast append action.
     pub fn fast_append(&self) -> FastAppendAction {
         FastAppendAction::new()
+    }
+
+    /// Creates a merge-append action.
+    ///
+    /// Appends new data files and runs the full merging snapshot producer
+    /// filter+merge pipeline on each commit, consolidating small sibling
+    /// manifests by partition spec and target size. Prefer this over
+    /// `fast_append` for workloads that benefit from bounded manifest counts.
+    pub fn merge_append(&self) -> MergeAppendAction {
+        MergeAppendAction::new()
+    }
+
+    /// Creates a row-delta action for writing delete files (equality or position deletes).
+    ///
+    /// Appends the supplied delete files into a new `ManifestContent::Deletes` manifest
+    /// and commits a `Operation::Delete` snapshot. Runs the full merging snapshot
+    /// producer filter+merge pipeline on each commit.
+    ///
+    /// Java analog: `org.apache.iceberg.RowDelta`.
+    pub fn row_delta(&self) -> RowDeltaAction {
+        RowDeltaAction::new()
+    }
+
+    /// Creates a delete-files action to mark existing data files as deleted.
+    ///
+    /// Rewrites manifests so that each registered data file is marked with
+    /// `ManifestStatus::Deleted` and commits an `Operation::Delete` snapshot.
+    ///
+    /// Java analog: `org.apache.iceberg.DeleteFiles` / `StreamingDelete`.
+    pub fn delete_files(&self) -> DeleteFilesAction {
+        DeleteFilesAction::new()
+    }
+
+    /// Creates a rewrite-files action for compaction operations.
+    ///
+    /// Atomically replaces N existing data files with M new data files. Every
+    /// commit also runs the merging snapshot producer's filter+merge pipeline,
+    /// rewriting any manifest with replaced entries and bin-packing siblings —
+    /// see [`RewriteFilesAction`] for the full sequence.
+    pub fn rewrite_files(&self) -> RewriteFilesAction {
+        RewriteFilesAction::new()
+    }
+
+    /// Creates a rewrite manifests action.
+    pub fn rewrite_manifests(&self) -> RewriteManifestsAction {
+        RewriteManifestsAction::new()
     }
 
     /// Creates replace sort order action.
@@ -261,15 +323,15 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use crate::catalog::MockCatalog;
+    use crate::catalog::{MockCatalog, TableUpdate};
     use crate::io::FileIO;
     use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, Literal, PartitionSpec, Struct,
-        TableMetadata, TableProperties, Transform,
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, PartitionSpec,
+        Snapshot, Struct, TableMetadata, TableProperties, Transform,
     };
     use crate::table::{StaticTable, Table};
-    use crate::test_utils::{make_encrypted_table, test_runtime};
+    use crate::test_utils::{commit_with_fresh_state, make_encrypted_table, test_runtime};
     use crate::transaction::{ApplyTransactionAction, Transaction};
     use crate::{Catalog, Error, ErrorKind, TableCreation, TableIdent};
 
@@ -331,6 +393,137 @@ mod tests {
             .runtime(test_runtime())
             .build()
             .unwrap()
+    }
+
+    pub(crate) fn apply_updates_to_table(table: &Table, updates: &[TableUpdate]) -> Table {
+        let mut builder = table.metadata().clone().into_builder(None);
+        for update in updates {
+            builder = update.clone().apply(builder).unwrap();
+        }
+        let metadata = Arc::new(builder.build().unwrap().metadata);
+        table.clone().with_metadata(metadata)
+    }
+
+    pub(crate) fn make_file_with_content(
+        table: &Table,
+        path: &str,
+        content: DataContentType,
+    ) -> DataFile {
+        DataFileBuilder::default()
+            .content(content)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap()
+    }
+
+    pub(crate) fn make_data_file(table: &Table, path: &str, record_count: u64) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(record_count)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap()
+    }
+
+    pub(crate) async fn append_files(table: Table, files: Vec<DataFile>) -> Table {
+        let tx = Transaction::new(&table);
+        let append = tx.fast_append().add_data_files(files);
+        let updates = commit_with_fresh_state(append, &table)
+            .await
+            .unwrap()
+            .take_updates();
+        apply_updates_to_table(&table, &updates)
+    }
+
+    #[tokio::test]
+    async fn incremental_scan_plans_each_added_file_once() {
+        use futures::TryStreamExt;
+
+        let mut table = make_v2_minimal_table();
+        let initial = make_data_file(&table, "initial.parquet", 1);
+        table = append_files(table, vec![initial]).await;
+        let start = table.metadata().current_snapshot_id().unwrap();
+        for path in ["first.parquet", "second.parquet"] {
+            let file = make_data_file(&table, path, 1);
+            table = append_files(table, vec![file]).await;
+        }
+        let scan = table
+            .scan()
+            .from_snapshot_id(start)
+            .to_snapshot_id(table.metadata().current_snapshot_id().unwrap())
+            .build()
+            .unwrap();
+        let mut paths: Vec<_> = scan
+            .plan_files()
+            .await
+            .unwrap()
+            .map_ok(|task| task.data_file_path().to_string())
+            .try_collect()
+            .await
+            .unwrap();
+        paths.sort();
+        assert_eq!(paths, ["first.parquet", "second.parquet"]);
+    }
+
+    pub(crate) fn snapshot_id_from(updates: &[TableUpdate]) -> i64 {
+        for u in updates {
+            if let TableUpdate::AddSnapshot { snapshot } = u {
+                return snapshot.snapshot_id();
+            }
+        }
+        panic!("no AddSnapshot in updates");
+    }
+
+    pub(crate) fn commit_uuid_from(updates: &[TableUpdate]) -> uuid::Uuid {
+        for u in updates {
+            if let TableUpdate::AddSnapshot { snapshot } = u {
+                let stem = snapshot
+                    .manifest_list()
+                    .rsplit('/')
+                    .next()
+                    .and_then(|s| s.strip_suffix(".avro"))
+                    .expect("manifest_list path must end in .avro");
+                // Filename: snap-{snapshot_id}-{attempt}-{uuid}, where uuid is
+                // hyphen-separated into 5 hex groups. Take the last 5 segments.
+                let segments: Vec<&str> = stem.split('-').collect();
+                assert!(
+                    segments.len() >= 5,
+                    "manifest_list filename has too few segments: {stem}"
+                );
+                let uuid_str = segments[segments.len() - 5..].join("-");
+                return uuid::Uuid::parse_str(&uuid_str)
+                    .expect("manifest_list filename must encode a valid UUID");
+            }
+        }
+        panic!("no AddSnapshot in updates");
+    }
+
+    pub(crate) async fn collect_alive_files(snapshot: &Snapshot, table: &Table) -> Vec<String> {
+        let manifest_list = table
+            .manifest_list_reader(&Arc::new(snapshot.clone()))
+            .load()
+            .await
+            .unwrap();
+        let mut alive_files: Vec<String> = Vec::new();
+        for mf in manifest_list.entries() {
+            let manifest = table.manifest_reader().read(mf).await.unwrap();
+            for me in manifest.entries() {
+                if me.is_alive() {
+                    alive_files.push(me.file_path().to_string());
+                }
+            }
+        }
+        alive_files.sort();
+        alive_files
     }
 
     pub(crate) fn make_v3_minimal_table() -> Table {

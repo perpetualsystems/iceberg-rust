@@ -17,6 +17,8 @@
 
 //! Parquet file data reader
 
+use arrow_schema::SchemaRef as ArrowSchemaRef;
+
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::io::FileIO;
 use crate::runtime::Runtime;
@@ -46,12 +48,13 @@ pub use file_reader::ArrowFileReader;
 pub use options::{ArrowReaderOptions, ParquetReadOptions};
 use predicate_visitor::{CollectFieldIdVisitor, PredicateConverter};
 use projection::{
-    add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
-    coerce_fixed_size_lists, find_leaf_by_field_id,
+    add_fallback_field_ids_to_arrow_schema, apply_arrow_schema_override,
+    apply_name_mapping_to_arrow_schema, coerce_fixed_size_lists, find_leaf_by_field_id,
 };
 
 /// Builder to create ArrowReader
 pub struct ArrowReaderBuilder {
+    arrow_schema_override: Option<ArrowSchemaRef>,
     options: ArrowReaderOptions,
     file_io: FileIO,
     runtime: Runtime,
@@ -61,10 +64,18 @@ impl ArrowReaderBuilder {
     /// Create a new ArrowReaderBuilder
     pub fn new(file_io: FileIO, runtime: Runtime) -> Self {
         ArrowReaderBuilder {
+            arrow_schema_override: None,
             options: ArrowReaderOptions::default(),
             file_io,
             runtime,
         }
+    }
+
+    /// Override the Arrow schema used by the Parquet decoder where its physical
+    /// layout is compatible with the file schema.
+    pub fn with_arrow_schema(mut self, arrow_schema: ArrowSchemaRef) -> Self {
+        self.arrow_schema_override = Some(arrow_schema);
+        self
     }
 
     /// Replaces all reader settings while preserving local I/O and runtime resources.
@@ -91,6 +102,7 @@ impl ArrowReaderBuilder {
         ArrowReader {
             options,
             file_io: self.file_io.clone(),
+            arrow_schema_override: self.arrow_schema_override,
             delete_file_loader: CachingDeleteFileLoader::new(
                 self.file_io.clone(),
                 concurrency_limit_data_files,
@@ -104,6 +116,7 @@ impl ArrowReaderBuilder {
 /// Reads data from Parquet files
 #[derive(Clone)]
 pub struct ArrowReader {
+    arrow_schema_override: Option<ArrowSchemaRef>,
     options: ArrowReaderOptions,
     file_io: FileIO,
     delete_file_loader: CachingDeleteFileLoader,

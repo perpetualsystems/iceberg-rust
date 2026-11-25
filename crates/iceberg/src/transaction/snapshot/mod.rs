@@ -23,6 +23,7 @@
 //! Iceberg metadata and files, never select operation policy, and never cache
 //! across calls.
 
+pub(crate) mod merging;
 pub(crate) mod simple;
 
 use std::collections::{HashMap, HashSet};
@@ -33,10 +34,10 @@ use uuid::Uuid;
 
 use crate::error::{Result, invalid_data};
 use crate::spec::{
-    DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestFile,
-    ManifestListWriter, ManifestWriter, ManifestWriterBuilder, Operation, PartitionSpecRef,
-    SchemaRef, Snapshot, SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Struct,
-    StructType, Summary, TableProperties, set_iceberg_version, update_snapshot_summaries,
+    DataFile, DataFileFormat, FormatVersion, ManifestContentType, ManifestFile, ManifestListWriter,
+    ManifestWriter, ManifestWriterBuilder, Operation, PartitionSpecRef, SchemaRef, Snapshot,
+    SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Struct, StructType, Summary,
+    TableProperties, set_iceberg_version, update_snapshot_summaries,
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
@@ -157,8 +158,11 @@ pub(crate) fn validate_partition_value(
 /// Delete-only manifests are kept too: they record which files were removed and
 /// must persist across snapshots until `expire_snapshots` cleans them up.
 /// Dropping them lets the removed files reappear as live data (see #2148).
-pub(crate) async fn current_manifests(table: &Table) -> Result<Vec<ManifestFile>> {
-    let Some(snapshot) = table.metadata().current_snapshot() else {
+pub(crate) async fn current_manifests(
+    table: &Table,
+    target_branch: &str,
+) -> Result<Vec<ManifestFile>> {
+    let Some(snapshot) = table.metadata().snapshot_for_ref(target_branch) else {
         return Ok(vec![]);
     };
 
@@ -178,8 +182,12 @@ pub(crate) async fn current_manifests(table: &Table) -> Result<Vec<ManifestFile>
 /// Must run against each attempt's base, since a concurrent commit may have
 /// added one of these files. Manifest reads go through the table's object
 /// cache, so manifests unchanged by a rebase are not re-read.
-pub(crate) async fn validate_files_not_live(table: &Table, data_files: &[DataFile]) -> Result<()> {
-    let Some(current_snapshot) = table.metadata().current_snapshot() else {
+pub(crate) async fn validate_files_not_live(
+    table: &Table,
+    target_branch: &str,
+    data_files: &[DataFile],
+) -> Result<()> {
+    let Some(current_snapshot) = table.metadata().snapshot_for_ref(target_branch) else {
         return Ok(());
     };
 
@@ -232,11 +240,12 @@ pub(crate) async fn validate_files_not_live(table: &Table, data_files: &[DataFil
 /// (`SnapshotProducer.summary`), where computed `added-*`/`total-*` values are
 /// written after user properties so a user cannot shadow them with a bad (or
 /// merely wrong) value that would corrupt the snapshot summary.
-fn build_summary(
+fn build_summary<'a>(
     table: &Table,
+    target_branch: &str,
     operation: Operation,
     mut properties: HashMap<String, String>,
-    added_files: &[DataFile],
+    added_files: impl IntoIterator<Item = &'a DataFile>,
     removed_files: &[DataFile],
     truncate_full_table: bool,
 ) -> Result<Summary> {
@@ -296,7 +305,9 @@ fn build_summary(
             operation,
             additional_properties: properties,
         },
-        metadata.current_snapshot().map(|s| s.summary()),
+        metadata
+            .snapshot_for_ref(target_branch)
+            .map(|s| s.summary()),
         truncate_full_table,
     )?;
     // Recorded last so it also overrides a user-supplied `iceberg-version`.
@@ -310,6 +321,7 @@ fn build_summary(
 /// manifest set; the attempt-sensitive values (parent, sequence number, row-id
 /// allocation) are read from `table` by [`write_snapshot_commit`].
 pub(crate) struct SnapshotCommitInput<'a> {
+    pub target_branch: &'a str,
     pub snapshot_id: i64,
     pub manifest_list_path: String,
     pub operation: Operation,
@@ -329,6 +341,7 @@ pub(crate) async fn write_snapshot_commit(
     input: SnapshotCommitInput<'_>,
 ) -> Result<ActionCommit> {
     let SnapshotCommitInput {
+        target_branch,
         snapshot_id,
         manifest_list_path,
         operation,
@@ -350,13 +363,9 @@ pub(crate) async fn write_snapshot_commit(
         "deleted files must match this commit's manifest entries"
     );
 
-    let metadata = table.metadata();
-    let parent_snapshot_id = metadata.current_snapshot_id();
-    let next_seq_num = metadata.next_sequence_number();
-    let first_row_id = metadata.next_row_id();
-
     let summary = build_summary(
         table,
+        target_branch,
         operation,
         properties,
         added_files,
@@ -366,6 +375,41 @@ pub(crate) async fn write_snapshot_commit(
     .map_err(|err| {
         Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
     })?;
+
+    commit_snapshot(
+        table,
+        target_branch,
+        snapshot_id,
+        manifest_list_path,
+        summary,
+        manifests,
+    )
+    .await
+}
+
+async fn commit_snapshot(
+    table: &Table,
+    target_branch: &str,
+    snapshot_id: i64,
+    manifest_list_path: String,
+    summary: Summary,
+    manifests: Vec<ManifestFile>,
+) -> Result<ActionCommit> {
+    let metadata = table.metadata();
+    if metadata
+        .refs
+        .get(target_branch)
+        .is_some_and(|reference| !reference.is_branch())
+    {
+        return Err(invalid_data!(
+            "Cannot commit to {target_branch}: reference is a tag"
+        ));
+    }
+    let parent_snapshot_id = metadata
+        .snapshot_for_ref(target_branch)
+        .map(|s| s.snapshot_id());
+    let next_seq_num = metadata.next_sequence_number();
+    let first_row_id = metadata.next_row_id();
 
     let raw_output = table.file_io().new_output(manifest_list_path.clone())?;
     let (writer, encrypted_output) = match table.encryption_manager() {
@@ -438,17 +482,17 @@ pub(crate) async fn write_snapshot_commit(
         })
         .unwrap_or_default();
 
-    // `SetSnapshotRef` replaces the whole reference, so keep the retention of `main`, as Java does.
-    let main_retention = match metadata.refs.get(MAIN_BRANCH) {
-        Some(main) if main.is_branch() => main.retention.clone(),
+    // `SetSnapshotRef` replaces the whole reference, so keep the retention of the target branch, as Java does.
+    let retention = match metadata.refs.get(target_branch) {
+        Some(branch) if branch.is_branch() => branch.retention.clone(),
         _ => SnapshotRetention::branch(None, None, None),
     };
 
     updates.extend([
         TableUpdate::AddSnapshot { snapshot },
         TableUpdate::SetSnapshotRef {
-            ref_name: MAIN_BRANCH.to_string(),
-            reference: SnapshotReference::new(snapshot_id, main_retention),
+            ref_name: target_branch.to_string(),
+            reference: SnapshotReference::new(snapshot_id, retention),
         },
     ]);
 
@@ -457,7 +501,7 @@ pub(crate) async fn write_snapshot_commit(
             uuid: metadata.uuid(),
         },
         TableRequirement::RefSnapshotIdMatch {
-            r#ref: MAIN_BRANCH.to_string(),
+            r#ref: target_branch.to_string(),
             snapshot_id: parent_snapshot_id,
         },
     ];
@@ -476,8 +520,8 @@ mod tests {
     use super::*;
     use crate::ErrorKind;
     use crate::spec::{
-        DataContentType, DataFileBuilder, Literal, Manifest, NestedField, PartitionSpec,
-        PrimitiveType, Schema, SortOrder, TableMetadataBuilder, Transform, Type,
+        DataContentType, DataFileBuilder, Literal, MAIN_BRANCH, Manifest, NestedField,
+        PartitionSpec, PrimitiveType, Schema, SortOrder, TableMetadataBuilder, Transform, Type,
     };
     use crate::transaction::Transaction;
     use crate::transaction::tests::make_v2_minimal_table;
@@ -503,6 +547,7 @@ mod tests {
     /// table with that snapshot as current.
     async fn append_to(table: &Table, data_files: Vec<DataFile>) -> Table {
         let mut producer = SimpleSnapshotProducer::new(AppendIntent {
+            target_branch: MAIN_BRANCH.to_string(),
             commit_uuid: None,
             snapshot_properties: HashMap::new(),
             data_files,
@@ -542,21 +587,27 @@ mod tests {
         // No current snapshot: nothing is live, so nothing is a duplicate.
         let table = make_v2_minimal_table();
         let files = vec![data_file(&table, "test/dup.parquet", 1)];
-        validate_files_not_live(&table, &files).await.unwrap();
+        validate_files_not_live(&table, MAIN_BRANCH, &files)
+            .await
+            .unwrap();
 
         // A concurrent writer commits the same file; validating against that
         // base must detect it.
         let rebased = append_to(&table, files.clone()).await;
-        let err = validate_files_not_live(&rebased, &files)
+        let err = validate_files_not_live(&rebased, MAIN_BRANCH, &files)
             .await
             .expect_err("file committed concurrently must be detected");
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert!(err.message().contains("test/dup.parquet"));
 
         // A different file is not flagged.
-        validate_files_not_live(&rebased, &[data_file(&table, "test/other.parquet", 1)])
-            .await
-            .unwrap();
+        validate_files_not_live(&rebased, MAIN_BRANCH, &[data_file(
+            &table,
+            "test/other.parquet",
+            1,
+        )])
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -583,6 +634,7 @@ mod tests {
 
         let summary = build_summary(
             &table,
+            MAIN_BRANCH,
             Operation::Delete,
             HashMap::new(),
             &[],
@@ -653,6 +705,7 @@ mod tests {
 
         let summary = build_summary(
             &table,
+            MAIN_BRANCH,
             Operation::Delete,
             HashMap::new(),
             &[],
@@ -677,6 +730,7 @@ mod tests {
         let snapshot_id = generate_snapshot_id(&table);
 
         write_snapshot_commit(&table, SnapshotCommitInput {
+            target_branch: MAIN_BRANCH,
             snapshot_id,
             manifest_list_path: manifest_list_path(&table, snapshot_id, 0, Uuid::now_v7()).unwrap(),
             operation: Operation::Delete,

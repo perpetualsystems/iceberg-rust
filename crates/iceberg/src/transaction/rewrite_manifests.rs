@@ -16,7 +16,6 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::future::try_join_all;
@@ -32,15 +31,16 @@ use crate::spec::{
     Operation, Struct,
 };
 use crate::table::Table;
-use crate::transaction::snapshot::{
+use crate::transaction::ActionCommit;
+use crate::transaction::snapshot::merging::{
     DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
 };
-use crate::transaction::{ActionCommit, TransactionAction};
 
 /// Action that rewrites cross-partition DATA manifests into per-partition manifests.
 ///
 /// DELETE manifests and already-single-partition DATA manifests are carried forward unchanged.
 /// Returns an empty `ActionCommit` when there are no cross-partition manifests to rewrite.
+#[derive(Clone)]
 pub struct RewriteManifestsAction {
     commit_uuid: Option<Uuid>,
 
@@ -70,8 +70,8 @@ impl RewriteManifestsAction {
 }
 
 #[async_trait]
-impl TransactionAction for RewriteManifestsAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+impl crate::transaction::StatelessAction for RewriteManifestsAction {
+    async fn commit(&self, table: &Table) -> Result<ActionCommit> {
         let commit_uuid = self.commit_uuid.unwrap_or_else(Uuid::now_v7);
 
         // Nothing to rewrite without an existing snapshot. Emit requirements so concurrent
@@ -188,7 +188,7 @@ impl TransactionAction for RewriteManifestsAction {
         // inheritance recognizes the manifests as part of this commit.
         let snapshot_producer = SnapshotProducer::new(
             table,
-            SnapshotProducer::generate_unique_snapshot_id(table),
+            crate::transaction::snapshot::generate_snapshot_id(table),
             commit_uuid,
             snapshot_properties,
             vec![], // no new data files — metadata-only operation
@@ -263,6 +263,7 @@ impl TransactionAction for RewriteManifestsAction {
                     manifests: all_manifests,
                 },
                 DefaultManifestProcess,
+                &mut Default::default(),
             )
             .await?;
         Ok(result.commit)
@@ -305,8 +306,9 @@ mod tests {
         ManifestWriterBuilder, Operation, PartitionSpec, Schema, Snapshot, SnapshotReference,
         SnapshotRetention, Struct, Summary,
     };
+    use crate::test_utils::commit_with_fresh_state;
+    use crate::transaction::Transaction;
     use crate::transaction::tests::make_v2_minimal_table;
-    use crate::transaction::{Transaction, TransactionAction};
 
     // ---------------------------------------------------------------------------
     // Helpers
@@ -345,7 +347,7 @@ mod tests {
     ) -> crate::table::Table {
         let tx = Transaction::new(&table);
         let action = tx.fast_append().add_data_files(files);
-        let mut commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut commit = commit_with_fresh_state(action, &table).await.unwrap();
         let updates = commit.take_updates();
         apply_action_commit(table, updates)
     }
@@ -369,7 +371,7 @@ mod tests {
 
         let tx = Transaction::new(&table);
         let action = tx.rewrite_manifests();
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = commit_with_fresh_state(action, &table).await.unwrap();
 
         // No cross-partition manifests → no new snapshot.
         assert!(
@@ -394,7 +396,7 @@ mod tests {
 
         let tx = Transaction::new(&table);
         let action = tx.rewrite_manifests();
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = commit_with_fresh_state(action, &table).await.unwrap();
 
         let updates = action_commit.take_updates();
         assert!(
@@ -450,7 +452,7 @@ mod tests {
 
         let tx = Transaction::new(&table);
         let action = tx.rewrite_manifests();
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = commit_with_fresh_state(action, &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_snapshot = if let TableUpdate::AddSnapshot { snapshot } = &updates[0] {
@@ -510,7 +512,7 @@ mod tests {
         // Rewrite and collect new entries.
         let tx = Transaction::new(&table);
         let action = tx.rewrite_manifests();
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = commit_with_fresh_state(action, &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_snapshot = if let TableUpdate::AddSnapshot { snapshot } = &updates[0] {
@@ -647,7 +649,7 @@ mod tests {
 
         let tx = Transaction::new(&table);
         let action = tx.rewrite_manifests();
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = commit_with_fresh_state(action, &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_snapshot = if let TableUpdate::AddSnapshot { snapshot } = &updates[0] {
@@ -797,7 +799,7 @@ mod tests {
 
         let tx = Transaction::new(&table);
         let action = tx.rewrite_manifests();
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = commit_with_fresh_state(action, &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_snapshot = if let TableUpdate::AddSnapshot { snapshot } = &updates[0] {
@@ -847,7 +849,7 @@ mod tests {
             async move {
                 let tx = Transaction::new(&table);
                 let action = tx.rewrite_manifests();
-                let mut commit = Arc::new(action).commit(&table).await.unwrap();
+                let mut commit = commit_with_fresh_state(action, &table).await.unwrap();
                 let updates = commit.take_updates();
                 let snapshot = if let TableUpdate::AddSnapshot { snapshot } = &updates[0] {
                     snapshot.clone()

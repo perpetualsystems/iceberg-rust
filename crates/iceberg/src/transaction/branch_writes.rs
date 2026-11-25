@@ -23,6 +23,7 @@ use crate::spec::{
     DataContentType, DataFile, MAIN_BRANCH, Snapshot, SnapshotReference, SnapshotRetention,
 };
 use crate::table::Table;
+use crate::test_utils::commit_with_fresh_state;
 use crate::transaction::tests::{
     append_files, apply_updates_to_table, collect_alive_files, make_data_file,
     make_file_with_content, make_v2_minimal_table,
@@ -41,7 +42,10 @@ async fn append_to_branch_updates(
         .fast_append()
         .add_data_files(files)
         .to_branch(branch);
-    Arc::new(action).commit(table).await.unwrap().take_updates()
+    commit_with_fresh_state(action, table)
+        .await
+        .unwrap()
+        .take_updates()
 }
 
 async fn append_to_branch(table: Table, branch: &str, files: Vec<DataFile>) -> Table {
@@ -108,7 +112,7 @@ async fn test_commit_to_tag_is_rejected() {
         .fast_append()
         .add_data_files(vec![make_data_file(&table, "data/f1.parquet", 2)])
         .to_branch("v1");
-    let err = Arc::new(action).commit(&table).await.err().unwrap();
+    let err = commit_with_fresh_state(action, &table).await.err().unwrap();
     assert_eq!(err.kind(), ErrorKind::DataInvalid);
     assert!(err.message().contains("is a tag"), "{err}");
 }
@@ -122,7 +126,7 @@ async fn test_append_to_missing_branch_creates_it_with_no_parent() {
         .fast_append()
         .add_data_files(vec![f1])
         .to_branch(STAGING);
-    let mut commit = Arc::new(action).commit(&table).await.unwrap();
+    let mut commit = commit_with_fresh_state(action, &table).await.unwrap();
     let requirements = commit.take_requirements();
     let updates = commit.take_updates();
 
@@ -176,8 +180,7 @@ async fn test_append_to_existing_branch_leaves_main_unchanged() {
         .fast_append()
         .add_data_files(vec![make_data_file(&table, "data/s3.parquet", 3)])
         .to_branch(STAGING);
-    let requirements = Arc::new(action)
-        .commit(&table)
+    let requirements = commit_with_fresh_state(action, &table)
         .await
         .unwrap()
         .take_requirements();
@@ -234,8 +237,7 @@ async fn test_stale_branch_head_fails_requirement() {
         .fast_append()
         .add_data_files(vec![make_data_file(&table, "data/a.parquet", 1)])
         .to_branch(STAGING);
-    let stale_requirements = Arc::new(action)
-        .commit(&table)
+    let stale_requirements = commit_with_fresh_state(action, &table)
         .await
         .unwrap()
         .take_requirements();
@@ -277,6 +279,8 @@ async fn test_retry_rereads_target_branch_head() {
             .add_data_files(vec![make_data_file(&table, "data/a.parquet", 1)])
             .to_branch(STAGING),
     );
+    let mut action_state = action.new_state();
+    action.commit(&mut action_state, &table).await.unwrap();
     // Another writer advances the branch before the retry.
     let advanced = append_to_branch(table.clone(), STAGING, vec![make_data_file(
         &table,
@@ -285,7 +289,7 @@ async fn test_retry_rereads_target_branch_head() {
     )])
     .await;
 
-    let mut second = action.commit(&advanced).await.unwrap();
+    let mut second = action.commit(&mut action_state, &advanced).await.unwrap();
     let requirements = second.take_requirements();
     let updates = second.take_updates();
     let TableUpdate::AddSnapshot { snapshot } = &updates[0] else {
@@ -317,13 +321,13 @@ async fn test_merge_append_to_branch() {
     let main_head = table.metadata().current_snapshot_id();
     let staging_head = branch_head(&table, STAGING).unwrap().snapshot_id();
 
-    let updates = Arc::new(
+    let updates = commit_with_fresh_state(
         Transaction::new(&table)
             .merge_append()
             .add_data_files(vec![make_data_file(&table, "data/s2.parquet", 3)])
             .to_branch(STAGING),
+        &table,
     )
-    .commit(&table)
     .await
     .unwrap()
     .take_updates();
@@ -350,14 +354,14 @@ async fn test_rewrite_files_on_branch() {
     let main_head = table.metadata().current_snapshot_id();
 
     let merged = make_data_file(&table, "data/merged.parquet", 5);
-    let updates = Arc::new(
+    let updates = commit_with_fresh_state(
         Transaction::new(&table)
             .rewrite_files()
             .delete_files(vec![s1, s2])
             .add_files(vec![merged])
             .to_branch(STAGING),
+        &table,
     )
-    .commit(&table)
     .await
     .unwrap()
     .take_updates();
@@ -379,14 +383,14 @@ async fn test_delete_files_on_branch() {
     let main_head = table.metadata().current_snapshot_id();
     let staging_head = branch_head(&table, STAGING).unwrap().snapshot_id();
 
-    let updates = Arc::new(
+    let updates = commit_with_fresh_state(
         Transaction::new(&table)
             .delete_files()
             .delete_file(s1)
             .validate_files_exist()
             .to_branch(STAGING),
+        &table,
     )
-    .commit(&table)
     .await
     .unwrap()
     .take_updates();
@@ -414,13 +418,13 @@ async fn test_row_delta_on_branch() {
         "deletes/pos1.parquet",
         DataContentType::PositionDeletes,
     );
-    let updates = Arc::new(
+    let updates = commit_with_fresh_state(
         Transaction::new(&table)
             .row_delta()
             .add_delete_files(vec![pos_delete])
             .to_branch(STAGING),
+        &table,
     )
-    .commit(&table)
     .await
     .unwrap()
     .take_updates();
@@ -491,7 +495,7 @@ async fn test_append_duplicate_file_on_branch_is_rejected() {
         .fast_append()
         .add_data_files(vec![s1])
         .to_branch(STAGING);
-    assert!(Arc::new(action).commit(&table).await.is_err());
+    assert!(commit_with_fresh_state(action, &table).await.is_err());
 }
 
 #[tokio::test]
@@ -512,13 +516,13 @@ async fn test_rewrite_on_branch_sees_new_branch_deletes() {
         "deletes/eq1.parquet",
         DataContentType::EqualityDeletes,
     );
-    let updates = Arc::new(
+    let updates = commit_with_fresh_state(
         Transaction::new(&table)
             .row_delta()
             .add_delete_files(vec![eq_delete])
             .to_branch(STAGING),
+        &table,
     )
-    .commit(&table)
     .await
     .unwrap()
     .take_updates();
@@ -530,5 +534,5 @@ async fn test_rewrite_on_branch_sees_new_branch_deletes() {
         .add_files(vec![make_data_file(&table, "data/merged.parquet", 2)])
         .validate_from_snapshot(planned_from)
         .to_branch(STAGING);
-    assert!(Arc::new(action).commit(&table).await.is_err());
+    assert!(commit_with_fresh_state(action, &table).await.is_err());
 }

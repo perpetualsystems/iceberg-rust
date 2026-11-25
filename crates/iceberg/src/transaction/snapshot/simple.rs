@@ -38,6 +38,7 @@ use crate::transaction::ActionCommit;
 /// Fixed for one logical execution; the producer derives everything else from
 /// it and the table of the current attempt.
 pub(crate) struct AppendIntent {
+    pub target_branch: String,
     /// Overrides the generated commit UUID.
     pub commit_uuid: Option<Uuid>,
     pub snapshot_properties: HashMap<String, String>,
@@ -111,7 +112,7 @@ impl SimpleSnapshotProducer {
     pub(crate) async fn apply(&mut self, table: &Table) -> Result<ActionCommit> {
         let snapshot_id = self.snapshot_id(table);
 
-        let mut manifests = current_manifests(table).await?;
+        let mut manifests = current_manifests(table, &self.intent.target_branch).await?;
         if !self.intent.data_files.is_empty() {
             manifests.extend(self.added_manifests(table, snapshot_id).await?);
         }
@@ -119,6 +120,7 @@ impl SimpleSnapshotProducer {
         let manifest_list_path = self.next_manifest_list_path(table, snapshot_id)?;
 
         write_snapshot_commit(table, SnapshotCommitInput {
+            target_branch: &self.intent.target_branch,
             snapshot_id,
             manifest_list_path,
             operation: Operation::Append,
@@ -318,6 +320,7 @@ mod tests {
         data_files: Vec<DataFile>,
     ) -> SimpleSnapshotProducer {
         SimpleSnapshotProducer::new(AppendIntent {
+            target_branch: crate::spec::MAIN_BRANCH.to_string(),
             commit_uuid,
             snapshot_properties: HashMap::new(),
             data_files,

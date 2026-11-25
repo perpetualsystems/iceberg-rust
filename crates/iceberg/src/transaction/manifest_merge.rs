@@ -38,7 +38,7 @@ use crate::prptl_utils::bin_packing::ListPacker;
 use crate::spec::{
     DataFileFormat, FormatVersion, ManifestContentType, ManifestFile, ManifestStatus,
 };
-use crate::transaction::snapshot::SnapshotProducer;
+use crate::transaction::snapshot::merging::SnapshotProducer;
 
 pub(crate) struct ManifestMergeManager {
     target_size_bytes: u64,

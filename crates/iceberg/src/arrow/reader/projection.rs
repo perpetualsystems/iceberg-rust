@@ -27,11 +27,11 @@ use std::sync::Arc;
 use arrow_schema::{
     DataType, Field, FieldRef, Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
-use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ProjectionMask};
+use parquet::arrow::{ArrowSchemaConverter, PARQUET_FIELD_ID_META_KEY, ProjectionMask};
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 
 use super::{ArrowReader, CollectFieldIdVisitor};
-use crate::arrow::schema::validate_unshredded_variant;
+use crate::arrow::schema::{get_field_id_from_metadata, validate_unshredded_variant};
 use crate::arrow::{VariantExtensionType, arrow_schema_to_schema, arrow_type_to_type};
 use crate::error::{Result, invalid_data};
 use crate::expr::BoundPredicate;
@@ -41,6 +41,73 @@ use crate::spec::{
     NestedField, PrimitiveType, Schema, Type,
 };
 use crate::{Error, ErrorKind};
+
+/// Applies a caller-supplied Arrow layout only to fields that share the file's
+/// Parquet physical representation. Matching by field id preserves schema evolution.
+pub(super) fn apply_arrow_schema_override(
+    file_schema: &ArrowSchemaRef,
+    override_schema: Option<&ArrowSchema>,
+) -> ArrowSchemaRef {
+    let Some(override_schema) = override_schema else {
+        return Arc::clone(file_schema);
+    };
+    let override_fields: HashMap<i32, &FieldRef> = override_schema
+        .fields()
+        .iter()
+        .filter_map(|field| get_field_id_from_metadata(field).ok().map(|id| (id, field)))
+        .collect();
+    if override_fields.is_empty() {
+        return Arc::clone(file_schema);
+    }
+    let mut changed = false;
+    let fields: Vec<FieldRef> = file_schema
+        .fields()
+        .iter()
+        .map(|file_field| {
+            let Some(override_field) = get_field_id_from_metadata(file_field)
+                .ok()
+                .and_then(|id| override_fields.get(&id).copied())
+            else {
+                return file_field.clone();
+            };
+            if override_field.data_type() == file_field.data_type()
+                || !physically_compatible(file_field, override_field)
+            {
+                return file_field.clone();
+            }
+            changed = true;
+            Arc::new(
+                Field::new(
+                    file_field.name(),
+                    override_field.data_type().clone(),
+                    file_field.is_nullable(),
+                )
+                .with_metadata(file_field.metadata().clone()),
+            )
+        })
+        .collect();
+    if changed {
+        Arc::new(ArrowSchema::new_with_metadata(
+            fields,
+            file_schema.metadata().clone(),
+        ))
+    } else {
+        Arc::clone(file_schema)
+    }
+}
+
+fn physically_compatible(a: &FieldRef, b: &FieldRef) -> bool {
+    fn convert(field: &FieldRef) -> Option<SchemaDescriptor> {
+        ArrowSchemaConverter::new()
+            .convert(&ArrowSchema::new(vec![field.clone()]))
+            .ok()
+    }
+    let (Some(a), Some(b)) = (convert(a), convert(b)) else {
+        return false;
+    };
+    a.num_columns() == b.num_columns()
+        && (0..a.num_columns()).all(|i| a.column(i).physical_type() == b.column(i).physical_type())
+}
 
 impl ArrowReader {
     pub(super) fn build_field_id_set_and_map(

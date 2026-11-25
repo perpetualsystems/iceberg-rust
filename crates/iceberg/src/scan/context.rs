@@ -33,11 +33,13 @@ use crate::spec::{
     PartitionSpecRef, PrimitiveType, SchemaRef, SnapshotRef, SortOrderRef, StructType,
     TableMetadataRef,
 };
+use crate::util::snapshot::ancestors_between;
 use crate::{Error, ErrorKind, Result};
 
 /// Wraps a [`ManifestFile`] alongside the objects that are needed
 /// to process it in a thread-safe manner
 pub(crate) struct ManifestFileContext {
+    added_in_snapshot: Option<i64>,
     manifest_file: ManifestFile,
 
     sender: Sender<ManifestEntryContext>,
@@ -102,6 +104,7 @@ impl ManifestFileContext {
     /// Fetches the manifest and streams its live entries to the context's channel.
     pub(crate) async fn fetch_manifest_and_stream_manifest_entries(self) -> Result<()> {
         let ManifestFileContext {
+            added_in_snapshot,
             object_cache,
             manifest_file,
             bound_predicates,
@@ -137,7 +140,14 @@ impl ManifestFileContext {
         };
 
         for manifest_entry in manifest.entries() {
-            if !manifest_entry.is_alive() {
+            if !manifest_entry.is_alive()
+                || added_in_snapshot.is_some_and(|id| {
+                    manifest_entry.status() != crate::spec::ManifestStatus::Added
+                        || manifest_entry
+                            .snapshot_id()
+                            .is_some_and(|added| added != id)
+                })
+            {
                 continue;
             }
 
@@ -205,6 +215,12 @@ impl ManifestEntryContext {
             .with_file_size_in_bytes(self.manifest_entry.file_size_in_bytes())
             .with_start(0)
             .with_length(self.manifest_entry.file_size_in_bytes())
+            .with_split_offsets(
+                self.manifest_entry
+                    .data_file()
+                    .split_offsets()
+                    .map(ToOwned::to_owned),
+            )
             .with_record_count(Some(self.manifest_entry.record_count()))
             .with_first_row_id(self.manifest_entry.data_file().first_row_id())
             .with_data_sequence_number(self.manifest_entry.sequence_number())
@@ -253,6 +269,8 @@ impl ManifestEntryContext {
 /// objects that are required to perform a scan file plan.
 #[derive(Debug)]
 pub(crate) struct PlanContext {
+    pub from_snapshot_id: Option<i64>,
+    pub to_snapshot_id: Option<i64>,
     pub snapshot: SnapshotRef,
 
     pub table_metadata: TableMetadataRef,
@@ -319,7 +337,7 @@ impl PlanContext {
         tx_data: Sender<ManifestEntryContext>,
         delete_file_idx: DeleteFileIndex,
         delete_file_tx: Sender<ManifestEntryContext>,
-    ) -> Result<Box<impl Iterator<Item = Result<ManifestFileContext>> + 'static>> {
+    ) -> Result<Vec<Result<ManifestFileContext>>> {
         let mut manifest_files = manifest_list.entries().iter().collect::<Vec<_>>();
         // Sort manifest files to process delete manifests first.
         // This avoids a deadlock where the producer blocks on sending data manifest entries
@@ -332,7 +350,6 @@ impl PlanContext {
             ManifestContentType::Data => 1,
         });
 
-        // TODO: Ideally we could ditch this intermediate Vec as we return an iterator.
         let mut filtered_mfcs = vec![];
         for manifest_file in manifest_files {
             let is_delete = manifest_file.content == ManifestContentType::Deletes;
@@ -376,12 +393,13 @@ impl PlanContext {
                 partition_bound_predicate,
                 tx,
                 delete_file_idx.clone(),
+                None,
             );
 
             filtered_mfcs.push(Ok(mfc));
         }
 
-        Ok(Box::new(filtered_mfcs.into_iter()))
+        Ok(filtered_mfcs)
     }
 
     fn create_manifest_file_context(
@@ -390,6 +408,7 @@ impl PlanContext {
         partition_filter: Option<Arc<BoundPredicate>>,
         sender: Sender<ManifestEntryContext>,
         delete_file_index: DeleteFileIndex,
+        added_in_snapshot: Option<i64>,
     ) -> ManifestFileContext {
         let bound_predicates =
             if let (Some(ref partition_bound_predicate), Some(snapshot_bound_predicate)) =
@@ -404,6 +423,7 @@ impl PlanContext {
             };
 
         ManifestFileContext {
+            added_in_snapshot,
             manifest_file: manifest_file.clone(),
             bound_predicates,
             sender,
@@ -422,5 +442,59 @@ impl PlanContext {
             sort_orders: self.sort_orders.clone(),
             column_stats_columns: self.column_stats_columns.clone(),
         }
+    }
+
+    pub(crate) async fn build_incremental_manifest_file_contexts(
+        &self,
+        from_snapshot_id: Option<i64>,
+        to_snapshot_id: i64,
+        sender: Sender<ManifestEntryContext>,
+        delete_file_index: DeleteFileIndex,
+    ) -> Result<Vec<Result<ManifestFileContext>>> {
+        let mut contexts = Vec::new();
+        for snapshot in ancestors_between(&self.table_metadata, to_snapshot_id, from_snapshot_id) {
+            if !matches!(
+                snapshot.summary().operation,
+                crate::spec::Operation::Append | crate::spec::Operation::Overwrite
+            ) {
+                continue;
+            }
+            let manifest_list = self
+                .object_cache
+                .get_manifest_list(&snapshot, &self.table_metadata)
+                .await?;
+            for manifest_file in manifest_list.entries() {
+                if manifest_file.added_snapshot_id != snapshot.snapshot_id() {
+                    continue;
+                }
+                if manifest_file.content == ManifestContentType::Deletes {
+                    return Err(Error::new(
+                        ErrorKind::FeatureUnsupported,
+                        "Incremental scan does not support delete manifests",
+                    ));
+                }
+                let partition_filter = if self.predicate.is_some() {
+                    let predicate = self.get_partition_filter(manifest_file)?;
+                    if !self
+                        .manifest_evaluator_cache
+                        .get(manifest_file.partition_spec_id, predicate.clone())
+                        .eval(manifest_file)?
+                    {
+                        continue;
+                    }
+                    Some(predicate)
+                } else {
+                    None
+                };
+                contexts.push(Ok(self.create_manifest_file_context(
+                    manifest_file,
+                    partition_filter,
+                    sender.clone(),
+                    delete_file_index.clone(),
+                    Some(snapshot.snapshot_id()),
+                )));
+            }
+        }
+        Ok(contexts)
     }
 }

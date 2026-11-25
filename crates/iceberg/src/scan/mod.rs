@@ -178,7 +178,10 @@ pub struct TableScanBuilder<'a> {
     table: &'a Table,
     // Defaults to none which means select all columns
     column_names: Option<Vec<String>>,
+    arrow_schema_override: Option<arrow_schema::SchemaRef>,
     column_stats_names: Option<Vec<String>>,
+    from_snapshot_id: Option<i64>,
+    to_snapshot_id: Option<i64>,
     snapshot_selection: Option<SnapshotSelection>,
     case_sensitive: bool,
     filter: Option<Predicate>,
@@ -193,13 +196,34 @@ impl<'a> TableScanBuilder<'a> {
         Self {
             table,
             column_names: None,
+            arrow_schema_override: None,
             column_stats_names: None,
             snapshot_selection: None,
+            from_snapshot_id: None,
+            to_snapshot_id: None,
             case_sensitive: true,
             filter: None,
             concurrency_limit_manifest_entries: num_cpus,
             concurrency_limit_manifest_files: num_cpus,
         }
+    }
+
+    /// Set the exclusive starting snapshot for an incremental scan.
+    pub fn from_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.from_snapshot_id = Some(snapshot_id);
+        self
+    }
+
+    /// Set the inclusive ending snapshot for an incremental scan.
+    pub fn to_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.to_snapshot_id = Some(snapshot_id);
+        self
+    }
+
+    /// Uses the supplied Arrow schema for physically compatible projected fields.
+    pub fn with_arrow_schema(mut self, schema: arrow_schema::SchemaRef) -> Self {
+        self.arrow_schema_override = Some(schema);
+        self
     }
 
     /// Sets the scan's case sensitivity
@@ -328,7 +352,42 @@ impl<'a> TableScanBuilder<'a> {
 
     /// Build the table scan.
     pub fn build(self) -> Result<TableScan> {
-        let selected_snapshot = match self.snapshot_selection {
+        if self.from_snapshot_id.is_some() || self.to_snapshot_id.is_some() {
+            let Some(to_snapshot_id) = self.to_snapshot_id else {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "Incremental scan requires to_snapshot_id to be set",
+                ));
+            };
+            if self.snapshot_selection.is_some() {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "snapshot_id cannot be combined with incremental scan bounds",
+                ));
+            }
+            let metadata = self.table.metadata();
+            if metadata.snapshot_by_id(to_snapshot_id).is_none() {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("to_snapshot_id {to_snapshot_id} not found in table metadata"),
+                ));
+            }
+            if let Some(from_snapshot_id) = self.from_snapshot_id
+                && !crate::util::snapshot::ancestors_of(&self.table.metadata_ref(), to_snapshot_id)
+                    .any(|snapshot| snapshot.snapshot_id() == from_snapshot_id)
+            {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "from_snapshot_id {from_snapshot_id} is not an ancestor of to_snapshot_id {to_snapshot_id}"
+                    ),
+                ));
+            }
+        }
+        let selected_snapshot = match self
+            .snapshot_selection
+            .or(self.to_snapshot_id.map(SnapshotSelection::SnapshotId))
+        {
             Some(SnapshotSelection::SnapshotId(id)) => {
                 Some((id, format!("Snapshot with id {id} not found")))
             }
@@ -356,6 +415,7 @@ impl<'a> TableScanBuilder<'a> {
                 let Some(current_snapshot_id) = self.table.metadata().current_snapshot() else {
                     return Ok(TableScan {
                         column_names: self.column_names,
+                        arrow_schema_override: self.arrow_schema_override,
                         file_io: self.table.file_io().clone(),
                         plan_context: None,
                         concurrency_limit_manifest_entries: self.concurrency_limit_manifest_entries,
@@ -402,6 +462,8 @@ impl<'a> TableScanBuilder<'a> {
         );
 
         let plan_context = PlanContext {
+            from_snapshot_id: self.from_snapshot_id,
+            to_snapshot_id: self.to_snapshot_id,
             snapshot,
             table_metadata: self.table.metadata_ref(),
             snapshot_schema: schema,
@@ -421,6 +483,7 @@ impl<'a> TableScanBuilder<'a> {
 
         Ok(TableScan {
             column_names: self.column_names,
+            arrow_schema_override: self.arrow_schema_override,
             file_io: self.table.file_io().clone(),
             plan_context: Some(plan_context),
             concurrency_limit_manifest_entries: self.concurrency_limit_manifest_entries,
@@ -439,6 +502,7 @@ pub struct TableScan {
     plan_context: Option<PlanContext>,
     file_io: FileIO,
     column_names: Option<Vec<String>>,
+    arrow_schema_override: Option<arrow_schema::SchemaRef>,
     /// The maximum number of manifest files that will be
     /// retrieved from [`FileIO`] concurrently
     concurrency_limit_manifest_files: usize,
@@ -490,17 +554,24 @@ impl TableScan {
 
         let (delete_file_idx, delete_file_tx) = DeleteFileIndex::new(self.runtime.clone());
 
-        let manifest_list = plan_context.get_manifest_list().await?;
-
-        // get the [`ManifestFile`]s from the [`ManifestList`], filtering out any
-        // whose partitions cannot match this
-        // scan's filter
-        let manifest_file_contexts = plan_context.build_manifest_file_contexts(
-            manifest_list,
-            manifest_entry_data_ctx_tx,
-            delete_file_idx.clone(),
-            manifest_entry_delete_ctx_tx,
-        )?;
+        let manifest_file_contexts = if let Some(to_snapshot_id) = plan_context.to_snapshot_id {
+            plan_context
+                .build_incremental_manifest_file_contexts(
+                    plan_context.from_snapshot_id,
+                    to_snapshot_id,
+                    manifest_entry_data_ctx_tx,
+                    delete_file_idx.clone(),
+                )
+                .await?
+        } else {
+            let manifest_list = plan_context.get_manifest_list().await?;
+            plan_context.build_manifest_file_contexts(
+                manifest_list,
+                manifest_entry_data_ctx_tx,
+                delete_file_idx.clone(),
+                manifest_entry_delete_ctx_tx,
+            )?
+        };
 
         let mut channel_for_manifest_error = planned_file_tx.clone();
         let mut channel_for_data_manifest_entry_error = planned_file_tx.clone();
@@ -628,8 +699,12 @@ impl TableScan {
     /// have been removed. [`ArrowReaderBuilder::with_parquet_options`] replaces
     /// only the nested Parquet configuration.
     pub async fn to_arrow(&self, options: ArrowReaderOptions) -> Result<ArrowRecordBatchStream> {
-        ArrowReaderBuilder::new(self.file_io.clone(), self.runtime.clone())
-            .with_options(options)
+        let mut reader = ArrowReaderBuilder::new(self.file_io.clone(), self.runtime.clone())
+            .with_options(options);
+        if let Some(schema) = &self.arrow_schema_override {
+            reader = reader.with_arrow_schema(schema.clone());
+        }
+        reader
             .build()
             .read(self.plan_files().await?)
             .map(|result| result.stream())
@@ -4738,5 +4813,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_incremental_scan_anchors_to_end_snapshot_not_current() {
+        // Regression: an incremental scan must resolve its snapshot (and thus its
+        // projection/predicate schema) from the inclusive `to_snapshot_id`, not
+        // from the table's current snapshot, which may be newer and carry an
+        // evolved schema. See example_table_metadata_v2.json for the ids below.
+        let table = TableTestFixture::new().table;
+
+        let to_snapshot_id = 3051729675574597004; // parent of the current snapshot
+        let current_snapshot_id = 3055729675574597004;
+        assert_eq!(
+            table.metadata().current_snapshot().unwrap().snapshot_id(),
+            current_snapshot_id,
+            "fixture precondition: current snapshot differs from to_snapshot_id"
+        );
+
+        let scan = table.scan().to_snapshot_id(to_snapshot_id).build().unwrap();
+
+        assert_eq!(
+            scan.snapshot().unwrap().snapshot_id(),
+            to_snapshot_id,
+            "incremental scan should anchor to to_snapshot_id, not the current snapshot"
+        );
     }
 }

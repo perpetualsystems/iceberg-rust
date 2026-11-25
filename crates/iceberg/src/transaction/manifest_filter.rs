@@ -35,7 +35,7 @@ use crate::Result;
 use crate::spec::{
     DataFileFormat, FormatVersion, Manifest, ManifestContentType, ManifestEntry, ManifestFile,
 };
-use crate::transaction::snapshot::SnapshotProducer;
+use crate::transaction::snapshot::merging::SnapshotProducer;
 
 pub(crate) struct ManifestFilterManager {
     deleted_paths: Mutex<HashSet<String>>,
