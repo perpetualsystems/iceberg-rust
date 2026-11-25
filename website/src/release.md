@@ -64,7 +64,7 @@ The RC creation script requires a local GPG secret key when artifact signing or 
 
 Install the release tooling used by the local scripts:
 
-- `cargo-deny`
+- `cargo-deny` (`make install-cargo-deny`)
 - `docker`
 - `gpg`
 - `svn`
@@ -121,6 +121,16 @@ For details on how to run a release, please refer to: https://rust.iceberg.apach
 
 The following steps should be followed once the release is ready to begin.
 
+### Update dependencies
+
+Dependabot runs monthly to reduce update noise, so dependencies may be out of date by the time of a release.
+Before cutting a release candidate, open the repository's [Dependabot page](https://github.com/apache/iceberg-rust/network/updates) and trigger a manual check for each configured ecosystem: `cargo` and `github-actions` at `/`, and `uv` at `/bindings/python`.
+Review and merge the applicable dependency update PRs before creating the release branch.
+For an existing release branch, backport the applicable updates to that branch before cutting the release candidate.
+
+Only a committer with write access to the repository can trigger Dependabot manually.
+Work with a committer if you do not have write access.
+
 ### Create a minor version release branch, if it doesn't already exist
 
 A committer must ensure that a release branch exists for each minor version.
@@ -141,7 +151,7 @@ git switch -c ${iceberg_minor_release_branch} && git push upstream ${iceberg_min
 - Use the minor version branch created earlier as the branch target. For example, `v0.9.x`.
 - Save the draft.
 
-### Update crate versions, dependencies list, and changelog
+### Update crate versions and changelog
 
 The following changes can be made in one pull request against the minor version branch (e.g. `v0.9.x`).
 
@@ -160,19 +170,18 @@ Update `CHANGELOG.md` based on the changes since the previous version.
 You may use generative AI to assist making this update, but please review the proposed changes for correctness.
 The changelog should reflect a summary of each commit in the new release.
 
-#### Update dependency lists
-
-Run the following command to update the dependencies list of every package:
-
-```shell
-dev/release/dependencies.sh generate
-```
+#### Verify dependency licenses
 
 Run the following command to verify the licenses meet the project's policy.
 
 ```shell
-dev/release/dependencies.sh check
+make check-dependency-licenses
 ```
+
+#### Check pyiceberg-core LICENSE and NOTICE
+
+The `pyiceberg-core` wheels bundle third-party licenses and notices, and some of the entries are maintained by hand.
+Check and update them following [`bindings/python/LICENSING.md`](https://github.com/apache/iceberg-rust/blob/main/bindings/python/LICENSING.md#keeping-entries-up-to-date).
 
 #### Open pull request
 
@@ -195,9 +204,10 @@ For example:
 dev/release/create_rc.sh 0.9.1 2
 ```
 
+The script always archives and tags `HEAD`, so make sure the exact commit to release is checked out before running it.
+
 Useful options include:
 
-- `--release_ref HEAD`: git commit-ish to archive and tag.
 - `--dist_dir dist`: artifact output root.
 - `--create_rc_tag 1`: create the signed annotated RC tag as the final release step.
 - `--check_headers 1`: check Apache license headers against the source archive.

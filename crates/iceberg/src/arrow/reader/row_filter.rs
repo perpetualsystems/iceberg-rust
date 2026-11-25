@@ -23,18 +23,21 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use arrow_schema::ArrowError;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter, RowSelection};
 use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::SchemaDescriptor;
 
 use super::{ArrowReader, PredicateConverter};
-use crate::error::Result;
+use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
+use crate::error::{Result, invalid_data};
 use crate::expr::BoundPredicate;
 use crate::expr::visitors::bound_predicate_visitor::visit;
 use crate::expr::visitors::page_index_evaluator::PageIndexEvaluator;
 use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator;
-use crate::spec::Schema;
+use crate::spec::{NestedFieldRef, Schema, Type, prune_columns};
+use crate::{Error, ErrorKind};
 
 impl ArrowReader {
     pub(super) fn get_row_filter(
@@ -42,14 +45,20 @@ impl ArrowReader {
         parquet_schema: &SchemaDescriptor,
         iceberg_field_ids: &HashSet<i32>,
         field_id_map: &HashMap<i32, usize>,
+        snapshot_schema: &Schema,
     ) -> Result<RowFilter> {
-        // Collect Parquet column indices from field ids.
+        // Collect Parquet column indices from field ids, keeping each column's field id.
         // If the field id is not found in Parquet schema, it will be ignored due to schema evolution.
-        let mut column_indices = iceberg_field_ids
-            .iter()
-            .filter_map(|field_id| field_id_map.get(field_id).cloned())
-            .collect::<Vec<_>>();
-        column_indices.sort();
+        let mut columns = Vec::with_capacity(iceberg_field_ids.len());
+        columns.extend(
+            iceberg_field_ids
+                .iter()
+                .filter_map(|field_id| field_id_map.get(field_id).map(|&idx| (idx, *field_id))),
+        );
+        // Leaf order is the filter batch's column order, so the transformer below passes the
+        // batch through unchanged when no column needs converting.
+        columns.sort_unstable();
+        let (column_indices, field_ids): (Vec<_>, Vec<_>) = columns.into_iter().unzip();
 
         // The converter that converts `BoundPredicates` to `ArrowPredicates`
         let mut converter = PredicateConverter {
@@ -61,8 +70,24 @@ impl ArrowReader {
         // After collecting required leaf column indices used in the predicate,
         // creates the projection mask for the Arrow predicates.
         let projection_mask = ProjectionMask::leaves(parquet_schema, column_indices.clone());
-        let predicate_func = visit(&mut converter, predicates)?;
-        let arrow_predicate = ArrowPredicateFn::new(projection_mask, predicate_func);
+        let mut predicate_func = visit(&mut converter, predicates)?;
+        // Predicates are bound to the table schema, so convert the filter columns to it, as the
+        // reader does for its output (e.g. `int` read as `long`).
+        let filter_schema = filter_schema(snapshot_schema, &field_ids)?;
+        let root_ids: Vec<i32> = filter_schema
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|f| f.id)
+            .collect();
+        let mut transformer =
+            RecordBatchTransformerBuilder::new(Arc::new(filter_schema), &root_ids).build();
+        let arrow_predicate = ArrowPredicateFn::new(projection_mask, move |batch| {
+            let batch = transformer
+                .process_record_batch(batch)
+                .map_err(|err| ArrowError::ExternalError(Box::new(err)))?;
+            predicate_func(batch)
+        });
         Ok(RowFilter::new(vec![Box::new(arrow_predicate)]))
     }
 
@@ -71,11 +96,21 @@ impl ArrowReader {
         parquet_metadata: &Arc<ParquetMetaData>,
         field_id_map: &HashMap<i32, usize>,
         snapshot_schema: &Schema,
+        candidate_row_groups: &[usize],
     ) -> Result<Vec<usize>> {
         let row_groups_metadata = parquet_metadata.row_groups();
-        let mut results = Vec::with_capacity(row_groups_metadata.len());
+        let mut results = Vec::with_capacity(candidate_row_groups.len());
 
-        for (idx, row_group_metadata) in row_groups_metadata.iter().enumerate() {
+        for &idx in candidate_row_groups {
+            let row_group_metadata = row_groups_metadata.get(idx).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "row group index {idx} out of range ({} row groups)",
+                        row_groups_metadata.len()
+                    ),
+                )
+            })?;
             if RowGroupMetricsEvaluator::eval(
                 predicate,
                 row_group_metadata,
@@ -105,15 +140,20 @@ impl ArrowReader {
         field_id_map: &HashMap<i32, usize>,
         snapshot_schema: &Schema,
     ) -> Result<Option<RowSelection>> {
-        let Some(column_index) = parquet_metadata.column_index() else {
-            tracing::debug!("ColumnIndex was absent while reading this file");
+        let Some(page_index) = parquet_metadata.page_index() else {
+            tracing::debug!("PageIndex was absent while reading this file");
             return Ok(None);
         };
 
-        let Some(offset_index) = parquet_metadata.offset_index() else {
+        if !page_index.has_column_indexes() {
+            tracing::debug!("ColumnIndex was absent while reading this file");
+            return Ok(None);
+        }
+
+        if !page_index.has_offset_indexes() {
             tracing::debug!("OffsetIndex was absent while reading this file");
             return Ok(None);
-        };
+        }
 
         // If all row groups were filtered out, return an empty RowSelection (select no rows)
         //
@@ -125,14 +165,8 @@ impl ArrowReader {
 
         let mut selected_row_groups_idx = 0;
 
-        let page_index = column_index
-            .iter()
-            .enumerate()
-            .zip(offset_index)
-            .zip(parquet_metadata.row_groups());
-
         let mut results = Vec::new();
-        for (((idx, column_index), offset_index), row_group_metadata) in page_index {
+        for (idx, row_group_metadata) in parquet_metadata.row_groups().iter().enumerate() {
             if let Some(selected_row_groups) = selected_row_groups {
                 // skip row groups that aren't present in selected_row_groups
                 if idx == selected_row_groups[selected_row_groups_idx] {
@@ -144,8 +178,7 @@ impl ArrowReader {
 
             let selections_for_page = PageIndexEvaluator::eval(
                 predicate,
-                column_index,
-                offset_index,
+                &parquet_metadata.page_index_for_row_group(idx),
                 row_group_metadata,
                 field_id_map,
                 snapshot_schema,
@@ -209,6 +242,30 @@ impl ArrowReader {
     }
 }
 
+/// The top-level fields holding `leaf_ids`, pruned to those leaves, in leaf order (the filter
+/// batch's column order). Only these fields are converted, so the transformer's per-file setup
+/// does not grow with the table's width. Fails for a leaf that is not in `snapshot_schema`,
+/// because skipping it would shift the columns the predicate reads.
+fn filter_schema(snapshot_schema: &Schema, leaf_ids: &[i32]) -> Result<Schema> {
+    let mut roots: Vec<NestedFieldRef> = Vec::with_capacity(leaf_ids.len());
+    for &id in leaf_ids {
+        let accessor = snapshot_schema
+            .accessor_by_field_id(id)
+            .ok_or_else(|| invalid_data!("Predicate field id {id} is not in the scan schema"))?;
+        let root = &snapshot_schema.as_struct().fields()[accessor.position()];
+        if !roots.iter().any(|r| r.id == root.id) {
+            roots.push(Arc::clone(root));
+        }
+    }
+    let roots = Schema::builder().with_fields(roots).build()?;
+    let Type::Struct(pruned) = prune_columns(&roots, leaf_ids.iter().copied(), false)? else {
+        unreachable!("prune_columns returns a struct");
+    };
+    Schema::builder()
+        .with_fields(pruned.fields().to_vec())
+        .build()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -216,26 +273,33 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::cast::AsArray;
+    use arrow_array::types::Int64Type;
     use arrow_array::{
-        ArrayRef, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
+        ArrayRef, Date32Array, Decimal128Array, Float32Array, Int32Array, Int64Array,
+        LargeStringArray, RecordBatch, StringArray, TimestampMicrosecondArray,
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::TryStreamExt;
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
     use parquet::basic::Compression;
+    use parquet::file::metadata::page_index::PageIndexProvider;
     use parquet::file::metadata::{FileMetaData, ParquetMetaData, ParquetMetaDataBuilder};
     use parquet::file::properties::{EnabledStatistics, WriterProperties};
     use parquet::schema::parser::parse_message_type;
     use parquet::schema::types::SchemaDescriptor;
     use tempfile::TempDir;
 
+    use super::filter_schema;
     use crate::Runtime;
-    use crate::arrow::{ArrowReader, ArrowReaderBuilder};
+    use crate::arrow::{
+        ArrowReader, ArrowReaderBuilder, ArrowReaderOptions as ReaderOptions, ParquetReadOptions,
+    };
     use crate::expr::{Bind, BoundPredicate, Predicate, Reference};
     use crate::io::FileIO;
     use crate::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskStream};
     use crate::spec::{
-        DataContentType, DataFileFormat, Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type,
+        DataContentType, DataFileFormat, Datum, Literal, NestedField, NestedFieldRef,
+        PartitionSpec, PrimitiveType, Schema, SchemaRef, Struct, StructType, Transform, Type,
     };
 
     async fn test_perform_read(
@@ -448,6 +512,110 @@ mod tests {
         }
     }
 
+    /// Writes `column` as field 1, with and without a field id, reads it back as `iceberg_type`
+    /// under `predicate`, and checks the values that survive (`None` when no row does).
+    async fn assert_promoted_reads(
+        column: ArrayRef,
+        iceberg_type: PrimitiveType,
+        predicate: Predicate,
+        expected: Option<ArrayRef>,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let schema = value_schema(Type::Primitive(iceberg_type));
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
+        for with_field_id in [true, false] {
+            // Without a field id, the reader assigns one by position.
+            let path = format!("{}/{with_field_id}.parquet", tmp.path().to_str().unwrap());
+            let field = if with_field_id {
+                field_with_id("v", column.data_type().clone(), 1)
+            } else {
+                Field::new("v", column.data_type().clone(), false)
+            };
+            let arrow_schema = Arc::new(ArrowSchema::new(vec![field]));
+            let batch = RecordBatch::try_new(arrow_schema.clone(), vec![column.clone()]).unwrap();
+            write_row_groups(&path, arrow_schema, vec![batch], false);
+
+            let (batches, _) = read_once(
+                reader.clone(),
+                &path,
+                schema.clone(),
+                vec![1],
+                predicate.clone(),
+                None,
+                vec![],
+            )
+            .await;
+            let actual = collapse(&batches).map(|batch| Arc::clone(batch.column(0)));
+            assert_eq!(
+                actual, expected,
+                "{predicate}, with_field_id = {with_field_id}"
+            );
+        }
+    }
+
+    /// The filter schema holds each filter leaf's top-level field, pruned to the filter leaves,
+    /// in leaf order. A leaf missing from the schema fails.
+    #[test]
+    fn test_filter_schema_prunes_nested_roots() {
+        let person = |fields: Vec<NestedFieldRef>| {
+            NestedField::required(2, "person", Type::Struct(StructType::new(fields))).into()
+        };
+        let n = || NestedField::required(3, "n", Type::Primitive(PrimitiveType::Long)).into();
+        let m = || NestedField::optional(4, "m", Type::Primitive(PrimitiveType::Int)).into();
+        let id = || NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into();
+        let schema = Schema::builder()
+            .with_fields(vec![id(), person(vec![n(), m()])])
+            .build()
+            .unwrap();
+
+        for (leaf_ids, expected_fields) in [
+            (vec![3], vec![person(vec![n()])]),
+            (vec![4, 1, 3], vec![person(vec![n(), m()]), id()]),
+            (vec![], vec![]),
+        ] {
+            let filter_schema = filter_schema(&schema, &leaf_ids).unwrap();
+            assert_eq!(
+                filter_schema.as_struct().fields(),
+                expected_fields,
+                "{leaf_ids:?}"
+            );
+        }
+        assert!(filter_schema(&schema, &[3, 9]).is_err());
+    }
+
+    /// A file written before a type promotion keeps the old physical type, so the row
+    /// filter must compare its values promoted to the table type.
+    #[tokio::test]
+    async fn test_predicate_on_promoted_column() {
+        let v = || Reference::new("v");
+        // The literal is out of `int` range.
+        assert_promoted_reads(
+            Arc::new(Int32Array::from(vec![1, 2])),
+            PrimitiveType::Long,
+            v().less_than(Datum::long(i64::from(i32::MAX) + 1)),
+            Some(Arc::new(Int64Array::from(vec![1, 2]))),
+        )
+        .await;
+        // 0.1f32 promotes to a double slightly above 0.1, so it no longer equals 0.1.
+        assert_promoted_reads(
+            Arc::new(Float32Array::from(vec![0.1])),
+            PrimitiveType::Double,
+            v().equal_to(Datum::double(0.1)),
+            None,
+        )
+        .await;
+        // 2024-01-01 promotes to midnight, which is before noon on that day.
+        assert_promoted_reads(
+            Arc::new(Date32Array::from(vec![19723])),
+            PrimitiveType::Timestamp,
+            v().less_than(Datum::timestamp_from_str("2024-01-01T12:00:00").unwrap()),
+            Some(Arc::new(TimestampMicrosecondArray::from(vec![
+                1_704_067_200_000_000,
+            ]))),
+        )
+        .await;
+    }
+
     /// Verifies that file splits respect byte ranges and only read specific row groups.
     #[tokio::test]
     async fn test_file_splits_respect_byte_ranges() {
@@ -633,6 +801,71 @@ mod tests {
 
             assert_eq!(first_val, 100, "Task 2 should start with id=100, not id=0");
         }
+
+        // Combining byte-range and predicate row-group filtering should narrow the
+        // split's candidates instead of evaluating and intersecting independent lists.
+        // This task owns row groups 1 and 2, while the predicate can match row groups
+        // 0 and 2. Only row group 2 should be read.
+        let predicate = Reference::new("id")
+            .less_than(Datum::int(100))
+            .or(Reference::new("id").greater_than_or_equal_to(Datum::int(200)))
+            .bind(schema.clone(), true)
+            .unwrap();
+
+        // Test the pruning decision directly, not just the final filtered rows.
+        let parquet_metadata = Arc::new((*metadata).clone());
+        let field_id_map = HashMap::from([(1, 0)]);
+        for (candidates, expected) in [(vec![1, 2], vec![2]), (vec![0, 1], vec![0])] {
+            let selected = ArrowReader::get_selected_row_group_indices(
+                &predicate,
+                &parquet_metadata,
+                &field_id_map,
+                schema.as_ref(),
+                &candidates,
+            )
+            .unwrap();
+            assert_eq!(selected, expected);
+        }
+
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(std::fs::metadata(&file_path).unwrap().len())
+            .with_start(rg1_start)
+            .with_length(file_end - rg1_start)
+            .with_data_file_path(file_path.clone())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema.clone())
+            .with_project_field_ids(vec![1])
+            .with_predicate(Some(predicate))
+            .with_record_count(Some(200))
+            .with_case_sensitive(false)
+            .build()
+            .unwrap();
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+            .with_options(
+                ReaderOptions::builder()
+                    .with_row_group_filtering_enabled(true)
+                    .build(),
+            )
+            .build();
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let result = reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+
+        let mut ids = Vec::new();
+        for batch in &result {
+            let id_col = batch
+                .column(0)
+                .as_primitive::<arrow_array::types::Int32Type>();
+            ids.extend((0..id_col.len()).map(|index| id_col.value(index)));
+        }
+
+        assert_eq!(ids, (200..300).collect::<Vec<_>>());
     }
 
     /// A single data file split into multiple sub-row-group byte ranges (as Spark/Iceberg
@@ -879,13 +1112,52 @@ mod tests {
         Arc::new(ParquetMetaDataBuilder::new(file_meta).build())
     }
 
+    #[derive(Debug)]
+    struct TestPageIndexProvider {
+        has_column_indexes: bool,
+        has_offset_indexes: bool,
+    }
+
+    impl PageIndexProvider for TestPageIndexProvider {
+        fn has_offset_indexes(&self) -> bool {
+            self.has_offset_indexes
+        }
+
+        fn has_column_indexes(&self) -> bool {
+            self.has_column_indexes
+        }
+
+        fn column_index(
+            &self,
+            _: usize,
+            _: usize,
+        ) -> Option<&parquet::file::page_index::column_index::ColumnIndexMetaData> {
+            None
+        }
+
+        fn offset_index(
+            &self,
+            _: usize,
+            _: usize,
+        ) -> Option<&parquet::file::page_index::offset_index::OffsetIndexMetaData> {
+            None
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
     fn metadata_column_index_only() -> Arc<ParquetMetaData> {
         let msg_type = parse_message_type("message schema { REQUIRED INT32 x; }").unwrap();
         let schema_desc = Arc::new(SchemaDescriptor::new(Arc::new(msg_type)));
         let file_meta = FileMetaData::new(2, 0, None, None, schema_desc, None);
         Arc::new(
             ParquetMetaDataBuilder::new(file_meta)
-                .set_column_index(Some(vec![]))
+                .set_page_index(Some(Arc::new(TestPageIndexProvider {
+                    has_column_indexes: true,
+                    has_offset_indexes: false,
+                })))
                 .build(),
         )
     }
@@ -896,10 +1168,195 @@ mod tests {
         let file_meta = FileMetaData::new(2, 0, None, None, schema_desc, None);
         Arc::new(
             ParquetMetaDataBuilder::new(file_meta)
-                .set_column_index(Some(vec![]))
-                .set_offset_index(Some(vec![]))
+                .set_page_index(Some(Arc::new(TestPageIndexProvider {
+                    has_column_indexes: true,
+                    has_offset_indexes: true,
+                })))
                 .build(),
         )
+    }
+
+    /// A `FileScanTask` built or deserialized outside `TableScan` carries an
+    /// un-normalized predicate, so a raw `Not(...)` can reach the reader.
+    #[tokio::test]
+    async fn test_not_predicate_read_returns_matching_rows() {
+        use arrow_array::Int32Array;
+
+        let schema = int_schema();
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("x", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap().to_string();
+        let file_path = format!("{table_location}/not_pred.parquet");
+
+        let file = File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), None).unwrap();
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(
+            (0..=10).collect::<Vec<i32>>(),
+        ))])
+        .unwrap();
+        writer.write(&batch).expect("Writing batch");
+        writer.close().unwrap();
+
+        // NOT(x > 5) == x <= 5, bound without rewriting, as a non-TableScan caller
+        // would supply it.
+        let predicate = (!Reference::new("x").greater_than(Datum::int(5)))
+            .bind(schema.clone(), false)
+            .unwrap();
+        assert!(
+            matches!(predicate, BoundPredicate::Not(_)),
+            "test must drive a raw Not(...) node"
+        );
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+            .with_options(
+                ReaderOptions::builder()
+                    .with_row_group_filtering_enabled(true)
+                    .build(),
+            )
+            .build();
+
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(std::fs::metadata(&file_path).unwrap().len())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(file_path)
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema.clone())
+            .with_project_field_ids(vec![1])
+            .with_predicate(Some(predicate))
+            .with_case_sensitive(false)
+            .build()
+            .unwrap();
+
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let batches = reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+
+        let mut values = Vec::new();
+        for batch in &batches {
+            let col = batch
+                .column(0)
+                .as_primitive::<arrow_array::types::Int32Type>();
+            values.extend(col.values().iter().copied());
+        }
+
+        assert_eq!(values, (0..=5).collect::<Vec<i32>>());
+    }
+
+    #[tokio::test]
+    async fn test_not_predicate_read_through_page_index() {
+        use arrow_array::Int32Array;
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        use parquet::file::serialized_reader::ReadOptionsBuilder;
+
+        let schema = int_schema();
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("x", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap().to_string();
+        let file_path = format!("{table_location}/not_pred_pages.parquet");
+
+        let file = File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), None).unwrap();
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(
+            (0..100).collect::<Vec<i32>>(),
+        ))])
+        .unwrap();
+        writer.write(&batch).expect("Writing batch");
+        writer.close().unwrap();
+
+        {
+            let f = File::open(&file_path).unwrap();
+            let opts = ReadOptionsBuilder::new().with_page_index().build();
+            let rdr = SerializedFileReader::new_with_options(f, opts).unwrap();
+            assert!(
+                rdr.metadata()
+                    .page_index()
+                    .is_some_and(|page_index| page_index.has_column_indexes()),
+                "fixture must carry a column index so the page-index path runs"
+            );
+        }
+
+        // NOT(x >= 50) == x < 50, as a non-TableScan caller would supply it.
+        let predicate = (!Reference::new("x").greater_than_or_equal_to(Datum::int(50)))
+            .bind(schema.clone(), false)
+            .unwrap();
+        assert!(matches!(predicate, BoundPredicate::Not(_)));
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+            .with_options(
+                ReaderOptions::builder()
+                    .with_row_group_filtering_enabled(false)
+                    .with_row_selection_enabled(true)
+                    .build(),
+            )
+            .build();
+
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(std::fs::metadata(&file_path).unwrap().len())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(file_path)
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema.clone())
+            .with_project_field_ids(vec![1])
+            .with_predicate(Some(predicate))
+            .with_case_sensitive(false)
+            .build()
+            .unwrap();
+
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let batches = reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+
+        let mut values = Vec::new();
+        for batch in &batches {
+            let col = batch
+                .column(0)
+                .as_primitive::<arrow_array::types::Int32Type>();
+            values.extend(col.values().iter().copied());
+        }
+
+        assert_eq!(values, (0..50).collect::<Vec<i32>>());
+    }
+
+    #[test]
+    fn test_row_group_pruning_rejects_invalid_candidate() {
+        let schema = int_schema();
+        let predicate = simple_predicate(schema.clone());
+        let metadata = metadata_no_page_indexes();
+
+        let err = ArrowReader::get_selected_row_group_indices(
+            &predicate,
+            &metadata,
+            &field_id_map(),
+            schema.as_ref(),
+            &[0],
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
     }
 
     /// Testing suite regarding: https://github.com/apache/iceberg-rust/issues/2452
@@ -1116,13 +1573,9 @@ mod tests {
             let f = File::open(&file_path).unwrap();
             let rdr = SerializedFileReader::new(f).unwrap();
             assert!(
-                rdr.metadata().column_index().is_none(),
+                rdr.metadata().page_index().is_none(),
                 "test fixture must produce a file without a column index"
             );
-            assert!(
-                rdr.metadata().offset_index().is_none(),
-                "test fixture must a product a file without offset index"
-            )
         }
 
         // Predicate: id > 2
@@ -1134,7 +1587,11 @@ mod tests {
         let file_io = FileIO::new_with_fs();
         let reader = ArrowReaderBuilder::new(file_io.clone(), Runtime::current())
             // Enabling row selection ()
-            .with_row_selection_enabled(true)
+            .with_options(
+                ReaderOptions::builder()
+                    .with_row_selection_enabled(true)
+                    .build(),
+            )
             .build();
 
         let file_size = std::fs::metadata(&file_path).unwrap().len();
@@ -1222,7 +1679,11 @@ mod tests {
             .unwrap();
 
         let reader_sub2 = ArrowReaderBuilder::new(file_io.clone(), Runtime::current())
-            .with_row_selection_enabled(true)
+            .with_options(
+                ReaderOptions::builder()
+                    .with_row_selection_enabled(true)
+                    .build(),
+            )
             .build();
 
         let task_sub2 = FileScanTask::builder()
@@ -1234,19 +1695,16 @@ mod tests {
             .with_schema(iceberg_schema.clone())
             .with_project_field_ids(vec![1, 2])
             .with_predicate(Some(predicate_sub2))
-            .with_deletes(vec![FileScanTaskDeleteFile {
-                file_path: pos_del_path.clone(),
-                file_type: DataContentType::PositionDeletes,
-                file_format: DataFileFormat::Parquet,
-                partition_spec_id: 0,
-                equality_ids: None,
-                file_size_in_bytes: std::fs::metadata(&pos_del_path).unwrap().len(),
-                referenced_data_file: None,
-                content_offset: None,
-                content_size_in_bytes: None,
-                record_count: None,
-                key_metadata: None,
-            }])
+            .with_deletes(vec![
+                FileScanTaskDeleteFile::builder()
+                    .with_file_path(pos_del_path.clone())
+                    .with_file_type(DataContentType::PositionDeletes)
+                    .with_file_format(DataFileFormat::Parquet)
+                    .with_partition_spec_id(0)
+                    .with_file_size_in_bytes(std::fs::metadata(&pos_del_path).unwrap().len())
+                    .build()
+                    .unwrap(),
+            ])
             .with_case_sensitive(false)
             .build()
             .unwrap();
@@ -1279,5 +1737,661 @@ mod tests {
             vec![2, 4, 5],
             "positional deletes must be applied correctly even when page indexes are absent"
         );
+    }
+
+    // Bloom filter pushdown: on-vs-off equivalence
+    // Pushdown must never change results. An encoding bug in the probe shows up as
+    // rows the bloom filter drops and the row filter keeps, so every case below
+    // reads the same file twice and compares. Fixtures spread each row group's
+    // values across the whole domain, so min/max statistics cannot prune and any
+    // reduction in bytes read is attributable to the bloom filter.
+
+    const ROWS_PER_GROUP: i32 = 20_000;
+    const GROUPS: i32 = 3;
+    /// Gap between consecutive values in a row group, so a value can be absent from
+    /// the file yet still sit inside every row group's min/max range.
+    const STRIDE: i32 = 30;
+
+    /// The `i`th value of row group `group`, spread across the whole domain.
+    fn interleaved(group: i32, i: i32) -> i32 {
+        i * STRIDE + group
+    }
+
+    fn field_with_id(name: &str, ty: DataType, id: i32) -> Field {
+        Field::new(name, ty, false).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            id.to_string(),
+        )]))
+    }
+
+    /// Writes one row group per batch, optionally with bloom filters.
+    fn write_row_groups(
+        path: &str,
+        arrow_schema: Arc<ArrowSchema>,
+        row_groups: Vec<RecordBatch>,
+        with_bloom_filters: bool,
+    ) {
+        let mut props = WriterProperties::builder().set_compression(Compression::UNCOMPRESSED);
+        if with_bloom_filters {
+            props = props
+                .set_bloom_filter_enabled(true)
+                .set_bloom_filter_max_ndv(ROWS_PER_GROUP as u64);
+        }
+
+        let file = File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema, Some(props.build())).unwrap();
+        for batch in row_groups {
+            writer.write(&batch).unwrap();
+            // Force a row group boundary so each batch is independently prunable.
+            writer.flush().unwrap();
+        }
+        writer.close().unwrap();
+    }
+
+    async fn read_once(
+        reader: ArrowReader,
+        file_path: &str,
+        schema: Arc<Schema>,
+        project_field_ids: Vec<i32>,
+        predicate: Predicate,
+        partition: Option<(Arc<PartitionSpec>, Struct)>,
+        deletes: Vec<FileScanTaskDeleteFile>,
+    ) -> (Vec<RecordBatch>, u64) {
+        let (partition_spec, partition) = partition.unzip();
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(std::fs::metadata(file_path).unwrap().len())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(file_path.to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema.clone())
+            .with_project_field_ids(project_field_ids)
+            .with_predicate(Some(predicate.bind(schema, true).unwrap()))
+            .with_deletes(deletes)
+            .with_partition(partition)
+            .with_partition_spec(partition_spec)
+            .with_case_sensitive(false)
+            .build()
+            .unwrap();
+
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let result = reader.read(tasks).unwrap();
+        let metrics = result.metrics().clone();
+        let batches: Vec<RecordBatch> = result.stream().try_collect().await.unwrap();
+
+        (batches, metrics.bytes_read())
+    }
+
+    /// Batch boundaries differ when fewer row groups are read, so collapse to a
+    /// single batch before comparing. `None` means no rows at all.
+    fn collapse(batches: &[RecordBatch]) -> Option<RecordBatch> {
+        let first = batches.first()?;
+        Some(arrow_select::concat::concat_batches(&first.schema(), batches).unwrap())
+    }
+
+    /// Reads the file with pushdown on and off, asserts the rows are identical, and
+    /// returns the rows plus (bytes_on, bytes_off).
+    async fn assert_pushdown_agrees(
+        case: &str,
+        file_path: &str,
+        schema: Arc<Schema>,
+        project_field_ids: Vec<i32>,
+        predicate: Predicate,
+    ) -> (Option<RecordBatch>, u64, u64) {
+        let read = |bloom_enabled| {
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+                .with_options(
+                    ReaderOptions::builder()
+                        .with_bloom_filter_enabled(bloom_enabled)
+                        .build(),
+                )
+                // Keep the fixed footer prefetch small so the byte measurement reflects
+                // row group I/O rather than a constant metadata read.
+                .with_parquet_options(
+                    ParquetReadOptions::builder()
+                        .with_metadata_size_hint(8 * 1024)
+                        .build(),
+                )
+                .build();
+            read_once(
+                reader,
+                file_path,
+                schema.clone(),
+                project_field_ids.clone(),
+                predicate.clone(),
+                None,
+                vec![],
+            )
+        };
+        let (off, bytes_off) = read(false).await;
+        let (on, bytes_on) = read(true).await;
+
+        let off = collapse(&off);
+        let on = collapse(&on);
+        assert_eq!(
+            on, off,
+            "{case}: bloom filter pushdown changed the rows returned"
+        );
+
+        (on, bytes_on, bytes_off)
+    }
+
+    fn rows(batch: &Option<RecordBatch>) -> usize {
+        batch.as_ref().map_or(0, |b| b.num_rows())
+    }
+
+    fn value_schema(iceberg_type: Type) -> Arc<Schema> {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![NestedField::required(1, "v", iceberg_type).into()])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    /// Writes a single-column file, one row group per group index.
+    fn write_value_fixture(
+        path: &str,
+        data_type: DataType,
+        make_group: impl Fn(i32) -> ArrayRef,
+        with_bloom_filters: bool,
+    ) {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![field_with_id("v", data_type, 1)]));
+        let row_groups = (0..GROUPS)
+            .map(|g| RecordBatch::try_new(arrow_schema.clone(), vec![make_group(g)]).unwrap())
+            .collect();
+        write_row_groups(path, arrow_schema, row_groups, with_bloom_filters);
+    }
+
+    /// The core check for one physical encoding: a value that is present must
+    /// survive pushdown, and one that is absent must prune every row group. The
+    /// first catches a probe that encodes wrongly and drops real rows; the second
+    /// catches a probe that silently never prunes.
+    async fn assert_prunes_and_agrees(
+        case: &str,
+        file_path: &str,
+        schema: Arc<Schema>,
+        present: Datum,
+        absent: Datum,
+    ) {
+        let (on, bytes_on, bytes_off) = assert_pushdown_agrees(
+            &format!("{case}/present"),
+            file_path,
+            schema.clone(),
+            vec![1],
+            Reference::new("v").equal_to(present),
+        )
+        .await;
+        assert_eq!(rows(&on), 1, "{case}/present: expected one matching row");
+        assert!(
+            bytes_on < bytes_off,
+            "{case}/present: pushdown must skip row groups: {bytes_on} vs {bytes_off}"
+        );
+
+        let (on, bytes_on, bytes_off) = assert_pushdown_agrees(
+            &format!("{case}/absent"),
+            file_path,
+            schema,
+            vec![1],
+            Reference::new("v").equal_to(absent),
+        )
+        .await;
+        assert_eq!(rows(&on), 0, "{case}/absent: expected no matching rows");
+        assert!(
+            bytes_on * 2 < bytes_off,
+            "{case}/absent: pruning every row group should cut reads sharply: \
+             {bytes_on} vs {bytes_off}"
+        );
+    }
+
+    /// Value present in exactly one row group: `interleaved(1, 51)`.
+    const PRESENT_INT: i32 = 51 * STRIDE + 1;
+    /// Not congruent to any group index mod STRIDE, so absent from the file while
+    /// still inside every row group's min/max range.
+    const ABSENT_INT: i32 = 7;
+
+    fn int_group(g: i32) -> ArrayRef {
+        Arc::new(Int32Array::from(
+            (0..ROWS_PER_GROUP)
+                .map(|i| interleaved(g, i))
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_bloom_pushdown_int32_eq() {
+        let tmp = TempDir::new().unwrap();
+        let path = format!("{}/int32.parquet", tmp.path().to_str().unwrap());
+        write_value_fixture(&path, DataType::Int32, int_group, true);
+
+        assert_prunes_and_agrees(
+            "int32",
+            &path,
+            value_schema(Type::Primitive(PrimitiveType::Int)),
+            Datum::int(PRESENT_INT),
+            Datum::int(ABSENT_INT),
+        )
+        .await;
+    }
+
+    /// `IN` takes a different evaluator path from `eq`: it must keep the row group
+    /// when any literal might be present, and prune only when all are absent.
+    #[tokio::test]
+    async fn test_bloom_pushdown_int32_in() {
+        let tmp = TempDir::new().unwrap();
+        let path = format!("{}/int32_in.parquet", tmp.path().to_str().unwrap());
+        write_value_fixture(&path, DataType::Int32, int_group, true);
+        let schema = value_schema(Type::Primitive(PrimitiveType::Int));
+
+        // One present literal keeps its row group; the absent one must not suppress it.
+        let (on, bytes_on, bytes_off) = assert_pushdown_agrees(
+            "int32_in/mixed",
+            &path,
+            schema.clone(),
+            vec![1],
+            Reference::new("v").is_in([Datum::int(PRESENT_INT), Datum::int(ABSENT_INT)]),
+        )
+        .await;
+        assert_eq!(rows(&on), 1);
+        assert!(bytes_on < bytes_off, "{bytes_on} vs {bytes_off}");
+
+        // All literals absent: every row group prunes.
+        let (on, bytes_on, bytes_off) = assert_pushdown_agrees(
+            "int32_in/all_absent",
+            &path,
+            schema,
+            vec![1],
+            Reference::new("v").is_in([Datum::int(ABSENT_INT), Datum::int(ABSENT_INT + 1)]),
+        )
+        .await;
+        assert_eq!(rows(&on), 0);
+        assert!(bytes_on * 2 < bytes_off, "{bytes_on} vs {bytes_off}");
+    }
+
+    #[tokio::test]
+    async fn test_bloom_pushdown_string_eq() {
+        let tmp = TempDir::new().unwrap();
+        let path = format!("{}/string.parquet", tmp.path().to_str().unwrap());
+        write_value_fixture(
+            &path,
+            DataType::Utf8,
+            |g| {
+                Arc::new(StringArray::from(
+                    (0..ROWS_PER_GROUP)
+                        .map(|i| format!("{:016}", interleaved(g, i)))
+                        .collect::<Vec<_>>(),
+                ))
+            },
+            true,
+        );
+
+        assert_prunes_and_agrees(
+            "string",
+            &path,
+            value_schema(Type::Primitive(PrimitiveType::String)),
+            Datum::string(format!("{PRESENT_INT:016}")),
+            Datum::string(format!("{ABSENT_INT:016}")),
+        )
+        .await;
+    }
+
+    /// Decimal precision decides the Parquet physical type, and the probe has to be
+    /// encoded to match: precision 9 -> INT32, 15 -> INT64, 25 -> FIXED_LEN_BYTE_ARRAY.
+    /// Each width is a separate arm of `check_in_bloom_filter`.
+    async fn check_decimal_width(name: &str, precision: u32) {
+        const SCALE: u32 = 2;
+        let tmp = TempDir::new().unwrap();
+        let path = format!("{}/{name}.parquet", tmp.path().to_str().unwrap());
+
+        write_value_fixture(
+            &path,
+            DataType::Decimal128(precision as u8, SCALE as i8),
+            |g| {
+                let values: Vec<i128> = (0..ROWS_PER_GROUP)
+                    .map(|i| i128::from(interleaved(g, i)))
+                    .collect();
+                Arc::new(
+                    Decimal128Array::from(values)
+                        .with_precision_and_scale(precision as u8, SCALE as i8)
+                        .unwrap(),
+                )
+            },
+            true,
+        );
+
+        let datum = |mantissa: i32| {
+            Datum::decimal_with_precision(
+                crate::spec::decimal_utils::decimal_from_i128_with_scale(
+                    i128::from(mantissa),
+                    SCALE,
+                ),
+                precision,
+            )
+            .unwrap()
+        };
+
+        assert_prunes_and_agrees(
+            name,
+            &path,
+            value_schema(Type::Primitive(PrimitiveType::Decimal {
+                precision,
+                scale: SCALE,
+            })),
+            datum(PRESENT_INT),
+            datum(ABSENT_INT),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_bloom_pushdown_decimal_int32() {
+        check_decimal_width("decimal_int32", 9).await;
+    }
+
+    #[tokio::test]
+    async fn test_bloom_pushdown_decimal_int64() {
+        check_decimal_width("decimal_int64", 15).await;
+    }
+
+    #[tokio::test]
+    async fn test_bloom_pushdown_decimal_fixed_len_byte_array() {
+        check_decimal_width("decimal_flba", 25).await;
+    }
+
+    /// Widening a decimal's precision does not rewrite existing files, so the file
+    /// keeps its original physical width while the bound literal arrives at the new
+    /// precision. Deriving the probe encoding from the schema instead of the file
+    /// would miss every entry the writer inserted and prune matching row groups.
+    #[tokio::test]
+    async fn test_bloom_pushdown_decimal_widened_precision() {
+        const SCALE: u32 = 2;
+        let tmp = TempDir::new().unwrap();
+        let path = format!("{}/decimal_widened.parquet", tmp.path().to_str().unwrap());
+
+        // File written at precision 9 -> INT32.
+        write_value_fixture(
+            &path,
+            DataType::Decimal128(9, SCALE as i8),
+            |g| {
+                let values: Vec<i128> = (0..ROWS_PER_GROUP)
+                    .map(|i| i128::from(interleaved(g, i)))
+                    .collect();
+                Arc::new(
+                    Decimal128Array::from(values)
+                        .with_precision_and_scale(9, SCALE as i8)
+                        .unwrap(),
+                )
+            },
+            true,
+        );
+
+        // Table schema has since widened to precision 30.
+        let schema = value_schema(Type::Primitive(PrimitiveType::Decimal {
+            precision: 30,
+            scale: SCALE,
+        }));
+        let datum = |mantissa: i32| {
+            Datum::decimal_with_precision(
+                crate::spec::decimal_utils::decimal_from_i128_with_scale(
+                    i128::from(mantissa),
+                    SCALE,
+                ),
+                30,
+            )
+            .unwrap()
+        };
+
+        assert_prunes_and_agrees(
+            "decimal_widened",
+            &path,
+            schema,
+            datum(PRESENT_INT),
+            datum(ABSENT_INT),
+        )
+        .await;
+    }
+
+    /// `Sbbf` hashes raw IEEE bytes, so `-0.0` and `0.0` are distinct entries. Arrow's
+    /// float equality is bitwise too, for an independent reason: `ArrowNativeTypeOp::is_eq`
+    /// implements total-order (`total_cmp`) semantics as `to_bits() == to_bits()`, so
+    /// `-0.0 != 0.0` and `NaN == NaN` there. That agreement is what makes it safe to prune
+    /// a row group holding only the opposite zero: if `is_eq` ever became IEEE-lenient,
+    /// those pruned rows would be rows the row filter should have returned. A probe that
+    /// canonicalized the sign instead only over-keeps, costing pruning rather than
+    /// correctness — but it would also hide such a change from this test.
+    ///
+    /// Each row group pairs its zero with a larger filler value so its min/max range spans
+    /// the other zero. Neither statistics path can prune it, so the bloom-off read really
+    /// does evaluate `is_eq` against `ROWS_PER_GROUP - 1` copies of the opposite zero: that
+    /// arm is the control pinning arrow's semantics, and IEEE-lenient equality would double
+    /// the row count it returns. Pairing with a filler also avoids relying on the writer
+    /// widening a single-value group's bounds to `[-0.0, +0.0]`.
+    #[tokio::test]
+    async fn test_bloom_pushdown_float_signed_zero() {
+        const FILLER: f32 = 5.0;
+        let tmp = TempDir::new().unwrap();
+        let path = format!("{}/float_zero.parquet", tmp.path().to_str().unwrap());
+
+        // Row group 0 holds -0.0 and never +0.0; row group 1 the reverse; row group 2
+        // neither zero.
+        write_value_fixture(
+            &path,
+            DataType::Float32,
+            |g| {
+                let zero = match g {
+                    0 => -0.0f32,
+                    1 => 0.0f32,
+                    _ => 7.5f32,
+                };
+                let mut values = vec![zero; ROWS_PER_GROUP as usize - 1];
+                values.push(FILLER);
+                Arc::new(Float32Array::from(values))
+            },
+            true,
+        );
+
+        let schema = value_schema(Type::Primitive(PrimitiveType::Float));
+        let zero_rows = ROWS_PER_GROUP as usize - 1;
+
+        for (label, probe) in [("positive_zero", 0.0f32), ("negative_zero", -0.0f32)] {
+            let (on, _, _) = assert_pushdown_agrees(
+                label,
+                &path,
+                schema.clone(),
+                vec![1],
+                Reference::new("v").equal_to(Datum::float(probe)),
+            )
+            .await;
+            // Only the group holding this exact zero matches, on both paths.
+            assert_eq!(
+                rows(&on),
+                zero_rows,
+                "{label}: expected only the row group holding this zero to match"
+            );
+        }
+    }
+
+    /// A file with no bloom filters at all must read identically with the option on,
+    /// exercising the conservative might-match path end to end.
+    #[tokio::test]
+    async fn test_bloom_pushdown_file_without_bloom_filters() {
+        let tmp = TempDir::new().unwrap();
+        let path = format!("{}/no_filters.parquet", tmp.path().to_str().unwrap());
+        write_value_fixture(&path, DataType::Int32, int_group, false);
+
+        let (on, _, _) = assert_pushdown_agrees(
+            "no_filters",
+            &path,
+            value_schema(Type::Primitive(PrimitiveType::Int)),
+            vec![1],
+            Reference::new("v").equal_to(Datum::int(PRESENT_INT)),
+        )
+        .await;
+        assert_eq!(rows(&on), 1);
+    }
+
+    /// Writes a file that stores only field 1 (`a`), with values 1, 2, 3.
+    fn write_file_without_b() -> (String, TempDir) {
+        let tmp_dir = TempDir::new().unwrap();
+        let file_path = format!("{}/1.parquet", tmp_dir.path().to_str().unwrap());
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![field_with_id(
+            "a",
+            DataType::Int64,
+            1,
+        )]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int64Array::from(
+            vec![1, 2, 3],
+        ))])
+        .unwrap();
+        write_row_groups(&file_path, arrow_schema, vec![batch], false);
+        (file_path, tmp_dir)
+    }
+
+    fn schema_with_b(b: NestedField) -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "a", Type::Primitive(PrimitiveType::Long)).into(),
+                    b.into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    /// Reads the file from [`write_file_without_b`], in which `b` reads as 7 on every row through
+    /// `schema` or `partition`, and asserts the rows each predicate keeps. Each predicate, and each
+    /// equality delete on `b`, must keep or drop all three rows as if `b` were stored as 7.
+    async fn assert_absent_b_reads_as_7(
+        schema: SchemaRef,
+        partition: Option<(Arc<PartitionSpec>, Struct)>,
+        cases: Vec<(Predicate, usize)>,
+    ) {
+        let (file_path, tmp_dir) = write_file_without_b();
+        let read = async |row_selection_enabled, predicate, deletes| {
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+                .with_options(
+                    ReaderOptions::builder()
+                        .with_row_selection_enabled(row_selection_enabled)
+                        .build(),
+                )
+                .build();
+            let (batches, _) = read_once(
+                reader,
+                &file_path,
+                schema.clone(),
+                vec![1, 2],
+                predicate,
+                partition.clone(),
+                deletes,
+            )
+            .await;
+            batches
+        };
+
+        let batches = read(false, Predicate::AlwaysTrue, vec![]).await;
+        assert_eq!(
+            batches[0].column(1).as_primitive::<Int64Type>().values(),
+            &[7, 7, 7]
+        );
+
+        // The keep predicate for a deleted value `v` is `b IS NULL OR b != v`, and `b IS NOT NULL`
+        // for a deleted null.
+        let delete_field = Field::new("b", DataType::Int64, true).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "2".to_string(),
+        )]));
+        let delete_schema = Arc::new(ArrowSchema::new(vec![delete_field]));
+        let deletes: Vec<_> = [(Some(7), 0), (Some(5), 3), (None, 3)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (deleted_b, rows))| {
+                let delete_path =
+                    format!("{}/eq-del-{i}.parquet", tmp_dir.path().to_str().unwrap());
+                let batch = RecordBatch::try_new(delete_schema.clone(), vec![Arc::new(
+                    Int64Array::from(vec![deleted_b]),
+                )])
+                .unwrap();
+                write_row_groups(&delete_path, delete_schema.clone(), vec![batch], false);
+                let delete = FileScanTaskDeleteFile::builder()
+                    .with_file_size_in_bytes(std::fs::metadata(&delete_path).unwrap().len())
+                    .with_file_path(delete_path)
+                    .with_file_type(DataContentType::EqualityDeletes)
+                    .with_file_format(DataFileFormat::Parquet)
+                    .with_partition_spec_id(0)
+                    .with_equality_ids(Some(vec![2]))
+                    .build()
+                    .unwrap();
+                (deleted_b, delete, rows)
+            })
+            .collect();
+
+        for row_selection_enabled in [false, true] {
+            for (predicate, expected) in &cases {
+                let batches = read(row_selection_enabled, predicate.clone(), vec![]).await;
+                let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+                assert_eq!(
+                    rows, *expected,
+                    "{predicate}, row_selection_enabled = {row_selection_enabled}"
+                );
+            }
+            for (deleted_b, delete, expected) in &deletes {
+                let batches = read(row_selection_enabled, Predicate::AlwaysTrue, vec![
+                    delete.clone(),
+                ])
+                .await;
+                let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+                assert_eq!(
+                    rows, *expected,
+                    "equality delete on b = {deleted_b:?}, row_selection_enabled = {row_selection_enabled}"
+                );
+            }
+        }
+    }
+
+    /// A file written before column `b` was added with `initial-default` 7.
+    #[tokio::test]
+    async fn test_predicate_on_absent_column_uses_initial_default() {
+        let schema = schema_with_b(
+            NestedField::optional(2, "b", Type::Primitive(PrimitiveType::Long))
+                .with_initial_default(Literal::long(7)),
+        );
+        let b = || Reference::new("b");
+        assert_absent_b_reads_as_7(schema, None, vec![
+            (b().equal_to(Datum::long(7)), 3),
+            (b().is_not_null(), 3),
+            (b().is_in([Datum::long(7), Datum::long(8)]), 3),
+            (b().greater_than(Datum::long(5)), 3),
+            (b().equal_to(Datum::long(8)), 0),
+            (b().is_null(), 0),
+        ])
+        .await;
+    }
+
+    /// A file that doesn't store its identity partition column `b`, as after a Hive migration or
+    /// `add_files`, with partition value 7.
+    #[tokio::test]
+    async fn test_predicate_on_absent_identity_partition_column_uses_partition_value() {
+        let schema = schema_with_b(NestedField::optional(
+            2,
+            "b",
+            Type::Primitive(PrimitiveType::Long),
+        ));
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .add_partition_field("b", "b", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        let partition = Struct::from_iter([Some(Literal::long(7))]);
+        let b = || Reference::new("b");
+        assert_absent_b_reads_as_7(schema, Some((Arc::new(partition_spec), partition)), vec![
+            (b().equal_to(Datum::long(7)), 3),
+            (b().is_not_null(), 3),
+            (b().equal_to(Datum::long(8)), 0),
+            (b().is_null(), 0),
+        ])
+        .await;
     }
 }

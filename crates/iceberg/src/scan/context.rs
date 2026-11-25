@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::channel::mpsc::Sender;
@@ -25,18 +25,15 @@ use crate::delete_file_index::DeleteFileIndex;
 use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::io::object_cache::ObjectCache;
 use crate::scan::{
-    BoundPredicates, ExpressionEvaluatorCache, FileScanTask, ManifestEvaluatorCache,
-    PartitionFilterCache,
+    BoundPredicates, ColumnStatsColumns, ExpressionEvaluatorCache, FileScanTask,
+    FileScanTaskColumnStats, ManifestEvaluatorCache, PartitionFilterCache,
 };
 use crate::spec::{
     ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList, NameMapping,
-    PartitionSpecRef, SchemaRef, SnapshotRef, StructType, TableMetadataRef,
+    PartitionSpecRef, PrimitiveType, SchemaRef, SnapshotRef, SortOrderRef, StructType,
+    TableMetadataRef,
 };
-use crate::util::snapshot::ancestors_between;
 use crate::{Error, ErrorKind, Result};
-
-/// Predicate applied to individual manifest entries during a scan.
-type ManifestEntryFilterFn = dyn Fn(&ManifestEntryRef) -> bool + Send + Sync;
 
 /// Wraps a [`ManifestFile`] alongside the objects that are needed
 /// to process it in a thread-safe manner
@@ -55,7 +52,8 @@ pub(crate) struct ManifestFileContext {
     case_sensitive: bool,
     partition_spec: Option<PartitionSpecRef>,
     unified_partition_type: Option<Arc<StructType>>,
-    filter_fn: Option<Arc<ManifestEntryFilterFn>>,
+    sort_orders: Arc<HashMap<i64, SortOrderRef>>,
+    column_stats_columns: Option<ColumnStatsColumns>,
 }
 
 /// Wraps a [`ManifestEntryRef`] alongside the objects that are needed
@@ -73,11 +71,35 @@ pub(crate) struct ManifestEntryContext {
     pub case_sensitive: bool,
     pub partition_spec: Option<PartitionSpecRef>,
     pub unified_partition_type: Option<Arc<StructType>>,
+    pub sort_order_id: Option<i32>,
+    pub sort_order: Option<SortOrderRef>,
+    pub column_stats_columns: Option<ColumnStatsColumns>,
+}
+
+/// Returns whether any `int` or `float` field of `written` is widened in `current`, to
+/// `long`/`double` or to `unknown` once its source column is dropped, i.e. partition
+/// values written with `written` need normalizing before they compare against predicates
+/// bound to the current schema or against delete-file partitions.
+fn partition_types_differ(current: &StructType, written: &StructType) -> bool {
+    current.fields().iter().zip(written.fields()).any(|(c, w)| {
+        matches!(
+            (
+                w.field_type.as_primitive_type(),
+                c.field_type.as_primitive_type()
+            ),
+            (
+                Some(PrimitiveType::Int),
+                Some(PrimitiveType::Long | PrimitiveType::Unknown)
+            ) | (
+                Some(PrimitiveType::Float),
+                Some(PrimitiveType::Double | PrimitiveType::Unknown)
+            )
+        )
+    })
 }
 
 impl ManifestFileContext {
-    /// Consumes this [`ManifestFileContext`], fetching its Manifest from FileIO and then
-    /// streaming its constituent [`ManifestEntries`] to the channel provided in the context
+    /// Fetches the manifest and streams its live entries to the context's channel.
     pub(crate) async fn fetch_manifest_and_stream_manifest_entries(self) -> Result<()> {
         let ManifestFileContext {
             object_cache,
@@ -92,19 +114,56 @@ impl ManifestFileContext {
             case_sensitive,
             partition_spec,
             unified_partition_type,
-            filter_fn,
+            sort_orders,
+            column_stats_columns,
         } = self;
 
         let manifest = object_cache.get_manifest(&manifest_file).await?;
 
-        for manifest_entry in manifest
-            .entries()
-            .iter()
-            .filter(|entry| filter_fn.as_ref().is_none_or(|filter| filter(entry)))
-        {
+        // A manifest written under an older schema stores partition values in that
+        // schema's (narrower) types. When the current partition type widens the one the
+        // manifest was written with (e.g. an int source column promoted to long), widen
+        // each entry's partition tuple here so the pruning evaluator and the delete-file
+        // index compare like-typed values. The gate compares the partition types
+        // themselves, not schema ids, since v1 may omit them (defaulting to 0). Column
+        // bounds are widened lazily where the metrics evaluator compares them.
+        let promotion_target: Option<(StructType, StructType)> = match partition_spec.as_ref() {
+            Some(spec) => {
+                let current = spec.partition_type(&snapshot_schema)?;
+                let written = spec.partition_type(manifest.metadata().schema())?;
+                partition_types_differ(&current, &written).then_some((current, written))
+            }
+            None => None,
+        };
+
+        for manifest_entry in manifest.entries() {
+            if !manifest_entry.is_alive() {
+                continue;
+            }
+
+            let manifest_entry = match promotion_target.as_ref() {
+                Some((current, written)) => {
+                    let mut entry = manifest_entry.as_ref().clone();
+                    entry.data_file.partition =
+                        entry.data_file.promoted_partition(current, written)?;
+                    Arc::new(entry)
+                }
+                None => manifest_entry.clone(),
+            };
+
+            // Carry the raw id through unresolved, then resolve it to an order for the
+            // reader. The resolved order is `None` for the unsorted order (empty fields) so
+            // that `Some` always means genuinely sorted, matching Java's `isSorted()` gate;
+            // the raw id above keeps the "physically sorted but definition dropped" case
+            // recoverable.
+            let sort_order_id = manifest_entry.data_file().sort_order_id();
+            let sort_order = sort_order_id
+                .and_then(|id| sort_orders.get(&(id as i64)))
+                .filter(|order| !order.is_unsorted())
+                .cloned();
+
             let manifest_entry_context = ManifestEntryContext {
-                // TODO: refactor to avoid the expensive ManifestEntry clone
-                manifest_entry: manifest_entry.clone(),
+                manifest_entry,
                 expression_evaluator_cache: expression_evaluator_cache.clone(),
                 field_ids: field_ids.clone(),
                 partition_spec_id: manifest_file.partition_spec_id,
@@ -115,6 +174,9 @@ impl ManifestFileContext {
                 case_sensitive,
                 partition_spec: partition_spec.clone(),
                 unified_partition_type: unified_partition_type.clone(),
+                sort_order_id,
+                sort_order,
+                column_stats_columns: column_stats_columns.clone(),
             };
 
             sender
@@ -159,33 +221,31 @@ impl ManifestEntryContext {
             .with_partition_spec(self.partition_spec.clone())
             .with_name_mapping(self.name_mapping)
             .with_unified_partition_type(self.unified_partition_type.clone())
-            .with_column_sizes(Some(self.manifest_entry.data_file().column_sizes().clone()))
-            .with_null_value_counts(
-                (!self
-                    .manifest_entry
-                    .data_file()
-                    .null_value_counts()
-                    .is_empty())
-                .then(|| self.manifest_entry.data_file().null_value_counts().clone()),
-            )
-            .with_split_offsets(
-                self.manifest_entry
-                    .data_file()
-                    .split_offsets()
-                    .map(|offsets| offsets.to_vec()),
-            )
-            .with_lower_bounds(
-                (!self.manifest_entry.data_file().lower_bounds().is_empty())
-                    .then(|| self.manifest_entry.data_file().lower_bounds().clone()),
-            )
-            .with_upper_bounds(
-                (!self.manifest_entry.data_file().upper_bounds().is_empty())
-                    .then(|| self.manifest_entry.data_file().upper_bounds().clone()),
-            )
-            .with_sort_order_id(self.manifest_entry.data_file().sort_order_id())
             .with_case_sensitive(self.case_sensitive)
             .with_key_metadata(self.manifest_entry.data_file.key_metadata().map(Box::from))
+            .with_sort_order_id(self.sort_order_id)
+            .with_sort_order(self.sort_order)
+            .with_column_stats(self.column_stats_columns.as_deref().map(|columns| {
+                FileScanTaskColumnStats::from_data_file(self.manifest_entry.data_file(), columns)
+            }))
             .build()
+    }
+
+    /// Consume this `ManifestEntryContext`, returning a COW rewrite file candidate.
+    ///
+    /// The scan task keeps everything planned for a normal read (projection,
+    /// delete files, partition metadata, ...) except the row predicate: the
+    /// candidate was already selected by that predicate during planning, and
+    /// the rewrite must read the whole file.
+    pub(crate) async fn into_cow_rewrite_file(self) -> Result<crate::cow_rewrite::CowRewriteFile> {
+        let old_data_file = self.manifest_entry.data_file().clone();
+        let mut scan_task = self.into_file_scan_task().await?;
+        scan_task.clear_predicate();
+
+        Ok(crate::cow_rewrite::CowRewriteFile {
+            old_data_file,
+            scan_task,
+        })
     }
 }
 
@@ -196,6 +256,9 @@ pub(crate) struct PlanContext {
     pub snapshot: SnapshotRef,
 
     pub table_metadata: TableMetadataRef,
+    /// The schema the scan projects. For a scan of the current state, this is
+    /// the table's current schema, not the snapshot's; for time travel, it is
+    /// the schema the snapshot was written with.
     pub snapshot_schema: SchemaRef,
     pub case_sensitive: bool,
     pub predicate: Option<Arc<Predicate>>,
@@ -209,8 +272,14 @@ pub(crate) struct PlanContext {
     pub expression_evaluator_cache: Arc<ExpressionEvaluatorCache>,
 
     pub unified_partition_type: Option<Arc<StructType>>,
-    pub from_snapshot_id: Option<i64>,
-    pub to_snapshot_id: Option<i64>,
+
+    /// The table's sort orders keyed by id, precomputed once so each
+    /// [`ManifestFileContext`] carries only this narrow map rather than the full table
+    /// metadata. Mirrors how `unified_partition_type` carries a precomputed value.
+    pub sort_orders: Arc<HashMap<i64, SortOrderRef>>,
+
+    /// Field ids whose column statistics each [`FileScanTask`] retains, or `None` to retain none.
+    pub column_stats_columns: Option<ColumnStatsColumns>,
 }
 
 impl PlanContext {
@@ -266,7 +335,13 @@ impl PlanContext {
         // TODO: Ideally we could ditch this intermediate Vec as we return an iterator.
         let mut filtered_mfcs = vec![];
         for manifest_file in manifest_files {
-            let tx = if manifest_file.content == ManifestContentType::Deletes {
+            let is_delete = manifest_file.content == ManifestContentType::Deletes;
+            let has_live_files =
+                manifest_file.has_added_files() || manifest_file.has_existing_files();
+            if is_delete && !has_live_files {
+                continue;
+            }
+            let tx = if is_delete {
                 delete_file_tx.clone()
             } else {
                 tx_data.clone()
@@ -293,12 +368,14 @@ impl PlanContext {
                 None
             };
 
+            if !has_live_files {
+                continue;
+            }
             let mfc = self.create_manifest_file_context(
                 manifest_file,
                 partition_bound_predicate,
                 tx,
                 delete_file_idx.clone(),
-                None,
             );
 
             filtered_mfcs.push(Ok(mfc));
@@ -313,7 +390,6 @@ impl PlanContext {
         partition_filter: Option<Arc<BoundPredicate>>,
         sender: Sender<ManifestEntryContext>,
         delete_file_index: DeleteFileIndex,
-        filter_fn: Option<Arc<ManifestEntryFilterFn>>,
     ) -> ManifestFileContext {
         let bound_predicates =
             if let (Some(ref partition_bound_predicate), Some(snapshot_bound_predicate)) =
@@ -343,79 +419,8 @@ impl PlanContext {
                 .partition_spec_by_id(manifest_file.partition_spec_id)
                 .cloned(),
             unified_partition_type: self.unified_partition_type.clone(),
-            filter_fn,
+            sort_orders: self.sort_orders.clone(),
+            column_stats_columns: self.column_stats_columns.clone(),
         }
-    }
-
-    pub(crate) async fn build_incremental_manifest_file_contexts(
-        &self,
-        from_snapshot_id: Option<i64>,
-        to_snapshot_id: i64,
-        sender: Sender<ManifestEntryContext>,
-        delete_file_index: DeleteFileIndex,
-    ) -> Result<Vec<Result<ManifestFileContext>>> {
-        let snapshots: Vec<SnapshotRef> =
-            ancestors_between(&self.table_metadata, to_snapshot_id, from_snapshot_id)
-                .filter(|snapshot| {
-                    matches!(
-                        snapshot.summary().operation,
-                        crate::spec::Operation::Append | crate::spec::Operation::Overwrite
-                    )
-                })
-                .collect();
-        let snapshot_ids: HashSet<i64> = snapshots
-            .iter()
-            .map(|snapshot| snapshot.snapshot_id())
-            .collect();
-        let filter_snapshot_ids = snapshot_ids.clone();
-        let filter_fn: Arc<ManifestEntryFilterFn> = Arc::new(move |entry| {
-            matches!(entry.status(), crate::spec::ManifestStatus::Added)
-                && matches!(
-                    entry.data_file().content_type(),
-                    crate::spec::DataContentType::Data
-                )
-                && entry
-                    .snapshot_id()
-                    .is_none_or(|id| filter_snapshot_ids.contains(&id))
-        });
-        let mut contexts = Vec::new();
-        for snapshot in snapshots {
-            let manifest_list = self
-                .object_cache
-                .get_manifest_list(&snapshot, &self.table_metadata)
-                .await?;
-            for manifest_file in manifest_list.entries() {
-                if !snapshot_ids.contains(&manifest_file.added_snapshot_id) {
-                    continue;
-                }
-                if manifest_file.content == ManifestContentType::Deletes {
-                    return Err(Error::new(
-                        ErrorKind::FeatureUnsupported,
-                        "Incremental scan does not support delete manifests",
-                    ));
-                }
-                let partition_filter = if self.predicate.is_some() {
-                    let predicate = self.get_partition_filter(manifest_file)?;
-                    if !self
-                        .manifest_evaluator_cache
-                        .get(manifest_file.partition_spec_id, predicate.clone())
-                        .eval(manifest_file)?
-                    {
-                        continue;
-                    }
-                    Some(predicate)
-                } else {
-                    None
-                };
-                contexts.push(Ok(self.create_manifest_file_context(
-                    manifest_file,
-                    partition_filter,
-                    sender.clone(),
-                    delete_file_index.clone(),
-                    Some(filter_fn.clone()),
-                )));
-            }
-        }
-        Ok(contexts)
     }
 }

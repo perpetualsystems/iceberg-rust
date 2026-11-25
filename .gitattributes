@@ -2,7 +2,7 @@
 # Files needed to build, test, and verify from source (dev/, .licenserc.yaml,
 # lint configs) must stay in.
 #
-# .github must stay in too: `uses: ./...` action references are resolved from
+# .github must stay in too: `uses: $/...` action references are resolved from
 # the repository archive, which honors export-ignore.
 website export-ignore
 .asf.yaml export-ignore

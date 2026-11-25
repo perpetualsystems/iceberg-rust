@@ -19,6 +19,12 @@
 
 set -Eeuo pipefail
 
+# bash 3.2 (macOS default) does not run the ERR trap for a failing subshell:
+# the script still exits on failure but does not report which step failed.
+if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  echo "Warning: bash ${BASH_VERSION} will not print which step failed. Use bash 4 or newer to see it." >&2
+fi
+
 CURRENT_STEP=""
 
 on_error() {
@@ -47,11 +53,10 @@ Arguments:
       Numeric release candidate round.
       Example: 2 creates tag v0.9.1-rc.2 and dist dir apache-iceberg-rust-0.9.1-rc2.
 
-Options:
-  --release_ref <ref>
-      Git commit-ish to archive and tag.
-      Default: HEAD
+The script always archives and tags HEAD, so check out the exact commit to
+release before running it.
 
+Options:
   --dist_dir <dir>
       Directory where RC artifacts are written.
       Relative paths are resolved from the repository root.
@@ -92,7 +97,7 @@ Examples:
   $0 0.9.1 2
   $0 0.9.1 2 --create_rc_tag 0 --sign 0
   $0 0.9.1 2 --upload_svn 1
-  $0 0.9.1 2 --release_ref abc123 --dist_dir /tmp/iceberg-rust-dist
+  $0 0.9.1 2 --dist_dir /tmp/iceberg-rust-dist
 USAGE
 }
 
@@ -152,16 +157,6 @@ require_checksum_command() {
   fi
 }
 
-require_cargo_deny() {
-  require_command cargo
-  if ! cargo deny --version >/dev/null 2>&1; then
-    echo "This step requires 'cargo-deny' for dependency license checks." >&2
-    echo "Install it with: cargo install --locked cargo-deny" >&2
-    echo "To skip this step locally, pass: --check_deps 0" >&2
-    return 1
-  fi
-}
-
 require_gpg_secret_key() {
   require_command gpg
   if ! gpg --list-secret-keys --with-colons 2>/dev/null | grep -q '^sec'; then
@@ -202,11 +197,6 @@ parse_args() {
       -h | --help)
         usage
         exit 0
-        ;;
-      --release_ref | --release-ref)
-        require_option_value "$1" "${2:-}"
-        RELEASE_REF="$2"
-        shift 2
         ;;
       --dist_dir | --dist-dir)
         require_option_value "$1" "${2:-}"
@@ -305,7 +295,7 @@ derive_release_names() {
 
 check_release_ref() {
   require_command git
-  git -C "${REPO_ROOT}" rev-parse --verify "${RELEASE_REF}^{commit}" >/dev/null
+  git -C "${REPO_ROOT}" rev-parse --verify "HEAD^{commit}" >/dev/null
 }
 
 check_rc_tag_available() {
@@ -317,12 +307,9 @@ check_rc_tag_available() {
 }
 
 check_dependency_licenses() {
-  require_cargo_deny
-  (
-    trap - ERR
-    cd "${REPO_ROOT}"
-    cargo deny check license
-  )
+  require_command make
+  require_command python3
+  make -C "${REPO_ROOT}" check-dependency-licenses
 }
 
 # Packages and builds every crate as `cargo publish` would, without uploading,
@@ -343,7 +330,7 @@ create_source_archive() {
     --format=tar.gz \
     --output="${RC_DIR}/${ARCHIVE_FILE_NAME}" \
     --prefix="${ARCHIVE_BASE_NAME}/" \
-    "${RELEASE_REF}"
+    HEAD
 }
 
 check_license_headers() {
@@ -434,7 +421,7 @@ upload_to_svn() {
 create_rc_tag() {
   require_command git
   require_gpg_secret_key
-  git -C "${REPO_ROOT}" tag -s "${RC_TAG}" "${RELEASE_REF}" -m "Apache Iceberg Rust ${VERSION} RC${RC}"
+  git -C "${REPO_ROOT}" tag -s "${RC_TAG}" HEAD -m "Apache Iceberg Rust ${VERSION} RC${RC}"
 }
 
 print_summary() {
@@ -512,7 +499,6 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 VERSION=""
 RC=""
-RELEASE_REF="HEAD"
 RELEASE_DIST_DIR="dist"
 CREATE_RC_TAG="1"
 CHECK_HEADERS="1"
@@ -527,7 +513,7 @@ run_step "Parse command arguments" parse_args "$@"
 run_step "Validate release arguments" validate_args
 derive_release_names
 
-run_step "Check release reference ${RELEASE_REF}" check_release_ref
+run_step "Check release reference HEAD" check_release_ref
 
 if enabled "${CREATE_RC_TAG}"; then
   run_step "Check RC tag ${RC_TAG} is available" check_rc_tag_available
