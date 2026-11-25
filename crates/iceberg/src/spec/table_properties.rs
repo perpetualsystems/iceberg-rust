@@ -21,13 +21,13 @@ use iceberg_property_macro::properties_view;
 
 use crate::compression::CompressionCodec;
 use crate::encryption::AesKeySize;
-use crate::error::{Error, ErrorKind, Result};
+use crate::error::{Result, invalid_data};
 use crate::spec::NameMapping;
 use crate::util::location::strip_trailing_slash;
 
 fn parse_location_property(path: &str) -> Result<String> {
     if path.is_empty() {
-        return Err(Error::new(ErrorKind::DataInvalid, "path must not be empty"));
+        return Err(invalid_data!("path must not be empty"));
     }
 
     Ok(strip_trailing_slash(path).to_string())
@@ -43,30 +43,22 @@ fn parse_metadata_compression(value: &str) -> Result<CompressionCodec> {
     let lowercase_value = value.to_lowercase();
 
     // Use serde to parse the codec (which has rename_all = "lowercase")
-    let codec: CompressionCodec = serde_json::from_value(serde_json::Value::String(
-        lowercase_value,
-    ))
-    .map_err(|_| {
-        Error::new(
-            ErrorKind::DataInvalid,
-            format!(
+    let codec: CompressionCodec =
+        serde_json::from_value(serde_json::Value::String(lowercase_value)).map_err(|_| {
+            invalid_data!(
                 "Invalid metadata compression codec: {value}. Only '{}' and '{}' are supported.",
                 CompressionCodec::None.name(),
                 CompressionCodec::gzip_default().name()
-            ),
-        )
-    })?;
+            )
+        })?;
 
     // Validate that only None and Gzip are used for metadata
     match codec {
         CompressionCodec::None | CompressionCodec::Gzip(_) => Ok(codec),
-        _ => Err(Error::new(
-            ErrorKind::DataInvalid,
-            format!(
-                "Invalid metadata compression codec: {value}. Only '{}' and '{}' are supported for metadata files.",
-                CompressionCodec::None.name(),
-                CompressionCodec::gzip_default().name()
-            ),
+        _ => Err(invalid_data!(
+            "Invalid metadata compression codec: {value}. Only '{}' and '{}' are supported for metadata files.",
+            CompressionCodec::None.name(),
+            CompressionCodec::gzip_default().name()
         )),
     }
 }
@@ -85,12 +77,9 @@ fn parse_parquet_compression(
         .get(codec_key)
         .map(|value| {
             serde_json::from_value(serde_json::Value::String(value.to_lowercase())).map_err(|_| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Invalid Parquet compression codec: {value}. Supported codecs: \
+                invalid_data!(
+                    "Invalid Parquet compression codec: {value}. Supported codecs: \
                          uncompressed, snappy, gzip, lzo, brotli, lz4, lz4_raw, zstd"
-                    ),
                 )
             })
         })
@@ -100,12 +89,9 @@ fn parse_parquet_compression(
     let level = properties
         .get(level_key)
         .map(|value| {
-            value.parse::<u8>().map_err(|error| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("Invalid value for {level_key}: {error}"),
-                )
-            })
+            value
+                .parse::<u8>()
+                .map_err(|error| invalid_data!("Invalid value for {level_key}: {error}"))
         })
         .transpose()?;
 
@@ -121,28 +107,6 @@ properties_view! {
 /// Typed view over the properties of a table.
 #[derive(Debug)]
 pub struct TableProperties {
-    /// Target size for merged manifests.
-    #[property(
-        key = Self::PROPERTY_COMMIT_MANIFEST_TARGET_SIZE_BYTES,
-        default = Self::PROPERTY_COMMIT_MANIFEST_TARGET_SIZE_BYTES_DEFAULT,
-        getter
-    )]
-    commit_manifest_target_size_bytes: u64,
-    /// Minimum manifest count before merging.
-    #[property(
-        key = Self::PROPERTY_COMMIT_MANIFEST_MIN_MERGE_COUNT,
-        default = Self::PROPERTY_COMMIT_MANIFEST_MIN_MERGE_COUNT_DEFAULT,
-        getter
-    )]
-    commit_manifest_min_merge_count: u32,
-    /// Whether to merge manifests on commit.
-    #[property(
-        key = Self::PROPERTY_COMMIT_MANIFEST_MERGE_ENABLED,
-        default = Self::PROPERTY_COMMIT_MANIFEST_MERGE_ENABLED_DEFAULT,
-        getter
-    )]
-    commit_manifest_merge_enabled: bool,
-
     /// The number of times to retry a commit.
     #[property(
         key = Self::PROPERTY_COMMIT_NUM_RETRIES,
@@ -352,6 +316,14 @@ pub struct TableProperties {
         getter
     )]
     write_object_storage_location: Option<String>,
+    /// Whether new data files use the object storage location layout, which
+    /// injects hash entropy into file paths to spread object-store prefixes.
+    #[property(
+        key = Self::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED,
+        default = Self::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED_DEFAULT,
+        getter
+    )]
+    write_object_storage_enabled: bool,
     /// Whether partition values are included in object storage paths.
     #[property(
         key = Self::PROPERTY_WRITE_OBJECT_STORAGE_PARTITIONED_PATHS,
@@ -359,6 +331,13 @@ pub struct TableProperties {
         getter
     )]
     write_object_storage_partitioned_paths: bool,
+    /// Whether to delete the oldest tracked metadata files after each commit.
+    #[property(
+        key = Self::PROPERTY_METADATA_DELETE_AFTER_COMMIT_ENABLED,
+        default = Self::PROPERTY_METADATA_DELETE_AFTER_COMMIT_ENABLED_DEFAULT,
+        getter
+    )]
+    metadata_delete_after_commit_enabled: bool,
     /// The table's default name mapping, used to assign field ids when reading data files
     /// that carry no field id metadata. `None` if `schema.name-mapping.default` is not set.
     #[property(
@@ -403,6 +382,13 @@ impl TableProperties<'_> {
         "write.metadata.previous-versions-max";
     /// Default value for max number of previous versions to keep.
     pub const PROPERTY_METADATA_PREVIOUS_VERSIONS_MAX_DEFAULT: usize = 100;
+
+    /// Property key for deleting the previous metadata files that fall out of the metadata log
+    /// (bounded by [`TableProperties::PROPERTY_METADATA_PREVIOUS_VERSIONS_MAX`]) after a commit.
+    pub const PROPERTY_METADATA_DELETE_AFTER_COMMIT_ENABLED: &'static str =
+        "write.metadata.delete-after-commit.enabled";
+    /// Default value for [`TableProperties::PROPERTY_METADATA_DELETE_AFTER_COMMIT_ENABLED`].
+    pub const PROPERTY_METADATA_DELETE_AFTER_COMMIT_ENABLED_DEFAULT: bool = false;
 
     /// Property key for max number of partitions to keep summary stats for.
     pub const PROPERTY_WRITE_PARTITION_SUMMARY_LIMIT: &'static str =
@@ -478,24 +464,6 @@ impl TableProperties<'_> {
         "write.datafusion.fanout.enabled";
     /// Default value for fanout writer enabled
     pub const PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED_DEFAULT: bool = true;
-
-    /// Target manifest size for the merge step's bin packer.
-    pub const PROPERTY_COMMIT_MANIFEST_TARGET_SIZE_BYTES: &'static str =
-        "commit.manifest.target-size-bytes";
-    /// Default target manifest size for the merge step.
-    pub const PROPERTY_COMMIT_MANIFEST_TARGET_SIZE_BYTES_DEFAULT: u64 = 8 * 1024 * 1024;
-
-    /// Minimum number of manifests required before merging.
-    pub const PROPERTY_COMMIT_MANIFEST_MIN_MERGE_COUNT: &'static str =
-        "commit.manifest.min-count-to-merge";
-    /// Default minimum manifest count required before merging.
-    pub const PROPERTY_COMMIT_MANIFEST_MIN_MERGE_COUNT_DEFAULT: u32 = 100;
-
-    /// Whether the manifest merge step is enabled.
-    pub const PROPERTY_COMMIT_MANIFEST_MERGE_ENABLED: &'static str =
-        "commit.manifest-merge.enabled";
-    /// Default manifest merge setting.
-    pub const PROPERTY_COMMIT_MANIFEST_MERGE_ENABLED_DEFAULT: bool = true;
 
     /// Property key for enabling garbage collection on drop.
     /// When set to `false`, data files will not be deleted when a table is dropped.
@@ -584,6 +552,10 @@ impl TableProperties<'_> {
     pub const PROPERTY_WRITE_FOLDER_STORAGE_LOCATION: &'static str = "write.folder-storage.path";
     /// Property key for deprecated object storage path, kept as a fallback for compatibility.
     pub const PROPERTY_WRITE_OBJECT_STORAGE_LOCATION: &'static str = "write.object-storage.path";
+    /// Property key for enabling the object storage location layout for new data files.
+    pub const PROPERTY_WRITE_OBJECT_STORAGE_ENABLED: &'static str = "write.object-storage.enabled";
+    /// Default value for [`TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED`]
+    pub const PROPERTY_WRITE_OBJECT_STORAGE_ENABLED_DEFAULT: bool = false;
     /// Property key for controlling whether partition values are included in object storage paths.
     pub const PROPERTY_WRITE_OBJECT_STORAGE_PARTITIONED_PATHS: &'static str =
         "write.object-storage.partitioned-paths";
@@ -600,6 +572,7 @@ impl TableProperties<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ErrorKind;
     use crate::compression::CompressionCodec;
 
     #[test]

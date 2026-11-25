@@ -32,10 +32,13 @@ OpenDAL-based storage backend implementations for [Apache Iceberg Rust](https://
 | Hugging Face         | `opendal-hf`     | ✅ Stable       | Hugging Face buckets and repositories         |
 | Alibaba Cloud OSS    | `opendal-oss`    | 🧪 Experimental | Alibaba Cloud Object Storage Service          |
 | Azure Datalake       | `opendal-azdls`  | 🧪 Experimental | Azure Datalake Storage v2                     |
+| HDFS                 | `opendal-hdfs-native` | 🧪 Experimental | HDFS via the native Rust client (`hdfs-native`) |
 
 You can enable all stable storage backends at once using the `opendal-all` feature flag.
 
 > Note that `opendal-oss` and `opendal-azdls` are currently experimental and not included in `opendal-all`.
+
+> `opendal-hdfs-native` is experimental and not included in `opendal-all`. A portless path authority such as `hdfs://nameservice1/warehouse` must be declared in properties, e.g. `hdfs.name-node.nameservice1 = nn1:8020,nn2:8020`: unlike Hadoop, nameservices defined only in `$HADOOP_CONF_DIR` are not resolved, and a portless host is not dialed on the default port 8020.
 
 ## Usage
 
@@ -77,25 +80,8 @@ async fn main() -> iceberg::Result<()> {
         .await?;
 
     let scan = table.scan().select_all().build()?;
-    let stream = scan.to_arrow().await?;
+    let stream = scan.to_arrow(Default::default()).await?;
 
     Ok(())
 }
 ```
-
-## HTTP connection pooling
-
-Configure the factory without changing its constructor:
-
-```rust
-use iceberg_storage_opendal::{ClientOptions, OpenDalStorageFactory};
-
-let factory = OpenDalStorageFactory::S3 {
-    customized_credential_load: None,
-}.with_client_options(ClientOptions::default().with_pool_max_idle_per_host(32));
-```
-
-Factory clones share one lazy HTTP client across `FileIO`s. The limit applies to
-idle connections per host; active requests remain unrestricted. Default options
-keep OpenDAL's existing transport. Serialization retains the settings and recreates
-the runtime client lazily. `OpenDalResolvingStorageFactory` supports the same method.

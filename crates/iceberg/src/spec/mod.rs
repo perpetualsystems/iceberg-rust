@@ -19,13 +19,14 @@
 
 mod datatypes;
 mod encrypted_key;
+pub mod geospatial;
 mod manifest;
 mod manifest_list;
 mod name_mapping;
 mod partition;
 mod schema;
 mod snapshot;
-pub(crate) mod snapshot_summary;
+mod snapshot_summary;
 mod sort;
 mod statistic_file;
 mod table_metadata;
@@ -39,6 +40,7 @@ mod view_version;
 
 pub use datatypes::*;
 pub use encrypted_key::*;
+pub use geospatial::{GeographyType, GeometryType};
 pub use manifest::*;
 pub use manifest_list::*;
 pub use name_mapping::*;

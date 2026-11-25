@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use itertools::Itertools;
 
 use super::{DataContentType, DataFile, PartitionSpecRef};
+use crate::error::invalid_data;
 use crate::spec::{ManifestContentType, ManifestFile, Operation, SchemaRef, Summary};
 use crate::{Error, ErrorKind, Result};
 
@@ -47,13 +48,7 @@ const TOTAL_RECORDS: &str = "total-records";
 const TOTAL_FILE_SIZE: &str = "total-files-size";
 const CHANGED_PARTITION_COUNT_PROP: &str = "changed-partition-count";
 const CHANGED_PARTITION_PREFIX: &str = "partitions.";
-
-/// Per-commit manifest activity counters. Java parity:
-/// `org.apache.iceberg.SnapshotSummary::CREATED_MANIFESTS_COUNT` etc.
-pub(crate) const MANIFESTS_CREATED: &str = "manifests-created";
-pub(crate) const MANIFESTS_REPLACED: &str = "manifests-replaced";
-pub(crate) const MANIFESTS_KEPT: &str = "manifests-kept";
-pub(crate) const ENTRIES_PROCESSED: &str = "entries-processed";
+const ICEBERG_VERSION_PROP: &str = "iceberg-version";
 
 /// `SnapshotSummaryCollector` collects and aggregates snapshot update metrics.
 /// It gathers metrics about added or removed data files and manifests, and tracks
@@ -336,6 +331,14 @@ where T: PartialOrd + Default + ToString {
     }
 }
 
+pub(crate) fn set_iceberg_version(properties: &mut HashMap<String, String>) {
+    let version = env!("CARGO_PKG_VERSION");
+    properties.insert(
+        ICEBERG_VERSION_PROP.to_string(),
+        format!("Apache Iceberg Rust {version}"),
+    );
+}
+
 pub(crate) fn update_snapshot_summaries(
     summary: Summary,
     previous_summary: Option<&Summary>,
@@ -345,12 +348,8 @@ pub(crate) fn update_snapshot_summaries(
     if summary.operation != Operation::Append
         && summary.operation != Operation::Overwrite
         && summary.operation != Operation::Delete
-        && summary.operation != Operation::Replace
     {
-        return Err(Error::new(
-            ErrorKind::DataInvalid,
-            "Operation is not supported.",
-        ));
+        return Err(invalid_data!("Operation is not supported."));
     }
 
     let mut summary = match previous_summary {
@@ -540,7 +539,10 @@ fn update_totals(
         return;
     };
 
-    let new_total = previous_total + added - removed;
+    // Like Java, a total that would go negative is omitted rather than written as a false basis.
+    let Some(new_total) = previous_total.saturating_add(added).checked_sub(removed) else {
+        return;
+    };
     summary
         .additional_properties
         .insert(total_property.to_string(), new_total.to_string());
@@ -838,10 +840,11 @@ mod tests {
             PartitionSpec::builder(schema.clone())
                 .add_unbound_fields(vec![
                     UnboundPartitionField::builder()
-                        .source_id(2)
+                        .source_ids(vec![2])
                         .name("year".to_string())
                         .transform(Transform::Identity)
-                        .build(),
+                        .build()
+                        .unwrap(),
                 ])
                 .unwrap()
                 .with_spec_id(1)
@@ -988,10 +991,11 @@ mod tests {
             PartitionSpec::builder(schema.clone())
                 .add_unbound_fields(vec![
                     UnboundPartitionField::builder()
-                        .source_id(2)
+                        .source_ids(vec![2])
                         .name("year".to_string())
                         .transform(Transform::Identity)
-                        .build(),
+                        .build()
+                        .unwrap(),
                 ])
                 .unwrap()
                 .with_spec_id(1)
@@ -1281,5 +1285,24 @@ mod tests {
         assert_eq!(props.get(TOTAL_FILE_SIZE).unwrap(), "800");
         assert_eq!(props.get(TOTAL_POSITION_DELETES).unwrap(), "2");
         assert_eq!(props.get(TOTAL_EQUALITY_DELETES).unwrap(), "1");
+    }
+
+    #[test]
+    fn test_update_totals_omits_total_when_removed_exceeds_previous_total() {
+        let previous_summary = Summary {
+            operation: Operation::Append,
+            additional_properties: HashMap::from([(TOTAL_DATA_FILES.to_string(), "2".to_string())]),
+        };
+        let summary = Summary {
+            operation: Operation::Delete,
+            additional_properties: HashMap::from([(
+                DELETED_DATA_FILES.to_string(),
+                "3".to_string(),
+            )]),
+        };
+
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
+
+        assert!(!updated.additional_properties.contains_key(TOTAL_DATA_FILES));
     }
 }
